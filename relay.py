@@ -22,6 +22,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py slocmp FILE A B W OLD NEW EVENTS DATA
        python relay.py slogate FILE A B W CUR NEW EVENTS DATA
        python relay.py hotload FILE STATE A B W BASE OP EVENTS DATA
+       python relay.py snapshot STATE OP
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
        python relay.py impair FILE S D DATA
@@ -34,12 +35,15 @@ FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/audit
 those in DATA, for drill/multidrill/convstat/slosum those in
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
 those in OLD/NEW/EVENTS/DATA, for slogate those in
-CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA),
+CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA, for
+snapshot those in STATE/OP/IN),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
 P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
 unknown-node/overflow/re-failure error; for hotload code 5 also covers
 a STATE whose v/p/h structure, version continuity, or version conflict
-is invalid.
+is invalid; for snapshot code 5 also covers an invalid OP shape, path,
+or BASE, a STATE/IN whose v/p/h structure, key order, or version
+continuity is invalid, and a BASE that conflicts with the current v.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -2167,18 +2171,37 @@ def _validate_hotload_state(data):
     return v, p, [list(entry) for entry in h]
 
 
-def _write_state_atomic(path, state):
-    # Replace the state file atomically: serialize, flush+fsync a
-    # sibling temp file, os.replace it over the destination, then fsync
-    # the directory. Any failure removes the temp file (never leaving
-    # residue) and the destination stays byte-for-byte untouched.
+def _state_payload(state):
+    # Canonical on-disk form: top-level key order v,p,h, compact
+    # separators, non-ASCII UTF-8, integers in decimal, one trailing LF.
     text = json.dumps(state, ensure_ascii=False,
                       separators=(",", ":")) + "\n"
-    payload = text.encode("utf-8")
+    return text.encode("utf-8")
+
+
+def _write_state_atomic(path, state):
+    # Replace the state file atomically: serialize, then exclusively
+    # create a unique sibling temp file with an incrementing suffix (a
+    # collision only retries under the next name), flush+fsync it,
+    # os.replace it over the destination, then fsync the directory.
+    # Any failure removes only the temp file this call acquired and
+    # leaves the destination byte-for-byte untouched.
+    payload = _state_payload(state)
     directory = os.path.dirname(os.path.abspath(path))
-    tmp_path = path + ".tmp"
+    suffix = 0
+    while True:
+        tmp_path = path + ".tmp." + str(suffix)
+        try:
+            fd = os.open(tmp_path,
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            suffix += 1
+            continue
+        except OSError:
+            fail(3)
+        break
     try:
-        with open(tmp_path, "wb") as f:
+        with os.fdopen(fd, "wb") as f:
             f.write(payload)
             f.flush()
             os.fsync(f.fileno())
@@ -3467,6 +3490,71 @@ def main():
                              "h": new_history}
                 _write_state_atomic(state_path, new_state)
                 result = {"s": 0, "v": new_v, "p": target_policy, "why": []}
+    elif argv[1] == "snapshot":
+        if len(argv) != 4:
+            fail(2)
+        state_path, op_text = argv[2], argv[3]
+        # Read/decode STATE first (read errors code 3, strict JSON
+        # errors code 4), then parse the inline OP, then check shapes.
+        raw_state = _load_state(state_path)
+        try:
+            op = json.loads(op_text, parse_constant=_reject_constant,
+                            parse_float=_finite_float,
+                            object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(op, list) or len(op) == 0 \
+                or type(op[0]) is not int:
+            fail(5)
+        kind = op[0]
+        if kind == 0:
+            # [0, OUT]: export STATE to OUT.
+            if len(op) != 2 or type(op[1]) is not str or len(op[1]) == 0:
+                fail(5)
+            out_path = op[1]
+        elif kind == 1:
+            # [1, BASE, IN]: import IN into STATE.
+            if len(op) != 3 or type(op[1]) is not int \
+                    or not 0 <= op[1] <= MAX_COST \
+                    or type(op[2]) is not str or len(op[2]) == 0:
+                fail(5)
+            base, in_path = op[1], op[2]
+        elif kind == 2:
+            # [2]: audit only, nothing is written.
+            if len(op) != 1:
+                fail(5)
+        else:
+            fail(5)
+        v, current_policy, history = _validate_hotload_state(raw_state)
+        state = {"v": v, "p": current_policy, "h": history}
+        if kind == 0:
+            try:
+                with open(out_path, "rb") as f:
+                    existing = f.read()
+            except FileNotFoundError:
+                existing = None
+            except OSError:
+                fail(3)
+            if existing == _state_payload(state):
+                # OUT already holds the canonical bytes: do not write.
+                result = {"op": 0, "status": 1, "state": state}
+            else:
+                _write_state_atomic(out_path, state)
+                result = {"op": 0, "status": 0, "state": state}
+        elif kind == 1:
+            raw_in = _load_state(in_path)
+            in_v, in_policy, in_history = _validate_hotload_state(raw_in)
+            in_state = {"v": in_v, "p": in_policy, "h": in_history}
+            if base != v:
+                fail(5)
+            if in_state == state:
+                # Importing the state already current is idempotent.
+                result = {"op": 1, "status": 1, "state": state}
+            else:
+                _write_state_atomic(state_path, in_state)
+                result = {"op": 1, "status": 0, "state": in_state}
+        else:
+            result = {"op": 2, "status": 2, "state": state}
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
