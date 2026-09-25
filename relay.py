@@ -17,6 +17,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py drill FILE A B EVENTS DATA
        python relay.py multidrill FILE A B EVENTS DATA
        python relay.py convstat FILE A B EVENTS DATA
+       python relay.py slosum FILE A B W EVENTS DATA
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
        python relay.py impair FILE S D DATA
@@ -25,7 +26,8 @@ Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance also those in
 FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/audit
-those in DATA, for drill/multidrill/convstat those in EVENTS/DATA),
+those in DATA, for drill/multidrill/convstat/slosum those in
+EVENTS/DATA),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
 P/C/RULES/A/B/W/schema/topology/unknown-node/overflow/re-failure
 error.
@@ -1450,6 +1452,57 @@ def compute_convstat(links, node_set, pair_set, a, b, events, data):
     return {"a": a, "b": b, "p": out_periods}
 
 
+def compute_slosum(links, node_set, pair_set, a, b, width, events, data):
+    # Windowed convergence-SLO summary. Periods open and close, records
+    # validate, and each period's [start, end, r, d, c, flows] is computed
+    # exactly as in compute_convstat (a recovery crossing a window edge
+    # still uses every DATA record up to the next period's start or b+1).
+    # The closed windows [x, min(b, x+width-1)] tile [a, b] from x = a in
+    # steps of width, and each period joins the window its start falls in.
+    # Per window: C counts periods with a non-null end, U those of them
+    # with r null, O the still-open periods, F the total affected-flow
+    # count, S the c sum, and ds summarizes the non-null d values with
+    # p50/p95 the ceil(0.50*n)-th / ceil(0.95*n)-th smallest (1-based).
+    periods = compute_convstat(links, node_set, pair_set, a, b, events,
+                               data)["p"]
+    count = (b - a) // width + 1
+    buckets = [[] for _ in range(count)]
+    for period in periods:
+        buckets[(period[0] - a) // width].append(period)
+    windows = []
+    for i, bucket in enumerate(buckets):
+        x = a + i * width
+        y = b if x + width - 1 > b else x + width - 1
+        closed = 0
+        unrecovered = 0
+        open_count = 0
+        flows_total = 0
+        c_total = 0
+        delays = []
+        for _start, end, r, d, c, flows in bucket:
+            if end is None:
+                open_count += 1
+            else:
+                closed += 1
+                if r is None:
+                    unrecovered += 1
+            if d is not None:
+                delays.append(d)
+            flows_total += len(flows)
+            c_total += c
+        n = len(delays)
+        if n:
+            delays.sort()
+            ds = [n, delays[0], delays[-1],
+                  delays[(n + 1) // 2 - 1],
+                  delays[(95 * n + 99) // 100 - 1]]
+        else:
+            ds = [0, None, None, None, None]
+        windows.append([x, y, closed, unrecovered, open_count, ds,
+                        flows_total, c_total])
+    return {"a": a, "b": b, "width": width, "windows": windows}
+
+
 def compute_replay(nodes, links, a, b, events):
     # Event-driven replay over a mutable up-graph. The clock jumps to each
     # event's t and processes it atomically; equal t keeps input order, so
@@ -2611,6 +2664,36 @@ def main():
         events = _parse_drill_events(raw_events, up_pairs, node_set, a, b)
         result = compute_convstat(links, node_set, pair_set, a, b,
                                   events, data)
+    elif argv[1] == "slosum":
+        if len(argv) != 8:
+            fail(2)
+        file_path, a_text, b_text, width_text, events_text, data_text = \
+            argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        a = _bounded_int_arg(a_text)
+        b = _bounded_int_arg(b_text)
+        if a > b:
+            fail(5)
+        width = _bounded_int_arg(width_text)
+        if width < 1:
+            fail(5)
+        try:
+            raw_events = json.loads(
+                events_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(raw_events, list) or not isinstance(data, list):
+            fail(5)
+        up_pairs = {(link["from"], link["to"]) for link in links
+                    if link["up"]}
+        pair_set = {(link["from"], link["to"]) for link in links}
+        events = _parse_drill_events(raw_events, up_pairs, node_set, a, b)
+        result = compute_slosum(links, node_set, pair_set, a, b, width,
+                                events, data)
     elif argv[1] == "replay":
         if len(argv) != 6:
             fail(2)
