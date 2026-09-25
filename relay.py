@@ -14,6 +14,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py quality FILE A B DATA
        python relay.py replay FILE A B DATA
        python relay.py audit FILE A B DATA
+       python relay.py drill FILE A B EVENTS DATA
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
        python relay.py impair FILE S D DATA
@@ -22,7 +23,7 @@ Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance also those in
 FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/audit
-those in DATA),
+those in DATA, for drill those in EVENTS/DATA),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
 P/C/RULES/A/B/W/schema/topology/unknown-node/overflow error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
@@ -997,6 +998,93 @@ def compute_audit(links, a, b, items):
             "links": link_rows, "reroutes": reroutes}
 
 
+def compute_drill(links, a, b, events, items):
+    # Fault-window drill over the audit records with a <= t <= b. events
+    # hold validated (0, t, n, up) node tuples and (1, t, u, v, up) tuples
+    # on initially-up edges, t non-decreasing; items hold validated audit
+    # (pid, f, t, s, d, path) tuples. Nodes start up and edges keep their
+    # FILE state; flips are atomic and idempotent. The first effective
+    # down opens the fault window at its t; the window closes at the t
+    # where every object downed so far is up again, and any down after
+    # that is an error. Events at the same t apply in order before the
+    # records at that t, so a record is before the window while t < f,
+    # inside it while f <= t < e, and after it once t >= e. Rates use
+    # exactly _format_peak with a zero denominator giving 0.000000; p95
+    # is the ceil(0.95*D)-th smallest delivered delay, as in audit.
+    node_down = set()
+    edge_down = set()
+    ever_nodes = set()
+    ever_edges = set()
+    start = None
+    end = None
+    for event in events:
+        if event[0] == 0:
+            _, t, target, up = event
+            down_set, ever_set = node_down, ever_nodes
+        else:
+            _, t, u, v, up = event
+            target = (u, v)
+            down_set, ever_set = edge_down, ever_edges
+        if up:
+            if target in down_set:
+                down_set.remove(target)
+                if end is None and not node_down and not edge_down:
+                    end = t
+        else:
+            if end is not None:
+                # The window already closed; no new fault may start.
+                fail(5)
+            if target not in down_set:
+                down_set.add(target)
+                ever_set.add(target)
+                if start is None:
+                    start = t
+
+    # [N, D, X, delays] per phase: before / during / after the window.
+    phases = [[0, 0, 0, []] for _ in range(3)]
+    for _, _, t, s, d, _ in items:
+        if not a <= t <= b:
+            continue
+        if start is None or t < start:
+            phase = 0
+        elif end is not None and t >= end:
+            phase = 2
+        else:
+            phase = 1
+        entry = phases[phase]
+        entry[0] += 1
+        if s == 0:
+            entry[1] += 1
+            entry[3].append(d)
+        else:
+            entry[2] += 1
+
+    p = []
+    for n, delivered, lost, delays in phases:
+        if delivered:
+            delays.sort()
+            p95 = delays[(95 * delivered + 99) // 100 - 1]
+        else:
+            p95 = None
+        p.append([n, delivered, lost,
+                  _format_peak(delivered, n) if n else "0.000000",
+                  _format_peak(lost, n) if n else "0.000000",
+                  p95])
+
+    # Affected edges: initially up, and the edge itself or one of its
+    # endpoints was down at some point, listed in FILE order.
+    affected = [[link["from"], link["to"]] for link in links
+                if link["up"]
+                and ((link["from"], link["to"]) in ever_edges
+                     or link["from"] in ever_nodes
+                     or link["to"] in ever_nodes)]
+
+    return {"a": a, "b": b, "f": start,
+            "r": [end, end - start] if end is not None else [None, None],
+            "p": p, "l": affected}
+
+
+
 def compute_replay(nodes, links, a, b, events):
     # Event-driven replay over a mutable up-graph. The clock jumps to each
     # event's t and processes it atomically; equal t keeps input order, so
@@ -1885,6 +1973,124 @@ def main():
                         fail(5)
             items.append((pid, f, t, s, d, path))
         result = compute_audit(links, a, b, items)
+    elif argv[1] == "drill":
+        if len(argv) != 7:
+            fail(2)
+        file_path, a_text, b_text, events_text, data_text = \
+            argv[2], argv[3], argv[4], argv[5], argv[6]
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        a = _bounded_int_arg(a_text)
+        b = _bounded_int_arg(b_text)
+        if a > b:
+            fail(5)
+        try:
+            data = json.loads(events_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        # Node items name any node; link items must name an initially-up
+        # directed edge, and every event t must lie inside [a, b].
+        up_pairs = {(link["from"], link["to"]) for link in links
+                    if link["up"]}
+        events = []
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) < 2:
+                fail(5)
+            t = item[0]
+            kind = item[1]
+            if type(t) is not int or not a <= t <= b:
+                fail(5)
+            if previous_time is not None and t < previous_time:
+                fail(5)
+            previous_time = t
+            if type(kind) is not int or kind not in (0, 1):
+                fail(5)
+            if kind == 0:
+                if len(item) != 4:
+                    fail(5)
+                _, _, n, up = item
+                if type(n) is not str or n not in node_set:
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                events.append((0, t, n, up))
+            else:
+                if len(item) != 5:
+                    fail(5)
+                _, _, u, v, up = item
+                if (type(u) is not str or type(v) is not str
+                        or (u, v) not in up_pairs):
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                events.append((1, t, u, v, up))
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        # Records follow the audit schema exactly: the paths are a record
+        # of edges already taken, so they only need to exist, up or down.
+        pair_set = {(link["from"], link["to"]) for link in links}
+        items = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 6:
+                fail(5)
+            pid, f, t, s, d, path = item
+            if type(pid) is not str or not 1 <= len(pid) <= 64:
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if pid in seen_ids:
+                fail(5)
+            seen_ids.add(pid)
+            if type(f) is not str or not 1 <= len(f) <= 64:
+                fail(5)
+            try:
+                f.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if type(t) is not int or not 0 <= t <= MAX_COST:
+                fail(5)
+            if previous_time is not None and t < previous_time:
+                fail(5)
+            previous_time = t
+            if type(s) is not int or s not in (0, 1, 2):
+                fail(5)
+            if s == 2:
+                # A no-route loss carries no delay and no path at all.
+                if d is not None or path != []:
+                    fail(5)
+            else:
+                if type(d) is not int or not 0 <= d <= MAX_TIME:
+                    fail(5)
+                # A non-empty simple node array walking directed edges
+                # (length >= 2 for s=1, so a last edge exists).
+                if not isinstance(path, list) or not path:
+                    fail(5)
+                if s == 1 and len(path) < 2:
+                    fail(5)
+                for node in path:
+                    if type(node) is not str or node not in node_set:
+                        fail(5)
+                if len(set(path)) != len(path):
+                    fail(5)
+                for x, y in zip(path, path[1:]):
+                    if (x, y) not in pair_set:
+                        fail(5)
+            items.append((pid, f, t, s, d, path))
+        result = compute_drill(links, a, b, events, items)
     elif argv[1] == "replay":
         if len(argv) != 6:
             fail(2)
