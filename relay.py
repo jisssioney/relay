@@ -7,12 +7,13 @@ Usage: python relay.py route FILE SOURCE
        python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
        python relay.py queue FILE FROM TO CAP STEP DATA
        python relay.py reorder FILE FROM TO BASE WINDOW DATA
+       python relay.py converge FILE SOURCE DESTINATION DELAY HOLD EVENTS
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/reorder also those in FILE/DATA), 5 FLOW/ORDER/DELAY/EVENTS/
-LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/schema/topology/unknown-node/
-overflow error.
+for queue/reorder/converge also those in FILE/DATA/EVENTS), 5 FLOW/
+ORDER/DELAY/HOLD/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/schema/
+topology/unknown-node/overflow error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline.
 """
@@ -484,6 +485,87 @@ def compute_reorder(frm, to, base, window, packets):
             "packets": results}
 
 
+def compute_converge(nodes, links, source, destination, delay, hold,
+                     events):
+    # Debounced recomputation after link-state changes. A real change
+    # (up flag actually flips) cancels any unfinished trigger/completion
+    # cycle and schedules a trigger at t+delay with completion at
+    # t+delay+hold; the trigger recomputes the route on the topology
+    # current at that moment and the completion installs it. At equal
+    # times events are processed before timers, and a trigger fires
+    # before a completion. Repeated settings of the same state are
+    # idempotent and neither cancel nor schedule anything.
+    state = {(link["from"], link["to"]): link["up"] for link in links}
+
+    def current_links():
+        return [link for link in links
+                if state[(link["from"], link["to"])]]
+
+    def snapshot():
+        # Installed route as (cost, path, reachable); reachable requires
+        # every edge of the installed path to be up right now.
+        if installed_path is None:
+            return [None, [], False]
+        reachable = all(state[pair]
+                        for pair in zip(installed_path, installed_path[1:]))
+        return [installed_cost, installed_path, reachable]
+
+    def emit(time, kind):
+        timeline.append([time, kind] + snapshot())
+
+    def fire_due(limit, inclusive):
+        # Fire every pending timer due at or before limit (strictly
+        # before limit when inclusive is false). A completion scheduled
+        # by a trigger firing here is itself fired when already due.
+        nonlocal pending, installed_cost, installed_path
+        while pending is not None and (pending[0] < limit
+                                       or inclusive and pending[0] == limit):
+            time = pending[0]
+            kind = pending[1]
+            if kind == 2:
+                # Recompute on the topology as of the trigger time; the
+                # result is held until the completion installs it.
+                cost_of, path_of = shortest_paths(nodes, current_links(),
+                                                  source)
+                pending = (time + hold, 3, cost_of[destination],
+                           path_of[destination])
+            else:
+                installed_cost, installed_path = pending[2], pending[3]
+                pending = None
+            emit(time, kind)
+
+    cost_of, path_of = shortest_paths(nodes, current_links(), source)
+    installed_cost = cost_of[destination]
+    installed_path = path_of[destination]
+    pending = None  # (time, kind, cost, path); kind 2 trigger, 3 completion
+    timeline = []
+    emit(0, 0)
+
+    i = 0
+    while i < len(events):
+        time = events[i]["time"]
+        # Timers due strictly before this slot fire first; timers due at
+        # this time wait until every event of the slot is processed.
+        fire_due(time, False)
+        while i < len(events) and events[i]["time"] == time:
+            event = events[i]
+            pair = (event["from"], event["to"])
+            if state[pair] != event["up"]:
+                state[pair] = event["up"]
+                trigger_time = time + delay
+                completion_time = trigger_time + hold
+                if completion_time > MAX_TIME:
+                    fail(5)
+                pending = (trigger_time, 2, None, None)
+            emit(time, 1)
+            i += 1
+        # Trigger at this slot fires before the completion it schedules.
+        fire_due(time, True)
+    # Advance the clock past the last event until no cycle is pending.
+    fire_due(MAX_TIME, True)
+    return {"timeline": timeline}
+
+
 def main():
     argv = sys.argv
     if len(argv) < 2:
@@ -698,6 +780,48 @@ def main():
                 fail(5)
             packets.append((pid, seq, arrival))
         result = compute_reorder(frm, to, base, window, packets)
+    elif argv[1] == "converge":
+        if len(argv) != 8:
+            fail(2)
+        file_path, source, destination = argv[2], argv[3], argv[4]
+        delay_text, hold_text, events_text = argv[5], argv[6], argv[7]
+        nodes, links, node_set = load_network(file_path, strict=True)
+        if source not in node_set or destination not in node_set:
+            fail(5)
+        delay = _bounded_int_arg(delay_text)
+        hold = _bounded_int_arg(hold_text)
+        try:
+            raw_events = json.loads(events_text, parse_constant=_reject_constant,
+                                    parse_float=_finite_float,
+                                    object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(raw_events, list):
+            fail(5)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        events = []
+        previous_time = None
+        for event in raw_events:
+            if (not isinstance(event, dict)
+                    or list(event) != ["time", "from", "to", "up"]):
+                fail(5)
+            time = event["time"]
+            frm = event["from"]
+            to = event["to"]
+            up = event["up"]
+            if type(time) is not int or not 0 <= time <= MAX_COST:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if (type(frm) is not str or type(to) is not str
+                    or (frm, to) not in pair_set):
+                fail(5)
+            if type(up) is not bool:
+                fail(5)
+            events.append({"time": time, "from": frm, "to": to, "up": up})
+        result = compute_converge(nodes, links, source, destination,
+                                  delay, hold, events)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
