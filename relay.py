@@ -21,28 +21,34 @@ Usage: python relay.py route FILE SOURCE
        python relay.py sloeval FILE A B W POLICY EVENTS DATA
        python relay.py slocmp FILE A B W OLD NEW EVENTS DATA
        python relay.py slogate FILE A B W CUR NEW EVENTS DATA
+       python relay.py hotload FILE STATE A B W BASE OP EVENTS DATA
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
        python relay.py impair FILE S D DATA
 
-Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
+Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE),
+4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance also those in
 FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/audit
 those in DATA, for drill/multidrill/convstat/slosum those in
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
 those in OLD/NEW/EVENTS/DATA, for slogate those in
-CUR/NEW/EVENTS/DATA),
+CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
-P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/schema/topology/unknown-node/
-overflow/re-failure error.
+P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
+unknown-node/overflow/re-failure error; for hotload code 5 also covers
+a STATE whose v/p/h structure, version continuity, or version conflict
+is invalid.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
-newline.
+newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
+STATE untouched, and reports the slogate gate codes in why.
 """
 
 import hashlib
 import json
 import math
+import os
 import sys
 from bisect import bisect_left, bisect_right
 from collections import deque
@@ -2102,6 +2108,152 @@ def _parse_drill_items(data, node_set, pair_set):
     return items
 
 
+def _is_policy(value):
+    # An SLO policy as used by slogate: a six-element list of
+    # non-boolean integers in [0, MAX_COST] ([u, o, d, f, s, g]).
+    return (isinstance(value, list) and len(value) == 6
+            and all(type(x) is int and 0 <= x <= MAX_COST for x in value))
+
+
+def _load_state(path):
+    # Read and strictly decode the hotload state file. JSON syntax
+    # errors, duplicate keys, and non-finite numbers are code 4; any
+    # read/UTF-8 problem is code 3. Structural/range checks belong to
+    # _validate_hotload_state and stay code 5.
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        fail(3)
+    except UnicodeDecodeError:
+        fail(4)
+    try:
+        data = json.loads(text, parse_constant=_reject_constant,
+                          parse_float=_finite_float,
+                          object_pairs_hook=_object_no_dup)
+    except (ValueError, RecursionError):
+        fail(4)
+    return data
+
+
+def _validate_hotload_state(data):
+    # State is {"v": v, "p": p, "h": h} with keys in that order: v is
+    # the current version, p the current policy, and h a version-zero
+    # continuous history of [version, policy] pairs whose last entry is
+    # exactly [v, p]. Returns the normalized (v, p, h).
+    if not isinstance(data, dict) or list(data.keys()) != ["v", "p", "h"]:
+        fail(5)
+    v = data["v"]
+    p = data["p"]
+    h = data["h"]
+    if type(v) is not int or not 0 <= v <= MAX_COST:
+        fail(5)
+    if not _is_policy(p):
+        fail(5)
+    if not isinstance(h, list) or len(h) != v + 1:
+        fail(5)
+    expected_version = 0
+    for entry in h:
+        if not isinstance(entry, list) or len(entry) != 2:
+            fail(5)
+        hv, hp = entry
+        if type(hv) is not int or hv != expected_version:
+            fail(5)
+        if not _is_policy(hp):
+            fail(5)
+        expected_version += 1
+    if h[-1][0] != v or h[-1][1] != p:
+        fail(5)
+    return v, p, [list(entry) for entry in h]
+
+
+def _write_state_atomic(path, state):
+    # Replace the state file atomically: serialize, flush+fsync a
+    # sibling temp file, os.replace it over the destination, then fsync
+    # the directory. Any failure removes the temp file (never leaving
+    # residue) and the destination stays byte-for-byte untouched.
+    text = json.dumps(state, ensure_ascii=False,
+                      separators=(",", ":")) + "\n"
+    payload = text.encode("utf-8")
+    directory = os.path.dirname(os.path.abspath(path))
+    tmp_path = path + ".tmp"
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        try:
+            dir_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    except OSError:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        fail(3)
+
+
+def _validate_hotload_records(links, events, data, node_set, pair_set, a, b):
+    # Stream validation matching slogate's data contract (the record
+    # checks inside compute_convstat) without running the windowed gate:
+    # apply the normalized events to the final up-graph in O(events),
+    # then verify every [t, f, path] record in O(records). Every hotload
+    # request validates its inputs before the idempotent/base/gate
+    # decision, so a rollback stays O(H + J + P) with no gate compute.
+    node_up = {}
+    link_up = {(link["from"], link["to"]): link["up"] for link in links}
+    for _t, kind, *rest in events:
+        if kind == 0:
+            node, up = rest
+            node_up[node] = up
+        else:
+            u, v, up = rest
+            link_up[(u, v)] = up
+    previous_time = None
+    seen_marks = set()
+    for item in data:
+        if not isinstance(item, list) or len(item) != 3:
+            fail(5)
+        t, f, path = item
+        if type(t) is not int or not 0 <= t <= MAX_COST:
+            fail(5)
+        if not a <= t <= b:
+            fail(5)
+        if previous_time is not None and t < previous_time:
+            fail(5)
+        previous_time = t
+        if type(f) is not str or not 1 <= len(f) <= 64:
+            fail(5)
+        try:
+            f.encode("utf-8")
+        except UnicodeEncodeError:
+            fail(5)
+        if (t, f) in seen_marks:
+            fail(5)
+        seen_marks.add((t, f))
+        if not isinstance(path, list):
+            fail(5)
+        if path:
+            for node in path:
+                if type(node) is not str or node not in node_set:
+                    fail(5)
+                if not node_up.get(node, True):
+                    fail(5)
+            if len(set(path)) != len(path):
+                fail(5)
+            for x, y in zip(path, path[1:]):
+                if (x, y) not in pair_set:
+                    fail(5)
+                if not link_up[(x, y)]:
+                    fail(5)
+
+
 def main():
     argv = sys.argv
     if len(argv) < 2:
@@ -3220,6 +3372,101 @@ def main():
                 seen_ids.add(pid)
                 items.append((1, t, pid))
         result = compute_impair(nodes, links, source, destination, items)
+    elif argv[1] == "hotload":
+        if len(argv) != 11:
+            fail(2)
+        file_path, state_path, a_text, b_text, width_text, base_text, \
+            op_text, events_text, data_text = (argv[2], argv[3], argv[4],
+                                               argv[5], argv[6], argv[7],
+                                               argv[8], argv[9], argv[10])
+        # Inputs are validated up front, following slogate's order: both
+        # files are read/decoded first (read errors code 3, strict JSON
+        # errors code 4), then the integer args, then the inline JSON.
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        raw_state = _load_state(state_path)
+        a = _bounded_int_arg(a_text)
+        b = _bounded_int_arg(b_text)
+        width = _bounded_int_arg(width_text)
+        base = _bounded_int_arg(base_text)
+        if a > b or width < 1:
+            fail(5)
+        try:
+            op = json.loads(op_text, parse_constant=_reject_constant,
+                            parse_float=_finite_float,
+                            object_pairs_hook=_object_no_dup)
+            raw_events = json.loads(
+                events_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(op, list) or len(op) != 2 or type(op[0]) is not int:
+            fail(5)
+        kind = op[0]
+        if kind not in (0, 1):
+            fail(5)
+        v, current_policy, history = _validate_hotload_state(raw_state)
+        up_pairs = {(link["from"], link["to"]) for link in links
+                    if link["up"]}
+        pair_set = {(link["from"], link["to"]) for link in links}
+        events = _parse_drill_events(raw_events, up_pairs, node_set, a, b)
+        if not isinstance(data, list):
+            fail(5)
+        _validate_hotload_records(links, events, data, node_set, pair_set,
+                                  a, b)
+
+        if kind == 0:
+            target_policy = op[1]
+            if not _is_policy(target_policy):
+                fail(5)
+            if target_policy == current_policy:
+                # Loading the policy already current is idempotent: no
+                # base check, no gate, no new version, no STATE write.
+                result = {"s": 2, "v": v, "p": current_policy, "why": []}
+            else:
+                if base != v:
+                    fail(5)
+                new_v = v + 1
+                if new_v > MAX_COST:
+                    fail(5)
+                # Reuse the slogate gate with CUR the current policy and
+                # NEW the candidate; a rejection writes nothing.
+                gate = compute_slogate(links, node_set, pair_set, a, b,
+                                       width, current_policy, target_policy,
+                                       events, data)
+                if gate["why"]:
+                    result = {"s": 1, "v": v, "p": current_policy,
+                              "why": gate["why"]}
+                else:
+                    new_history = history + [[new_v, target_policy]]
+                    new_state = {"v": new_v, "p": target_policy,
+                                 "h": new_history}
+                    _write_state_atomic(state_path, new_state)
+                    result = {"s": 0, "v": new_v, "p": target_policy,
+                              "why": []}
+        else:
+            target = op[1]
+            if type(target) is not int or not 0 <= target <= MAX_COST:
+                fail(5)
+            if target == v:
+                # Rolling back to the current version is idempotent.
+                result = {"s": 2, "v": v, "p": current_policy, "why": []}
+            else:
+                if base != v:
+                    fail(5)
+                if target >= len(history) or history[target][0] != target:
+                    fail(5)
+                new_v = v + 1
+                if new_v > MAX_COST:
+                    fail(5)
+                target_policy = history[target][1]
+                new_history = history + [[new_v, target_policy]]
+                new_state = {"v": new_v, "p": target_policy,
+                             "h": new_history}
+                _write_state_atomic(state_path, new_state)
+                result = {"s": 0, "v": new_v, "p": target_policy, "why": []}
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
