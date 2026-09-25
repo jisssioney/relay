@@ -8,12 +8,13 @@ Usage: python relay.py route FILE SOURCE
        python relay.py queue FILE FROM TO CAP STEP DATA
        python relay.py reorder FILE FROM TO BASE WINDOW DATA
        python relay.py converge FILE SRC DST D R EVENTS
+       python relay.py policy FILE SRC DST PORT CLASS RULES
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/reorder/converge also those in FILE/DATA/EVENTS), 5 FLOW/
-ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/schema/
-topology/unknown-node/overflow error.
+for queue/reorder/converge/policy also those in FILE/DATA/EVENTS/
+RULES), 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/
+DATA/D/R/PORT/CLASS/RULES/schema/topology/unknown-node/overflow error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline.
 """
@@ -513,10 +514,14 @@ def compute_converge(nodes, links, source, destination, delay, run, events):
 
     def entry(now, kind):
         # The last three fields always describe the currently installed
-        # route; an installed path with a down edge is not reachable.
-        if installed_path is not None and reachable(installed_path):
+        # route: an installed path with a down edge keeps its cost and
+        # path but is reported unreachable; nothing installed means
+        # null cost and an empty path.
+        if installed_path is None:
+            return [now, kind, None, [], False]
+        if reachable(installed_path):
             return [now, kind, installed_cost, installed_path, True]
-        return [now, kind, None, [], False]
+        return [now, kind, installed_cost, installed_path, False]
 
     timeline = [entry(0, 0)]
 
@@ -567,6 +572,37 @@ def compute_converge(nodes, links, source, destination, delay, run, events):
             timeline.append(entry(now, 3))
 
     return {"timeline": timeline}
+
+
+def compute_policy(nodes, links, source, destination, port, class_name,
+                   rules):
+    # Policy routing: rules are tried in ascending priority n (ties keep
+    # their array order, which sorted's stability preserves); a rule
+    # matches when its s/d equal the query's, its p/c are null (wildcard)
+    # or equal, and every directed edge of its path is up. The first
+    # usable rule wins; otherwise fall back to the lowest-cost route.
+    up_pairs = {(link["from"], link["to"]) for link in links if link["up"]}
+    link_cost = {(link["from"], link["to"]): link["cost"] for link in links}
+    for i in sorted(range(len(rules)), key=lambda i: rules[i][0]):
+        _, s, d, p, c, path = rules[i]
+        if s != source or d != destination:
+            continue
+        if p is not None and p != port:
+            continue
+        if c is not None and c != class_name:
+            continue
+        pairs = list(zip(path, path[1:]))
+        if any(pair not in up_pairs for pair in pairs):
+            continue
+        cost = sum(link_cost[pair] for pair in pairs)
+        return {"source": source, "destination": destination, "port": port,
+                "class": class_name, "rule": i, "cost": cost, "path": path}
+    cost_of, path_of = shortest_paths(nodes, links, source)
+    cost = cost_of[destination]
+    path = path_of[destination]
+    return {"source": source, "destination": destination, "port": port,
+            "class": class_name, "rule": None, "cost": cost,
+            "path": path if path is not None else []}
 
 
 def main():
@@ -823,6 +859,65 @@ def main():
                 fail(5)
         result = compute_converge(nodes, links, source, destination,
                                   delay, run, events)
+    elif argv[1] == "policy":
+        if len(argv) != 8:
+            fail(2)
+        file_path, source, destination = argv[2], argv[3], argv[4]
+        port_text, class_name, rules_text = argv[5], argv[6], argv[7]
+        nodes, links, node_set = load_network(file_path, strict=True)
+        if source not in node_set or destination not in node_set:
+            fail(5)
+        port = _bounded_int_arg(port_text)
+        if port > 65535:
+            fail(5)
+        if not 1 <= len(class_name) <= 32:
+            fail(5)
+        try:
+            class_name.encode("utf-8")
+        except UnicodeEncodeError:
+            fail(5)
+        try:
+            rule_data = json.loads(rules_text, parse_constant=_reject_constant,
+                                   parse_float=_finite_float,
+                                   object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(rule_data, list):
+            fail(5)
+        link_pairs = {(link["from"], link["to"]) for link in links}
+        rules = []
+        for item in rule_data:
+            if not isinstance(item, list) or len(item) != 6:
+                fail(5)
+            n, s, d, p, c, path = item
+            if type(n) is not int or not 0 <= n <= MAX_COST:
+                fail(5)
+            if (type(s) is not str or type(d) is not str
+                    or s not in node_set or d not in node_set):
+                fail(5)
+            if p is not None and (type(p) is not int or not 0 <= p <= 65535):
+                fail(5)
+            if c is not None:
+                if type(c) is not str or not 1 <= len(c) <= 32:
+                    fail(5)
+                try:
+                    c.encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(5)
+            if not isinstance(path, list) or not path:
+                fail(5)
+            for hop in path:
+                if type(hop) is not str or hop not in node_set:
+                    fail(5)
+            if len(set(path)) != len(path):
+                fail(5)
+            if path[0] != s or path[-1] != d:
+                fail(5)
+            if any(pair not in link_pairs for pair in zip(path, path[1:])):
+                fail(5)
+            rules.append((n, s, d, p, c, path))
+        result = compute_policy(nodes, links, source, destination,
+                                port, class_name, rules)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
