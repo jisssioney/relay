@@ -10,12 +10,14 @@ Usage: python relay.py route FILE SOURCE
        python relay.py converge FILE SRC DST D R EVENTS
        python relay.py policy FILE S D P C RULES
        python relay.py reserve FILE DATA
+       python relay.py rebalance FILE DATA LIMIT
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/reorder/converge/policy/reserve also those in FILE/DATA/
-EVENTS/RULES), 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/
-WINDOW/DATA/D/R/P/C/RULES/schema/topology/unknown-node/overflow error.
+for queue/reorder/converge/policy/reserve/rebalance also those in
+FILE/DATA/EVENTS/RULES), 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/
+STEP/BASE/WINDOW/DATA/D/R/P/C/RULES/schema/topology/unknown-node/
+overflow error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline.
 """
@@ -721,6 +723,205 @@ def compute_reserve(nodes, links, requests):
                       for i, link in enumerate(links)]}
 
 
+def _peak_text(num, den):
+    # Format num/den (non-negative) rounded half-up to six decimal places
+    # with integer arithmetic only: the rounded millionth count is
+    # floor(10^6*n/d + 1/2) = (2*10^6*n + d) // (2*d). Python ints cannot
+    # overflow in the multiplication.
+    units = (2 * num * 1000000 + den) // (2 * den)
+    return "%d.%06d" % (units // 1000000, units % 1000000)
+
+
+def compute_rebalance(nodes, links, flows, limit):
+    # Joint rerouting of existing reservations. Each flow carries a fixed
+    # bandwidth b over an up directed simple path; rerouting swaps its
+    # path for another up simple path s->d. An assignment is feasible iff
+    # every edge's summed b stays within bandwidth. Feasible assignments
+    # are ranked lexicographically by (peak used/bandwidth compared as
+    # fractions with integer cross-multiplication, number of rerouted
+    # flows, path vector in DATA order under Unicode code point order),
+    # and committed only when the peak strictly drops.
+    capacity = [link["bandwidth"] for link in links]
+    target_of = [link["to"] for link in links]
+    index_of = {}
+    adj = {n: [] for n in nodes}
+    for index, link in enumerate(links):
+        index_of[(link["from"], link["to"])] = index
+        if link["up"]:
+            adj[link["from"]].append((link["to"], index))
+
+    # flow_data[k] = (id, s, d, b, node_path, edge_indices).
+    flow_data = []
+    for rid, s, d, b, path in flows:
+        edges = [index_of[(a, c)] for a, c in zip(path, path[1:])]
+        flow_data.append((rid, s, d, b, path, edges))
+
+    def peak_of(loads):
+        # (num, den) of the maximum used/bandwidth fraction, compared
+        # elsewhere strictly by integer cross-multiplication.
+        num, den = 0, 1
+        for i, used in enumerate(loads):
+            if used * den > num * capacity[i]:
+                num, den = used, capacity[i]
+        return num, den
+
+    # Initial peak from the given paths.
+    initial_load = [0] * len(links)
+    for rid, s, d, b, path, edges in flow_data:
+        for i in edges:
+            initial_load[i] += b
+    initial_num, initial_den = peak_of(initial_load)
+
+    K = len(flows)
+    # Nested iterative DFS. For each active flow k the suspended topology
+    # walk keeps: node/edge stacks tnodes[k]/tedges[k], its visited set
+    # vis[k], and one adjacency iterator per open node tstack[k]. Reaching
+    # d yields a candidate: a feasible one is tentatively applied and flow
+    # k+1 opens beneath it; when that flow's enumeration is exhausted the
+    # candidate is undone and the walk retreats from d. Live state is
+    # O(KV+E); only feasible leaves build the O(KV) path vector.
+    cur_load = [0] * len(links)
+    choice = [None] * K
+    best = None  # (num, den, moved, path_vector, edge_choices)
+    moved = 0
+    tnodes = [None] * K
+    tedges = [None] * K
+    vis = [None] * K
+    tstack = [None] * K
+
+    def open_flow(k):
+        tnodes[k] = [flow_data[k][1]]
+        tedges[k] = []
+        vis[k] = {flow_data[k][1]}
+        tstack[k] = [iter(adj[flow_data[k][1]])]
+
+    def leaf_assignment():
+        nonlocal best
+        num, den = peak_of(cur_load)
+        if num * initial_den >= initial_num * den:
+            return
+        pathvec = []
+        for j in range(K):
+            seq = [flow_data[j][1]]
+            seq.extend(target_of[i] for i in choice[j])
+            pathvec.append(seq)
+        if (best is None
+                or num * best[1] < best[0] * den
+                or (num * best[1] == best[0] * den
+                    and (moved < best[2]
+                         or (moved == best[2] and pathvec < best[3])))):
+            best = (num, den, moved, pathvec,
+                    [list(choice[j]) for j in range(K)])
+
+    def undo_candidate(k):
+        nonlocal moved
+        edges = choice[k]
+        b = flow_data[k][3]
+        for i in edges:
+            cur_load[i] -= b
+        if edges != flow_data[k][5]:
+            moved -= 1
+        choice[k] = None
+
+    if K:
+        open_flow(0)
+    depth = 0
+    while K:
+        try:
+            to, eidx = next(tstack[depth][-1])
+        except StopIteration:
+            tstack[depth].pop()
+            if tstack[depth]:
+                vis[depth].remove(tnodes[depth].pop())
+                tedges[depth].pop()
+                continue
+            # Flow depth's simple-path enumeration is exhausted.
+            if depth == 0:
+                break
+            depth -= 1
+            # Undo the parent flow's accepted candidate and pull its walk
+            # back from the destination it is still parked on.
+            undo_candidate(depth)
+            vis[depth].remove(tnodes[depth].pop())
+            tedges[depth].pop()
+            continue
+        if to in vis[depth]:
+            continue
+        d = flow_data[depth][2]
+        b = flow_data[depth][3]
+        orig_edges = flow_data[depth][5]
+        is_last = depth + 1 == K
+        # Tentatively extend the topology path.
+        vis[depth].add(to)
+        tnodes[depth].append(to)
+        tedges[depth].append(eidx)
+        if to != d:
+            tstack[depth].append(iter(adj[to]))
+            continue
+        edges = list(tedges[depth])
+        is_move = edges != orig_edges
+        feasible = (not (is_move and moved + 1 > limit)
+                    and not any(cur_load[i] + b > capacity[i]
+                                for i in edges))
+        if feasible:
+            for i in edges:
+                cur_load[i] += b
+            if is_move:
+                moved += 1
+            choice[depth] = edges
+            if is_last:
+                leaf_assignment()
+                undo_candidate(depth)
+            else:
+                open_flow(depth + 1)
+                depth += 1
+                continue
+        # Reject the candidate (or return from an evaluated leaf): the
+        # destination never gets its own adjacency frame.
+        vis[depth].remove(tnodes[depth].pop())
+        tedges[depth].pop()
+
+    peak_before = _peak_text(initial_num, initial_den)
+    if not K:
+        # No flows means no before/after pair: the single zero peak is
+        # emitted per contract.
+        return {"status": 0,
+                "peak": ["0.000000"],
+                "moved": 0,
+                "flows": [],
+                "links": [[link["from"], link["to"], capacity[i], 0]
+                          for i, link in enumerate(links)]}
+    if best is None:
+        result_flows = [[rid, path, path]
+                        for rid, s, d, b, path, edges in flow_data]
+        final_load = initial_load
+        status = 0
+        moved_count = 0
+        peak_after = peak_before
+    else:
+        _, _, moved_count, _, chosen_edges = best
+        node_paths = []
+        final_load = [0] * len(links)
+        for k, edges in enumerate(chosen_edges):
+            seq = [flow_data[k][1]]
+            seq.extend(target_of[i] for i in edges)
+            node_paths.append(seq)
+            for i in edges:
+                final_load[i] += flow_data[k][3]
+        result_flows = [[flow_data[k][0], flow_data[k][4], node_paths[k]]
+                        for k in range(K)]
+        status = 1
+        peak_after = _peak_text(best[0], best[1])
+
+    result_links = [[link["from"], link["to"], capacity[i], final_load[i]]
+                    for i, link in enumerate(links)]
+    return {"status": status,
+            "peak": [peak_before, peak_after],
+            "moved": moved_count,
+            "flows": result_flows,
+            "links": result_links}
+
+
 def main():
     argv = sys.argv
     if len(argv) < 2:
@@ -1072,6 +1273,66 @@ def main():
                 fail(5)
             requests.append((rid, s, d, b))
         result = compute_reserve(nodes, links, requests)
+    elif argv[1] == "rebalance":
+        if len(argv) != 5:
+            fail(2)
+        file_path, data_text, limit_text = argv[2], argv[3], argv[4]
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        limit = _bounded_int_arg(limit_text)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        up_pairs = {(link["from"], link["to"]) for link in links
+                    if link["up"]}
+        flows = []
+        seen_ids = set()
+        loads = [0] * len(links)
+        for item in data:
+            if not isinstance(item, list) or len(item) != 5:
+                fail(5)
+            rid, s, d, b, path = item
+            if type(rid) is not str or not 1 <= len(rid) <= 64:
+                fail(5)
+            try:
+                rid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if rid in seen_ids:
+                fail(5)
+            seen_ids.add(rid)
+            if (type(s) is not str or type(d) is not str
+                    or s not in node_set or d not in node_set or s == d):
+                fail(5)
+            if type(b) is not int or not 1 <= b <= MAX_COST:
+                fail(5)
+            if (not isinstance(path, list) or not path
+                    or path[0] != s or path[-1] != d):
+                fail(5)
+            for node in path:
+                if type(node) is not str or node not in node_set:
+                    fail(5)
+            if len(set(path)) != len(path):
+                fail(5)
+            for a, c in zip(path, path[1:]):
+                if (a, c) not in up_pairs:
+                    fail(5)
+            flows.append((rid, s, d, b, path))
+        # The given allocation must satisfy every edge capacity.
+        edge_index = {(link["from"], link["to"]): i
+                      for i, link in enumerate(links)}
+        for rid, s, d, b, path in flows:
+            for a, c in zip(path, path[1:]):
+                i = edge_index[(a, c)]
+                loads[i] += b
+                if loads[i] > links[i]["bandwidth"]:
+                    fail(5)
+        result = compute_rebalance(nodes, links, flows, limit)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
