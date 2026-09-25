@@ -13,13 +13,14 @@ Usage: python relay.py route FILE SOURCE
        python relay.py rebalance FILE DATA LIMIT
        python relay.py quality FILE A B DATA
        python relay.py replay FILE A B DATA
+       python relay.py nfail FILE S D W DATA
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance also those in
-FILE/DATA/EVENTS/RULES, for quality/replay those in DATA), 5 FLOW/ORDER/
-DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/P/C/RULES/
-A/B/schema/topology/unknown-node/overflow error.
+FILE/DATA/EVENTS/RULES, for quality/replay/nfail those in DATA), 5
+FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/P/C/
+RULES/A/B/W/schema/topology/unknown-node/overflow error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline.
 """
@@ -976,6 +977,132 @@ def compute_replay(nodes, links, a, b, events):
             "changes": summary["changes"]}
 
 
+def compute_nfail(nodes, links, source, destination, wait, events):
+    # 1+1 protection with node failures and a W-tick switch timer. Both
+    # routes are fixed once here from the initial all-up graph (events
+    # only flip node states): the primary is the lowest-cost up path,
+    # ties going to the full node sequence smallest in Unicode code
+    # point order; the backup is recomputed on a graph with the
+    # primary's internal nodes and directed edges deleted, and is
+    # absent whenever the primary is absent. Events share one
+    # non-decreasing clock; a node item flips that node's state
+    # (repeated setting is idempotent) and a packet item is delivered
+    # only on the currently active route when all of its nodes are up.
+    up_links = [link for link in links if link["up"]]
+    cost_of, path_of = shortest_paths(nodes, up_links, source)
+    primary_cost = cost_of[destination]
+    primary_path = path_of[destination]
+    if primary_path is None:
+        backup_cost = None
+        backup_path = None
+    else:
+        removed_nodes = set(primary_path[1:-1])
+        removed_edges = set(zip(primary_path, primary_path[1:]))
+        backup_nodes = [n for n in nodes if n not in removed_nodes]
+        backup_links = [link for link in up_links
+                        if (link["from"] not in removed_nodes
+                            and link["to"] not in removed_nodes
+                            and (link["from"], link["to"]) not in removed_edges)]
+        bcost_of, bpath_of = shortest_paths(backup_nodes, backup_links, source)
+        backup_cost = bcost_of[destination]
+        backup_path = bpath_of[destination]
+
+    primary = [primary_cost, primary_path if primary_path is not None else []]
+    backup = [backup_cost, backup_path if backup_path is not None else []]
+
+    up_of = {n: True for n in nodes}
+    # Both routes are fixed, so a node flip updates a constant-time
+    # "down nodes on the route" counter instead of rescanning paths.
+    on_primary = set(primary_path or ())
+    on_backup = set(backup_path or ())
+    down_on = {1: 0, 2: 0}
+
+    def target():
+        # First fully-up candidate in primary, backup, no-route order.
+        if primary_path is not None and down_on[1] == 0:
+            return 1
+        if backup_path is not None and down_on[2] == 0:
+            return 2
+        return 0
+
+    active = target()
+    active_path = (primary_path if active == 1
+                   else backup_path if active == 2 else None)
+    fire_at = None
+    pending_target = active
+    segments = []
+    segment_start = 0
+    results = []
+
+    def close_segment(end):
+        nonlocal segment_start
+        if active_path is not None:
+            segments.append([segment_start, end, active_path])
+        segment_start = end
+
+    def fire(now):
+        # The timer at `now` wins: install the route captured when it
+        # was armed, regardless of where that route currently stands.
+        nonlocal active, active_path, fire_at
+        close_segment(now)
+        active = pending_target
+        active_path = (primary_path if active == 1
+                       else backup_path if active == 2 else None)
+        fire_at = None
+
+    i = 0
+    n = len(events)
+    while i < n or fire_at is not None:
+        if i >= n:
+            # Advance after the last item to finish the pending timer.
+            fire(fire_at)
+            continue
+        now = events[i][1]
+        if fire_at is not None and fire_at < now:
+            # Crossing an input-free deadline finishes the timer first.
+            fire(fire_at)
+            continue
+        # Inputs at this tick run first, in order; a real change cancels
+        # or rearms the timer (to now+W) before it could complete here.
+        while i < n and events[i][1] == now:
+            event = events[i]
+            i += 1
+            if event[0] == 0:
+                _, _, node, is_up = event
+                if up_of[node] != is_up:
+                    up_of[node] = is_up
+                    delta = 1 if not is_up else -1
+                    if node in on_primary:
+                        down_on[1] += delta
+                    if node in on_backup:
+                        down_on[2] += delta
+                    new_target = target()
+                    if new_target != active:
+                        pending_target = new_target
+                        fire_at = now + wait
+                        if fire_at > MAX_TIME:
+                            fail(5)
+                    else:
+                        fire_at = None
+            else:
+                _, _, pid = event
+                delivered = active_path is not None and (
+                    (active_path is primary_path and down_on[1] == 0)
+                    or (active_path is backup_path and down_on[2] == 0))
+                if delivered:
+                    cost = primary_cost if active == 1 else backup_cost
+                    results.append([pid, now, 0, cost, active_path])
+                elif not up_of[source] or not up_of[destination]:
+                    results.append([pid, now, 1, None, []])
+                else:
+                    results.append([pid, now, 2, None, []])
+        if fire_at is not None and fire_at == now:
+            # Same tick: the timer completes only after every input.
+            fire(now)
+
+    return {"m": primary, "b": backup, "s": segments, "p": results}
+
+
 def main():
     argv = sys.argv
     if len(argv) < 2:
@@ -1523,6 +1650,57 @@ def main():
                     fail(5)
                 events.append((1, t, pid, f, s, d))
         result = compute_replay(nodes, links, a, b, events)
+    elif argv[1] == "nfail":
+        if len(argv) != 7:
+            fail(2)
+        file_path, source, destination = argv[2], argv[3], argv[4]
+        wait_text, data_text = argv[5], argv[6]
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        if (source not in node_set or destination not in node_set
+                or source == destination):
+            fail(5)
+        wait = _bounded_int_arg(wait_text)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        events = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) not in (2, 3):
+                fail(5)
+            t = item[0]
+            if type(t) is not int or not 0 <= t <= MAX_COST:
+                fail(5)
+            if previous_time is not None and t < previous_time:
+                fail(5)
+            previous_time = t
+            if len(item) == 3:
+                _, node, is_up = item
+                if type(node) is not str or node not in node_set:
+                    fail(5)
+                if type(is_up) is not bool:
+                    fail(5)
+                events.append((0, t, node, is_up))
+            else:
+                _, pid = item
+                if type(pid) is not str or not 1 <= len(pid) <= 64:
+                    fail(5)
+                try:
+                    pid.encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(5)
+                if pid in seen_ids:
+                    fail(5)
+                seen_ids.add(pid)
+                events.append((1, t, pid))
+        result = compute_nfail(nodes, links, source, destination, wait,
+                               events)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
