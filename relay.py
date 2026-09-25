@@ -3,10 +3,11 @@
 Usage: python relay.py route FILE SOURCE
        python relay.py ecmp FILE SOURCE FLOW
        python relay.py metric FILE SOURCE ORDER
+       python relay.py protect FILE SOURCE DESTINATION DELAY EVENTS
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax,
-5 FLOW/ORDER/schema/topology/unknown-source error. On failure stdout
-stays empty and stderr is exactly {"error":N} plus a newline.
+5 FLOW/ORDER/DELAY/EVENTS/schema/topology/unknown-node error. On failure
+stdout stays empty and stderr is exactly {"error":N} plus a newline.
 """
 
 import hashlib
@@ -272,6 +273,78 @@ def compute_ecmp(nodes, links, source, flow):
     return {"source": source, "flow": flow, "routes": routes}
 
 
+def compute_protect(nodes, links, source, destination, delay, events):
+    # Primary: lowest-cost path in the initial up-graph. Backup: lowest-cost
+    # path after removing the primary's directed edges. Both are computed
+    # once here and never recomputed; events only flip link states.
+    up_links = [link for link in links if link["up"]]
+    cost_of, path_of = shortest_paths(nodes, up_links, source)
+    primary_cost = cost_of[destination]
+    primary_path = path_of[destination]
+    if primary_path is None:
+        backup_cost = None
+        backup_path = None
+    else:
+        removed = set(zip(primary_path, primary_path[1:]))
+        backup_links = [link for link in up_links
+                        if (link["from"], link["to"]) not in removed]
+        bcost_of, bpath_of = shortest_paths(nodes, backup_links, source)
+        backup_cost = bcost_of[destination]
+        backup_path = bpath_of[destination]
+
+    state = {(link["from"], link["to"]): link["up"] for link in links}
+
+    def usable(path):
+        return (path is not None
+                and all(state[pair] for pair in zip(path, path[1:])))
+
+    def selected():
+        # Prefer an available primary, then the backup, else no path.
+        if usable(primary_path):
+            return primary_path
+        if usable(backup_path):
+            return backup_path
+        return None
+
+    results = []
+    current = selected()
+    for event in events:
+        before = current if current is not None else []
+        pair = (event["from"], event["to"])
+        if state[pair] == event["up"]:
+            # Repeated setting is idempotent.
+            reason = 0
+            switch_time = None
+            after = before
+        else:
+            state[pair] = event["up"]
+            new = selected()
+            after = new if new is not None else []
+            if after == before:
+                reason = 1
+                switch_time = None
+            else:
+                switch_time = event["time"] + delay
+                if new is primary_path:
+                    reason = 2
+                elif new is None:
+                    reason = 5
+                elif current is primary_path:
+                    reason = 3
+                else:
+                    reason = 4
+            current = new
+        results.append({"time": event["time"], "from": event["from"],
+                        "to": event["to"], "up": event["up"],
+                        "switchTime": switch_time, "reason": reason,
+                        "before": before, "after": after})
+
+    return {"source": source, "destination": destination,
+            "primary": {"cost": primary_cost, "path": primary_path or []},
+            "backup": {"cost": backup_cost, "path": backup_path or []},
+            "events": results}
+
+
 def main():
     argv = sys.argv
     if len(argv) < 2:
@@ -311,6 +384,49 @@ def main():
         if source not in node_set:
             fail(5)
         result = compute_metric(nodes, links, source, order_names)
+    elif argv[1] == "protect":
+        if len(argv) != 7:
+            fail(2)
+        file_path, source, destination = argv[2], argv[3], argv[4]
+        delay_text, events_text = argv[5], argv[6]
+        nodes, links, node_set = load_network(file_path)
+        if (source not in node_set or destination not in node_set
+                or source == destination):
+            fail(5)
+        if (not delay_text
+                or any(c not in "0123456789" for c in delay_text)):
+            fail(5)
+        delay = int(delay_text)
+        if delay > MAX_COST:
+            fail(5)
+        try:
+            events = json.loads(events_text, parse_constant=_reject_constant)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(events, list):
+            fail(5)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        previous_time = None
+        for event in events:
+            if (not isinstance(event, dict)
+                    or list(event) != ["time", "from", "to", "up"]):
+                fail(5)
+            time = event["time"]
+            frm = event["from"]
+            to = event["to"]
+            up = event["up"]
+            if type(time) is not int or not 0 <= time <= MAX_COST:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if (type(frm) is not str or type(to) is not str
+                    or (frm, to) not in pair_set):
+                fail(5)
+            if type(up) is not bool:
+                fail(5)
+        result = compute_protect(nodes, links, source, destination,
+                                 delay, events)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
