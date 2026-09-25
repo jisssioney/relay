@@ -10,12 +10,14 @@ Usage: python relay.py route FILE SOURCE
        python relay.py converge FILE SRC DST D R EVENTS
        python relay.py policy FILE S D P C RULES
        python relay.py reserve FILE DATA
+       python relay.py rebalance FILE DATA LIMIT
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/reorder/converge/policy/reserve also those in FILE/DATA/
-EVENTS/RULES), 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/
-WINDOW/DATA/D/R/P/C/RULES/schema/topology/unknown-node/overflow error.
+for queue/reorder/converge/policy/reserve/rebalance also those in
+FILE/DATA/EVENTS/RULES), 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/
+STEP/BASE/WINDOW/DATA/D/R/P/C/RULES/schema/topology/unknown-node/
+overflow error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline.
 """
@@ -721,6 +723,167 @@ def compute_reserve(nodes, links, requests):
                       for i, link in enumerate(links)]}
 
 
+def _format_peak(num, den):
+    # num/den rounded half up to exactly six decimals, computed in
+    # integers so no float rounding can leak into the output.
+    scaled = (2 * num * 1000000 + den) // (2 * den)
+    return "%d.%06d" % (scaled // 1000000, scaled % 1000000)
+
+
+def compute_rebalance(nodes, links, demands, limit):
+    # Joint path reallocation minimizing the peak link utilization. Every
+    # demand keeps exactly one up simple path; an assignment is feasible
+    # when no link carries more than its bandwidth and at most `limit`
+    # demands leave their original path. Feasible assignments are ranked
+    # by peak used/bandwidth (fractions compared with integer cross-
+    # multiplication, never floats), then by the number of rerouted
+    # demands, then by the DATA-order vector of paths in Unicode code
+    # point order. The best assignment is committed atomically only when
+    # its peak is strictly below the initial one. The search enumerates
+    # the Cartesian product of the per-demand simple-path sets with an
+    # explicit stack — O((V!)^K (KV+E)) time, O(KV+E) space — pruning
+    # branches that already violate capacity or the reroute limit.
+    adj = {n: [] for n in nodes}
+    index_of = {}
+    for index, link in enumerate(links):
+        index_of[(link["from"], link["to"])] = index
+        if link["up"]:
+            adj[link["from"]].append((link["to"], index))
+    capacity = [link["bandwidth"] for link in links]
+
+    initial_used = [0] * len(links)
+    for _, _, _, b, path in demands:
+        for a, c in zip(path, path[1:]):
+            initial_used[index_of[(a, c)]] += b
+    for index, used_here in enumerate(initial_used):
+        if used_here > capacity[index]:
+            # The initial placement must already fit every link.
+            fail(5)
+
+    def peak_of(used):
+        # max(used[i]/capacity[i]) as an exact fraction.
+        num, den = 0, 1
+        for u, c in zip(used, capacity):
+            if u * den > num * c:
+                num, den = u, c
+        return num, den
+
+    init_num, init_den = peak_of(initial_used)
+
+    def enum_paths(source, destination):
+        # Yield (path, edge_indices) for every up simple path from
+        # source to destination via iterative DFS, so the enumeration
+        # depth is bounded by heap, not by the Python recursion limit.
+        path = [source]
+        edges = []
+        visited = {source}
+        iters = [iter(adj[source])]
+        while iters:
+            try:
+                to, index = next(iters[-1])
+            except StopIteration:
+                iters.pop()
+                if iters:
+                    visited.remove(path.pop())
+                    edges.pop()
+                continue
+            if to in visited:
+                continue
+            visited.add(to)
+            path.append(to)
+            edges.append(index)
+            if to == destination:
+                yield list(path), list(edges)
+                visited.remove(path.pop())
+                edges.pop()
+            else:
+                iters.append(iter(adj[to]))
+
+    best_num = best_den = best_moved = None
+    best_paths = best_used = None
+    count = len(demands)
+    if count:
+        used = [0] * len(links)
+        current_paths = [None] * count
+        current_edges = [None] * count
+        generators = [None] * count
+        moved = 0
+        depth = 0
+        generators[0] = enum_paths(demands[0][1], demands[0][2])
+        while depth >= 0:
+            item = next(generators[depth], None)
+            if item is None:
+                # The level's paths are exhausted: backtrack and undo
+                # the shallower level's assignment.
+                generators[depth] = None
+                depth -= 1
+                if depth >= 0:
+                    b = demands[depth][3]
+                    for index in current_edges[depth]:
+                        used[index] -= b
+                    if current_paths[depth] != demands[depth][4]:
+                        moved -= 1
+                    current_paths[depth] = None
+                    current_edges[depth] = None
+                continue
+            path, edges = item
+            b = demands[depth][3]
+            if any(used[index] + b > capacity[index] for index in edges):
+                continue
+            delta = 1 if path != demands[depth][4] else 0
+            if moved + delta > limit:
+                continue
+            for index in edges:
+                used[index] += b
+            current_paths[depth] = path
+            current_edges[depth] = edges
+            moved += delta
+            if depth + 1 < count:
+                depth += 1
+                generators[depth] = enum_paths(demands[depth][1],
+                                               demands[depth][2])
+            else:
+                num, den = peak_of(used)
+                if (best_paths is None
+                        or num * best_den < best_num * den
+                        or (num * best_den == best_num * den
+                            and (moved < best_moved
+                                 or (moved == best_moved
+                                     and current_paths < best_paths)))):
+                    best_num, best_den = num, den
+                    best_moved = moved
+                    best_paths = list(current_paths)
+                    best_used = list(used)
+                for index in edges:
+                    used[index] -= b
+                moved -= delta
+                current_paths[depth] = None
+                current_edges[depth] = None
+
+    if best_paths is not None and best_num * init_den < init_num * best_den:
+        status = 1
+        final_used = best_used
+        new_paths = best_paths
+        moved_out = best_moved
+        out_num, out_den = best_num, best_den
+    else:
+        status = 0
+        final_used = initial_used
+        new_paths = [path for _, _, _, _, path in demands]
+        moved_out = 0
+        out_num, out_den = init_num, init_den
+
+    return {"status": status,
+            "peak": [_format_peak(init_num, init_den),
+                     _format_peak(out_num, out_den)],
+            "moved": moved_out,
+            "flows": [[demands[i][0], demands[i][4], new_paths[i]]
+                      for i in range(count)],
+            "links": [[link["from"], link["to"], capacity[i],
+                       final_used[i]]
+                      for i, link in enumerate(links)]}
+
+
 def main():
     argv = sys.argv
     if len(argv) < 2:
@@ -1072,6 +1235,58 @@ def main():
                 fail(5)
             requests.append((rid, s, d, b))
         result = compute_reserve(nodes, links, requests)
+    elif argv[1] == "rebalance":
+        if len(argv) != 5:
+            fail(2)
+        file_path, data_text, limit_text = argv[2], argv[3], argv[4]
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        up_of = {}
+        for link in links:
+            up_of[(link["from"], link["to"])] = link["up"]
+        demands = []
+        seen_ids = set()
+        for item in data:
+            if not isinstance(item, list) or len(item) != 5:
+                fail(5)
+            rid, s, d, b, path = item
+            if type(rid) is not str or not 1 <= len(rid) <= 64:
+                fail(5)
+            try:
+                rid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if rid in seen_ids:
+                fail(5)
+            seen_ids.add(rid)
+            if (type(s) is not str or type(d) is not str
+                    or s not in node_set or d not in node_set or s == d):
+                fail(5)
+            if type(b) is not int or not 1 <= b <= MAX_COST:
+                fail(5)
+            if (not isinstance(path, list) or not path
+                    or path[0] != s or path[-1] != d):
+                fail(5)
+            for node in path:
+                if type(node) is not str or node not in node_set:
+                    fail(5)
+            if len(set(path)) != len(path):
+                fail(5)
+            for a, c in zip(path, path[1:]):
+                pair = (a, c)
+                if pair not in up_of or not up_of[pair]:
+                    fail(5)
+            demands.append((rid, s, d, b, path))
+        limit = _bounded_int_arg(limit_text)
+        result = compute_rebalance(nodes, links, demands, limit)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
