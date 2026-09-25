@@ -19,6 +19,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py convstat FILE A B EVENTS DATA
        python relay.py slosum FILE A B W EVENTS DATA
        python relay.py sloeval FILE A B W POLICY EVENTS DATA
+       python relay.py slocmp FILE A B W OLD NEW EVENTS DATA
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
        python relay.py impair FILE S D DATA
@@ -28,10 +29,11 @@ Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 for queue/reorder/converge/policy/reserve/rebalance also those in
 FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/audit
 those in DATA, for drill/multidrill/convstat/slosum those in
-EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA),
+EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
+those in OLD/NEW/EVENTS/DATA),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
-P/C/RULES/A/B/W/POLICY/schema/topology/unknown-node/overflow/re-failure
-error.
+P/C/RULES/A/B/W/POLICY/OLD/NEW/schema/topology/unknown-node/overflow/
+re-failure error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline.
 """
@@ -1504,25 +1506,24 @@ def compute_slosum(links, node_set, pair_set, a, b, width, events, data):
     return {"a": a, "b": b, "width": width, "windows": windows}
 
 
-def compute_sloeval(links, node_set, pair_set, a, b, width, policy,
-                    events, data):
-    # Windowed convergence-SLO evaluation. Windows come from compute_slosum
-    # and each is checked against policy [u, o, d, f, s, g]: u caps the
-    # unrecovered count U, o the still-open count O, d the recovery p95
-    # ds[4], f the affected-flow total F, s the change total S, and g the
-    # number of violating windows the budget still tolerates. A window is
-    # compliant when every reason list is empty; thresholds are inclusive,
-    # so equality never violates. Reason codes, in order: 0 for U > u,
-    # 1 for O > o, 2 for a window with periods (C + O > 0) but no recovery
-    # delay sample (ds[0] = 0), 3 for ds[0] > 0 with p95 > d, 4 for F > f,
-    # 5 for S > s. The excess vector reports q(z) = max(z, 0) of each
-    # overshoot, with the p95 slot null when ds[0] = 0.
-    summary = compute_slosum(links, node_set, pair_set, a, b, width,
-                             events, data)
+def _sloeval_policy(summary_windows, policy):
+    # Evaluate one SLO policy [u, o, d, f, s, g] against compute_slosum
+    # windows: u caps the unrecovered count U, o the still-open count O,
+    # d the recovery p95 ds[4], f the affected-flow total F, s the change
+    # total S, and g the number of violating windows the budget still
+    # tolerates. A window is compliant when every reason list is empty;
+    # thresholds are inclusive, so equality never violates. Reason codes,
+    # in order: 0 for U > u, 1 for O > o, 2 for a window with periods
+    # (C + O > 0) but no recovery delay sample (ds[0] = 0), 3 for
+    # ds[0] > 0 with p95 > d, 4 for F > f, 5 for S > s. The excess vector
+    # reports q(z) = max(z, 0) of each overshoot, with the p95 slot null
+    # when ds[0] = 0. Returns (evals, runs, budget) where evals holds
+    # [ok, reasons, excess] per window, runs the maximal runs of adjacent
+    # violating windows, and budget the four-integer budget array.
     u_lim, o_lim, d_lim, f_lim, s_lim, g = policy
-    windows = []
+    evals = []
     for x, y, closed, unrecovered, open_count, ds, flows_total, c_total \
-            in summary["windows"]:
+            in summary_windows:
         reasons = []
         if unrecovered > u_lim:
             reasons.append(0)
@@ -1541,28 +1542,87 @@ def compute_sloeval(links, node_set, pair_set, a, b, width, policy,
                   max(ds[4] - d_lim, 0) if ds[0] > 0 else None,
                   max(flows_total - f_lim, 0),
                   max(c_total - s_lim, 0)]
-        windows.append([x, y, not reasons, reasons, excess])
+        evals.append([not reasons, reasons, excess])
 
     # Maximal runs of adjacent violating windows; the windows tile [a, b]
     # in order, so adjacency is consecutive index.
     runs = []
     violations = 0
     i = 0
-    count = len(windows)
+    count = len(evals)
     while i < count:
-        if windows[i][2]:
+        if evals[i][0]:
             i += 1
             continue
         j = i
-        while j + 1 < count and not windows[j + 1][2]:
+        while j + 1 < count and not evals[j + 1][0]:
             j += 1
-        runs.append([windows[i][0], windows[j][1], j - i + 1])
+        runs.append([summary_windows[i][0], summary_windows[j][1],
+                     j - i + 1])
         violations += j - i + 1
         i = j + 1
 
     budget = [g, violations, max(g - violations, 0),
               max(violations - g, 0)]
+    return evals, runs, budget
+
+
+def compute_sloeval(links, node_set, pair_set, a, b, width, policy,
+                    events, data):
+    # Windowed convergence-SLO evaluation: evaluate POLICY against the
+    # compute_slosum windows via _sloeval_policy and attach each window's
+    # [ok, reasons, excess] to its [x, y].
+    summary = compute_slosum(links, node_set, pair_set, a, b, width,
+                             events, data)
+    evals, runs, budget = _sloeval_policy(summary["windows"], policy)
+    windows = [[window[0], window[1]] + ev
+               for window, ev in zip(summary["windows"], evals)]
     return {"a": a, "b": b, "width": width, "policy": policy,
+            "windows": windows, "runs": runs, "budget": budget}
+
+
+def compute_slocmp(links, node_set, pair_set, a, b, width, old, new,
+                   events, data):
+    # Windowed convergence-SLO comparison of two policies. Both OLD and
+    # NEW follow the sloeval POLICY [u, o, d, f, s, g] contract and are
+    # evaluated by _sloeval_policy over the same compute_slosum windows.
+    # Per window: O/N are each policy's [ok, reasons, excess]; t is 0
+    # when the ok flags agree, 1 on a true->false flip, 2 on false->true;
+    # add/remove list the reason codes NEW adds/eliminates, ascending;
+    # delta is NEW excess minus OLD excess per slot, null when either
+    # side is null. runs pairs each policy's maximal violation runs with
+    # [d1, d2], NEW minus OLD in run count and violating-window count;
+    # budget pairs the four-integer budget arrays with their elementwise
+    # difference.
+    summary = compute_slosum(links, node_set, pair_set, a, b, width,
+                             events, data)
+    old_evals, old_runs, old_budget = _sloeval_policy(summary["windows"],
+                                                      old)
+    new_evals, new_runs, new_budget = _sloeval_policy(summary["windows"],
+                                                      new)
+    windows = []
+    for window, (o_ok, o_reasons, o_excess), (n_ok, n_reasons, n_excess) \
+            in zip(summary["windows"], old_evals, new_evals):
+        if o_ok == n_ok:
+            t = 0
+        elif o_ok:
+            t = 1
+        else:
+            t = 2
+        add = sorted(set(n_reasons) - set(o_reasons))
+        remove = sorted(set(o_reasons) - set(n_reasons))
+        delta = [None if o_ex is None or n_ex is None else n_ex - o_ex
+                 for o_ex, n_ex in zip(o_excess, n_excess)]
+        windows.append([window[0], window[1],
+                        [o_ok, o_reasons, o_excess],
+                        [n_ok, n_reasons, n_excess],
+                        t, [add, remove], delta])
+    runs = [old_runs, new_runs,
+            [len(new_runs) - len(old_runs),
+             new_budget[1] - old_budget[1]]]
+    budget = [old_budget, new_budget,
+              [n_v - o_v for o_v, n_v in zip(old_budget, new_budget)]]
+    return {"a": a, "b": b, "width": width, "old": old, "new": new,
             "windows": windows, "runs": runs, "budget": budget}
 
 
@@ -2798,6 +2858,51 @@ def main():
         events = _parse_drill_events(raw_events, up_pairs, node_set, a, b)
         result = compute_sloeval(links, node_set, pair_set, a, b, width,
                                  policy, events, data)
+    elif argv[1] == "slocmp":
+        if len(argv) != 10:
+            fail(2)
+        file_path, a_text, b_text, width_text, old_text, new_text, \
+            events_text, data_text = (argv[2], argv[3], argv[4], argv[5],
+                                      argv[6], argv[7], argv[8], argv[9])
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        a = _bounded_int_arg(a_text)
+        b = _bounded_int_arg(b_text)
+        if a > b:
+            fail(5)
+        width = _bounded_int_arg(width_text)
+        if width < 1:
+            fail(5)
+        try:
+            old = json.loads(old_text, parse_constant=_reject_constant,
+                             parse_float=_finite_float,
+                             object_pairs_hook=_object_no_dup)
+            new = json.loads(new_text, parse_constant=_reject_constant,
+                             parse_float=_finite_float,
+                             object_pairs_hook=_object_no_dup)
+            raw_events = json.loads(
+                events_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        # OLD and NEW each follow the sloeval POLICY contract: a list of
+        # six non-boolean integers in [0, MAX_COST].
+        for policy in (old, new):
+            if not isinstance(policy, list) or len(policy) != 6:
+                fail(5)
+            for value in policy:
+                if type(value) is not int or not 0 <= value <= MAX_COST:
+                    fail(5)
+        if not isinstance(raw_events, list) or not isinstance(data, list):
+            fail(5)
+        up_pairs = {(link["from"], link["to"]) for link in links
+                    if link["up"]}
+        pair_set = {(link["from"], link["to"]) for link in links}
+        events = _parse_drill_events(raw_events, up_pairs, node_set, a, b)
+        result = compute_slocmp(links, node_set, pair_set, a, b, width,
+                                old, new, events, data)
     elif argv[1] == "replay":
         if len(argv) != 6:
             fail(2)
