@@ -23,6 +23,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py slogate FILE A B W CUR NEW EVENTS DATA
        python relay.py hotload FILE STATE A B W BASE OP EVENTS DATA
        python relay.py snapshot STATE OP
+       python relay.py config PACK OP
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
        python relay.py impair FILE S D DATA
@@ -36,14 +37,18 @@ those in DATA, for drill/multidrill/convstat/slosum those in
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
 those in OLD/NEW/EVENTS/DATA, for slogate those in
 CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA, for
-snapshot those in STATE/OP/IN),
+snapshot those in STATE/OP/IN, for config those in PACK/OP/IN),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
 P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
 unknown-node/overflow/re-failure error; for hotload code 5 also covers
 a STATE whose v/p/h structure, version continuity, or version conflict
 is invalid; for snapshot code 5 also covers an invalid OP shape, path,
 or BASE, a STATE/IN whose v/p/h structure, key order, or version
-continuity is invalid, and a BASE that conflicts with the current v.
+continuity is invalid, and a BASE that conflicts with the current v;
+for config code 5 also covers an invalid OP shape, path, or BASE, a
+PACK/IN whose v/t/p/h structure, key order, topology schema, version
+continuity, or version conflict is invalid, and a BASE that conflicts
+with the current v.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -91,7 +96,11 @@ def _object_no_dup(pairs):
     return obj
 
 
-def load_network(path, metrics=False, strict=False):
+def _load_json_document(path):
+    # Read and strictly decode a JSON document: read/UTF-8 problems are
+    # code 3, while JSON syntax errors, duplicate keys, and non-finite
+    # numbers are code 4. Structural/range checks are left to callers
+    # and stay code 5.
     try:
         with open(path, "r", encoding="utf-8") as f:
             text = f.read()
@@ -99,24 +108,43 @@ def load_network(path, metrics=False, strict=False):
         fail(3)
     except UnicodeDecodeError:
         fail(4)
-
     try:
-        if strict:
-            data = json.loads(text, parse_constant=_reject_constant,
-                              parse_float=_finite_float,
-                              object_pairs_hook=_object_no_dup)
-        else:
-            data = json.loads(text, parse_constant=_reject_constant)
+        data = json.loads(text, parse_constant=_reject_constant,
+                          parse_float=_finite_float,
+                          object_pairs_hook=_object_no_dup)
     except (ValueError, RecursionError):
         fail(4)
+    return data
 
+
+def load_network(path, metrics=False, strict=False):
+    if strict:
+        data = _load_json_document(path)
+    else:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            fail(3)
+        except UnicodeDecodeError:
+            fail(4)
+        try:
+            data = json.loads(text, parse_constant=_reject_constant)
+        except (ValueError, RecursionError):
+            fail(4)
+    return validate_network(data, metrics)
+
+
+def validate_network(data, metrics=False):
+    # Schema checks for a topology FILE: a {"nodes", "links"} object,
+    # distinct non-empty string nodes, and links whose key set is the
+    # base set plus, in FILE (metric) mode, the bandwidth/latency pair.
+    # The returned structure is normalized into canonical key order so a
+    # config pack round-trips byte-for-byte.
     if not isinstance(data, dict) or set(data) != {"nodes", "links"}:
         fail(5)
     nodes = data["nodes"]
     links = data["links"]
-
-    base_keys = {"from", "to", "cost", "up"}
-    link_keys = base_keys | {"bandwidth", "latency"} if metrics else base_keys
 
     if not isinstance(nodes, list):
         fail(5)
@@ -128,9 +156,17 @@ def load_network(path, metrics=False, strict=False):
 
     if not isinstance(links, list):
         fail(5)
+    normalized_links = []
     seen_pairs = set()
     for link in links:
-        if not isinstance(link, dict) or set(link) != link_keys:
+        if not isinstance(link, dict):
+            fail(5)
+        keys = set(link)
+        if metrics:
+            if keys != {"from", "to", "cost", "up", "bandwidth",
+                        "latency"}:
+                fail(5)
+        elif keys != {"from", "to", "cost", "up"}:
             fail(5)
         frm = link["from"]
         to = link["to"]
@@ -144,6 +180,7 @@ def load_network(path, metrics=False, strict=False):
             fail(5)
         if type(up) is not bool:
             fail(5)
+        normalized = {"from": frm, "to": to, "cost": cost, "up": up}
         if metrics:
             bw = link["bandwidth"]
             lat = link["latency"]
@@ -151,12 +188,15 @@ def load_network(path, metrics=False, strict=False):
                 fail(5)
             if type(lat) is not int or not 0 <= lat <= MAX_COST:
                 fail(5)
+            normalized["bandwidth"] = bw
+            normalized["latency"] = lat
         pair = (frm, to)
         if pair in seen_pairs:
             fail(5)
         seen_pairs.add(pair)
+        normalized_links.append(normalized)
 
-    return nodes, links, node_set
+    return list(nodes), normalized_links, node_set
 
 
 def shortest_paths(nodes, links, source):
@@ -2124,20 +2164,7 @@ def _load_state(path):
     # errors, duplicate keys, and non-finite numbers are code 4; any
     # read/UTF-8 problem is code 3. Structural/range checks belong to
     # _validate_hotload_state and stay code 5.
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            text = f.read()
-    except OSError:
-        fail(3)
-    except UnicodeDecodeError:
-        fail(4)
-    try:
-        data = json.loads(text, parse_constant=_reject_constant,
-                          parse_float=_finite_float,
-                          object_pairs_hook=_object_no_dup)
-    except (ValueError, RecursionError):
-        fail(4)
-    return data
+    return _load_json_document(path)
 
 
 def _validate_hotload_state(data):
@@ -2179,14 +2206,21 @@ def _state_payload(state):
     return text.encode("utf-8")
 
 
-def _write_state_atomic(path, state):
-    # Replace the state file atomically: serialize, then exclusively
-    # create a unique sibling temp file with an incrementing suffix (a
-    # collision only retries under the next name), flush+fsync it,
-    # os.replace it over the destination, then fsync the directory.
-    # Any failure removes only the temp file this call acquired and
-    # leaves the destination byte-for-byte untouched.
-    payload = _state_payload(state)
+def _config_payload(pack):
+    # Canonical on-disk form for a config pack: top-level key order
+    # v,t,p,h, otherwise identical rules to the state payload.
+    text = json.dumps(pack, ensure_ascii=False,
+                      separators=(",", ":")) + "\n"
+    return text.encode("utf-8")
+
+
+def _atomic_write(path, payload):
+    # Replace a file atomically: serialize, then exclusively create a
+    # unique sibling temp file with an incrementing suffix (a collision
+    # only retries under the next name), flush+fsync it, os.replace it
+    # over the destination, then fsync the directory. Any failure
+    # removes only the temp file this call acquired and leaves the
+    # destination byte-for-byte untouched.
     directory = os.path.dirname(os.path.abspath(path))
     suffix = 0
     while True:
@@ -2220,6 +2254,50 @@ def _write_state_atomic(path, state):
         except OSError:
             pass
         fail(3)
+
+
+def _write_state_atomic(path, state):
+    _atomic_write(path, _state_payload(state))
+
+
+def _validate_config_pack(data):
+    # A config pack is {"v": v, "t": t, "p": p, "h": h} with keys in
+    # that order: v is the current version in [0, MAX_COST], t the
+    # current topology in metric FILE mode, p the current six-integer
+    # policy, and h a non-empty version-zero continuous history of
+    # [version, t, p] entries whose last entry is exactly [v, t, p].
+    # Returns the normalized (v, t, p, h) with canonical key order.
+    if not isinstance(data, dict) or list(data.keys()) != ["v", "t", "p", "h"]:
+        fail(5)
+    v = data["v"]
+    t = data["t"]
+    p = data["p"]
+    h = data["h"]
+    if type(v) is not int or not 0 <= v <= MAX_COST:
+        fail(5)
+    nodes, links, _node_set = validate_network(t, metrics=True)
+    topo = {"nodes": nodes, "links": links}
+    if not _is_policy(p):
+        fail(5)
+    if not isinstance(h, list) or len(h) != v + 1:
+        fail(5)
+    history = []
+    expected_version = 0
+    for entry in h:
+        if not isinstance(entry, list) or len(entry) != 3:
+            fail(5)
+        hv, ht, hp = entry
+        if type(hv) is not int or hv != expected_version:
+            fail(5)
+        h_nodes, h_links, _ = validate_network(ht, metrics=True)
+        if not _is_policy(hp):
+            fail(5)
+        history.append([hv, {"nodes": h_nodes, "links": h_links}, hp])
+        expected_version += 1
+    if history[-1][0] != v or history[-1][1] != topo \
+            or history[-1][2] != p:
+        fail(5)
+    return v, topo, p, history
 
 
 def _validate_hotload_records(links, events, data, node_set, pair_set, a, b):
@@ -3555,6 +3633,73 @@ def main():
                 result = {"op": 1, "status": 0, "state": in_state}
         else:
             result = {"op": 2, "status": 2, "state": state}
+    elif argv[1] == "config":
+        if len(argv) != 4:
+            fail(2)
+        pack_path, op_text = argv[2], argv[3]
+        # Read/decode PACK first (read errors code 3, strict JSON errors
+        # code 4), then parse the inline OP, then check shapes.
+        raw_pack = _load_json_document(pack_path)
+        try:
+            op = json.loads(op_text, parse_constant=_reject_constant,
+                            parse_float=_finite_float,
+                            object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(op, list) or len(op) == 0 \
+                or type(op[0]) is not int:
+            fail(5)
+        kind = op[0]
+        if kind == 0:
+            # [0, OUT]: export PACK to OUT.
+            if len(op) != 2 or type(op[1]) is not str or len(op[1]) == 0:
+                fail(5)
+            out_path = op[1]
+        elif kind == 1:
+            # [1, BASE, IN]: import IN into PACK.
+            if len(op) != 3 or type(op[1]) is not int \
+                    or not 0 <= op[1] <= MAX_COST \
+                    or type(op[2]) is not str or len(op[2]) == 0:
+                fail(5)
+            base, in_path = op[1], op[2]
+        elif kind == 2:
+            # [2]: audit only, nothing is written.
+            if len(op) != 1:
+                fail(5)
+        else:
+            fail(5)
+        v, topo, policy, history = _validate_config_pack(raw_pack)
+        pack = {"v": v, "t": topo, "p": policy, "h": history}
+        if kind == 0:
+            try:
+                with open(out_path, "rb") as f:
+                    existing = f.read()
+            except FileNotFoundError:
+                existing = None
+            except OSError:
+                fail(3)
+            if existing == _config_payload(pack):
+                # OUT already holds the canonical bytes: do not write.
+                result = {"op": 0, "status": 1, "config": pack}
+            else:
+                _atomic_write(out_path, _config_payload(pack))
+                result = {"op": 0, "status": 0, "config": pack}
+        elif kind == 1:
+            raw_in = _load_json_document(in_path)
+            in_v, in_topo, in_policy, in_history = \
+                _validate_config_pack(raw_in)
+            in_pack = {"v": in_v, "t": in_topo, "p": in_policy,
+                       "h": in_history}
+            if base != v:
+                fail(5)
+            if in_pack == pack:
+                # Importing the pack already current is idempotent.
+                result = {"op": 1, "status": 1, "config": pack}
+            else:
+                _atomic_write(pack_path, _config_payload(in_pack))
+                result = {"op": 1, "status": 0, "config": in_pack}
+        else:
+            result = {"op": 2, "status": 2, "config": pack}
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
