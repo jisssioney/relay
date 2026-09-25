@@ -160,9 +160,11 @@ def compute_metric(nodes, links, source, order_names):
             adj[link["from"]].append(
                 (link["to"], link["cost"], link["bandwidth"], link["latency"]))
 
-    # Enumerate every directed simple path from the source via DFS and keep
-    # the best one per destination under the ORDER metric hierarchy. Ties on
-    # every metric go to the path with the smallest Unicode code point order.
+    # Enumerate every directed simple path from the source via an iterative
+    # DFS (explicit stack, so depth is bounded only by address space rather
+    # than Python's recursion limit) and keep the best one per destination
+    # under the ORDER metric hierarchy. Ties on every metric go to the path
+    # with the smallest Unicode code point order.
     # best[n] = (comparison_key, (hop, cost, bandwidth, latency), path)
     best = {}
 
@@ -181,19 +183,33 @@ def compute_metric(nodes, links, source, order_names):
             best[dest] = (key, (hop_count, cost, bandwidth, latency),
                           list(path))
 
-    def dfs(path, visited, hop_count, cost, bandwidth, latency):
-        consider(path, hop_count, cost, bandwidth, latency)
+    # One frame per node on the current DFS path:
+    # [next adjacency index, hop count, cost, bandwidth, latency].
+    path = [source]
+    visited = {source}
+    consider(path, 0, 0, MAX_COST, 0)
+    stack = [[0, 0, 0, MAX_COST, 0]]
+    while stack:
+        fr = stack[-1]
         u = path[-1]
-        for to, w, bw, lat in adj[u]:
-            if to not in visited:
-                visited.add(to)
-                path.append(to)
-                dfs(path, visited, hop_count + 1, cost + w,
-                    min(bandwidth, bw), latency + lat)
-                path.pop()
-                visited.remove(to)
-
-    dfs([source], {source}, 0, 0, MAX_COST, 0)
+        neighbors = adj[u]
+        if fr[0] == len(neighbors):
+            stack.pop()
+            visited.remove(u)
+            path.pop()
+            continue
+        to, w, bw, lat = neighbors[fr[0]]
+        fr[0] += 1
+        if to in visited:
+            continue
+        hop_count = fr[1] + 1
+        cost = fr[2] + w
+        bandwidth = min(fr[3], bw)
+        latency = fr[4] + lat
+        visited.add(to)
+        path.append(to)
+        consider(path, hop_count, cost, bandwidth, latency)
+        stack.append([0, hop_count, cost, bandwidth, latency])
 
     routes = []
     for n in sorted(nodes):
@@ -300,9 +316,13 @@ def main():
         result = compute_metric(nodes, links, source, order_names)
     else:
         fail(2)
-    sys.stdout.write(
-        json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n"
-    )
+    # Emit raw UTF-8 bytes with a fixed LF so the result is immune to the
+    # platform's locale encoding and Windows text-mode newline translation.
+    out = (json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+           + "\n").encode("utf-8")
+    sys.stdout.flush()
+    sys.stdout.buffer.write(out)
+    sys.stdout.buffer.flush()
 
 
 if __name__ == "__main__":
