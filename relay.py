@@ -15,11 +15,13 @@ Usage: python relay.py route FILE SOURCE
        python relay.py replay FILE A B DATA
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
+       python relay.py impair FILE S D DATA
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance also those in
-FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail those in DATA),
+FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair those
+in DATA),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
 P/C/RULES/A/B/W/schema/topology/unknown-node/overflow error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
@@ -1190,6 +1192,80 @@ def compute_lfail(nodes, links, source, destination, wait, items):
             "p": packets}
 
 
+def compute_impair(nodes, links, source, destination, items):
+    # Per-link periodic impairment applied along the lowest-cost up path.
+    # At each packet's tick the path is chosen atomically over the current
+    # up-graph (lowest cost, ties going to the complete node sequence
+    # smallest in Unicode code point order, exactly the shortest_paths
+    # tie-break); the graph never changes here, so it is chosen once.
+    # Configuration items set a link's drop modulus n and latency jitter j
+    # without resetting its counter (repeated setting is idempotent); n=0
+    # never drops, otherwise a link drops after its counter becomes a
+    # positive multiple of n. Every traversal increments the counter first
+    # and accumulates latency+j, then the drop test runs; the first hit
+    # stops the packet. Counters, n and j all start at 0 and persist for
+    # the whole run.
+    index_of = {}
+    latency_of = {}
+    for index, link in enumerate(links):
+        pair = (link["from"], link["to"])
+        index_of[pair] = index
+        latency_of[pair] = link["latency"]
+
+    up_links = [link for link in links if link["up"]]
+    _, path_of = shortest_paths(nodes, up_links, source)
+    path = path_of[destination]
+
+    count_link = len(links)
+    modulus = [0] * count_link
+    jitter = [0] * count_link
+    counter = [0] * count_link
+
+    packets = []
+    delivered = 0
+    lost = 0
+    unreachable = 0
+    delay_sum = 0
+    for item in items:
+        if item[0] == 0:
+            _, t, u, v, n, j = item
+            index = index_of[(u, v)]
+            modulus[index] = n
+            jitter[index] = j
+            continue
+        _, t, pid = item
+        if path is None:
+            packets.append([pid, t, 2, None, None, []])
+            unreachable += 1
+            continue
+        total_delay = 0
+        hit = None
+        for k in range(1, len(path)):
+            index = index_of[(path[k - 1], path[k])]
+            counter[index] += 1
+            total_delay += latency_of[(path[k - 1], path[k])] + jitter[index]
+            if modulus[index] != 0 and counter[index] % modulus[index] == 0:
+                hit = k
+                break
+        end = t + total_delay
+        if end > MAX_TIME:
+            fail(5)
+        if hit is None:
+            packets.append([pid, t, 0, end, total_delay, list(path)])
+            delivered += 1
+            delay_sum += total_delay
+        else:
+            packets.append([pid, t, 1, end, total_delay, list(path[:hit + 1])])
+            lost += 1
+
+    total = delivered + lost
+    stats = [delivered, lost, unreachable,
+             _format_peak(lost, total) if total else "0.000000",
+             _format_peak(delay_sum, delivered) if delivered else "0.000000"]
+    return {"source": source, "destination": destination,
+            "packets": packets, "stats": stats}
+
+
 def main():
     argv = sys.argv
     if len(argv) < 2:
@@ -1841,6 +1917,72 @@ def main():
                 items.append((t, pid))
         result = compute_lfail(nodes, links, source, destination,
                                wait, items)
+    elif argv[1] == "impair":
+        if len(argv) != 6:
+            fail(2)
+        file_path, source, destination, data_text = \
+            argv[2], argv[3], argv[4], argv[5]
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        if (source not in node_set or destination not in node_set
+                or source == destination):
+            fail(5)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        latency_of = {(link["from"], link["to"]): link["latency"]
+                      for link in links}
+        items = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) < 2:
+                fail(5)
+            t = item[0]
+            kind = item[1]
+            if type(t) is not int or not 0 <= t <= MAX_COST:
+                fail(5)
+            if previous_time is not None and t < previous_time:
+                fail(5)
+            previous_time = t
+            if type(kind) is not int or kind not in (0, 1):
+                fail(5)
+            if kind == 0:
+                if len(item) != 6:
+                    fail(5)
+                _, _, u, v, n, j = item
+                if (type(u) is not str or type(v) is not str
+                        or (u, v) not in pair_set):
+                    fail(5)
+                if type(n) is not int or not 0 <= n <= MAX_COST:
+                    fail(5)
+                if type(j) is not int or not -MAX_COST <= j <= MAX_COST:
+                    fail(5)
+                # Every traversal of this link adds latency+j, which must
+                # stay in the non-negative 32-bit latency range.
+                if not 0 <= latency_of[(u, v)] + j <= MAX_COST:
+                    fail(5)
+                items.append((0, t, u, v, n, j))
+            else:
+                if len(item) != 3:
+                    fail(5)
+                _, _, pid = item
+                if type(pid) is not str or not 1 <= len(pid) <= 64:
+                    fail(5)
+                try:
+                    pid.encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(5)
+                if pid in seen_ids:
+                    fail(5)
+                seen_ids.add(pid)
+                items.append((1, t, pid))
+        result = compute_impair(nodes, links, source, destination, items)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
