@@ -4,14 +4,18 @@ Usage: python relay.py route FILE SOURCE
        python relay.py ecmp FILE SOURCE FLOW
        python relay.py metric FILE SOURCE ORDER
        python relay.py protect FILE SOURCE DESTINATION DELAY EVENTS
+       python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
 
-Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax,
-5 FLOW/ORDER/DELAY/EVENTS/schema/topology/unknown-node error. On failure
-stdout stays empty and stderr is exactly {"error":N} plus a newline.
+Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
+(for forward also duplicate keys or non-finite numbers in FILE/TABLE),
+5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/schema/topology/unknown-node error.
+On failure stdout stays empty and stderr is exactly {"error":N} plus a
+newline.
 """
 
 import hashlib
 import json
+import math
 import sys
 
 MAX_COST = 2147483647
@@ -28,7 +32,26 @@ def _reject_constant(value):
     raise ValueError("invalid JSON constant: " + value)
 
 
-def load_network(path, metrics=False):
+def _finite_float(text):
+    # Reject numbers like 1e999 that parse to a non-finite float.
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError("non-finite number: " + text)
+    return value
+
+
+def _object_no_dup(pairs):
+    # object_pairs_hook rejecting duplicate keys, which JSON objects
+    # must not contain here even though json.loads would allow them.
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError("duplicate key: " + key)
+        obj[key] = value
+    return obj
+
+
+def load_network(path, metrics=False, strict=False):
     try:
         with open(path, "r", encoding="utf-8") as f:
             text = f.read()
@@ -38,7 +61,12 @@ def load_network(path, metrics=False):
         fail(4)
 
     try:
-        data = json.loads(text, parse_constant=_reject_constant)
+        if strict:
+            data = json.loads(text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        else:
+            data = json.loads(text, parse_constant=_reject_constant)
     except (ValueError, RecursionError):
         fail(4)
 
@@ -345,6 +373,39 @@ def compute_protect(nodes, links, source, destination, delay, events):
             "events": results}
 
 
+def compute_forward(links, source, destination, limit, table):
+    # Hop-by-hop forwarding along the explicit next-hop table, over up
+    # links only. seen holds every trace node before the current one, so
+    # arriving at a node already departed means the trace has a loop.
+    up_pairs = {(link["from"], link["to"]) for link in links if link["up"]}
+    trace = [[0, source]]
+    seen = set()
+    current = source
+    time = 0
+    hops = 0
+    while True:
+        if current == destination:
+            status = "delivered"
+            break
+        if current in seen:
+            status = "loop"
+            break
+        if hops == limit:
+            status = "hop_limit"
+            break
+        nxt = table[current]
+        if nxt is None or (current, nxt) not in up_pairs:
+            status = "unreachable"
+            break
+        seen.add(current)
+        current = nxt
+        time += 1
+        hops += 1
+        trace.append([time, current])
+    return {"source": source, "destination": destination, "limit": limit,
+            "status": status, "time": time, "trace": trace}
+
+
 def main():
     argv = sys.argv
     if len(argv) < 2:
@@ -427,6 +488,38 @@ def main():
                 fail(5)
         result = compute_protect(nodes, links, source, destination,
                                  delay, events)
+    elif argv[1] == "forward":
+        if len(argv) != 7:
+            fail(2)
+        file_path, source, destination = argv[2], argv[3], argv[4]
+        limit_text, table_text = argv[5], argv[6]
+        nodes, links, node_set = load_network(file_path, strict=True)
+        if source not in node_set or destination not in node_set:
+            fail(5)
+        if (not limit_text
+                or any(c not in "0123456789" for c in limit_text)):
+            fail(5)
+        # Strip leading zeros before int() so absurdly long digit strings
+        # cannot trip Python's integer conversion digit limit.
+        limit_digits = limit_text.lstrip("0") or "0"
+        if len(limit_digits) > 10:
+            fail(5)
+        limit = int(limit_digits)
+        if limit > MAX_COST:
+            fail(5)
+        try:
+            table = json.loads(table_text, parse_constant=_reject_constant,
+                               parse_float=_finite_float,
+                               object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(table, dict) or set(table) != node_set:
+            fail(5)
+        for value in table.values():
+            if (value is not None
+                    and (type(value) is not str or value not in node_set)):
+                fail(5)
+        result = compute_forward(links, source, destination, limit, table)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
