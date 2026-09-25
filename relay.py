@@ -11,13 +11,14 @@ Usage: python relay.py route FILE SOURCE
        python relay.py policy FILE S D P C RULES
        python relay.py reserve FILE DATA
        python relay.py rebalance FILE DATA LIMIT
+       python relay.py quality FILE A B DATA
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance also those in
-FILE/DATA/EVENTS/RULES), 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/
-STEP/BASE/WINDOW/DATA/D/R/P/C/RULES/schema/topology/unknown-node/
-overflow error.
+FILE/DATA/EVENTS/RULES, for quality those in DATA), 5 FLOW/ORDER/
+DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/P/C/RULES/
+A/B/schema/topology/unknown-node/overflow error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline.
 """
@@ -884,6 +885,48 @@ def compute_rebalance(nodes, links, demands, limit):
                       for i, link in enumerate(links)]}
 
 
+def compute_quality(a, b, items):
+    # Per-flow delivery quality over the items with a <= t <= b, kept in
+    # input order (t is non-decreasing and equal t keeps input order).
+    # items hold validated (id, f, t, d, path) tuples with d None for a
+    # lost packet. _format_peak is exactly F: q = (2x*10^6 + y)//(2y)
+    # rendered as q*10^-6 with six fixed decimals, all in integers.
+    total = 0
+    delays = []
+    flow_paths = {}  # f -> paths of its delivered packets, in order
+    for _, f, t, d, path in items:
+        if not a <= t <= b:
+            continue
+        total += 1
+        if d is None:
+            # A flow seen only through losses is still listed, with c=0.
+            flow_paths.setdefault(f, [])
+            continue
+        delays.append(d)
+        flow_paths.setdefault(f, []).append(path)
+
+    delivered = len(delays)
+    lost = total - delivered
+    stats = [total, delivered, lost,
+             _format_peak(lost, total) if total else "0.000000"]
+
+    n = delivered
+    if n:
+        delays.sort()
+        # p95 is the ceil(0.95*n)-th smallest, as a 1-based index.
+        delay = [n, delays[0], delays[-1],
+                 _format_peak(sum(delays), n),
+                 delays[(95 * n + 99) // 100 - 1]]
+    else:
+        delay = [0, None, None, None, None]
+
+    changes = [[f, sum(1 for x, y in zip(paths, paths[1:]) if x != y)]
+               for f, paths in sorted(flow_paths.items())]
+
+    return {"start": a, "end": b, "stats": stats, "delay": delay,
+            "changes": changes}
+
+
 def main():
     argv = sys.argv
     if len(argv) < 2:
@@ -1287,6 +1330,82 @@ def main():
             demands.append((rid, s, d, b, path))
         limit = _bounded_int_arg(limit_text)
         result = compute_rebalance(nodes, links, demands, limit)
+    elif argv[1] == "quality":
+        if len(argv) != 6:
+            fail(2)
+        file_path, a_text, b_text, data_text = \
+            argv[2], argv[3], argv[4], argv[5]
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        a = _bounded_int_arg(a_text)
+        b = _bounded_int_arg(b_text)
+        if a > b:
+            fail(5)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        up_pairs = {(link["from"], link["to"]) for link in links
+                    if link["up"]}
+        items = []
+        seen_ids = {}  # id -> (f, t, d, path) of its first occurrence
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 5:
+                fail(5)
+            pid, f, t, d, path = item
+            if type(pid) is not str or not 1 <= len(pid) <= 64:
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if type(f) is not str or not 1 <= len(f) <= 64:
+                fail(5)
+            try:
+                f.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if type(t) is not int or not 0 <= t <= MAX_COST:
+                fail(5)
+            if previous_time is not None and t < previous_time:
+                fail(5)
+            previous_time = t
+            if d is not None and (type(d) is not int
+                                  or not 0 <= d <= MAX_COST):
+                fail(5)
+            if not isinstance(path, list):
+                fail(5)
+            if d is None:
+                # A lost packet carries no path at all.
+                if path:
+                    fail(5)
+            else:
+                # A delivered packet's path is a non-empty simple node
+                # array walking up directed edges.
+                if not path:
+                    fail(5)
+                for node in path:
+                    if type(node) is not str or node not in node_set:
+                        fail(5)
+                if len(set(path)) != len(path):
+                    fail(5)
+                for x, y in zip(path, path[1:]):
+                    if (x, y) not in up_pairs:
+                        fail(5)
+            signature = (f, t, d, path)
+            if pid in seen_ids:
+                # A repeated id is dropped when the whole item matches;
+                # the same id on a different item is an error.
+                if seen_ids[pid] != signature:
+                    fail(5)
+                continue
+            seen_ids[pid] = signature
+            items.append((pid, f, t, d, path))
+        result = compute_quality(a, b, items)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
