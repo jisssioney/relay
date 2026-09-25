@@ -15,6 +15,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py replay FILE A B DATA
        python relay.py audit FILE A B DATA
        python relay.py drill FILE A B EVENTS DATA
+       python relay.py multidrill FILE A B EVENTS DATA
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
        python relay.py impair FILE S D DATA
@@ -23,7 +24,7 @@ Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance also those in
 FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/audit
-those in DATA, for drill those in EVENTS/DATA),
+those in DATA, for drill/multidrill those in EVENTS/DATA),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
 P/C/RULES/A/B/W/schema/topology/unknown-node/overflow/re-failure
 error.
@@ -1124,6 +1125,132 @@ def compute_drill(links, a, b, events, items):
     return {"a": a, "b": b, "f": f, "r": r, "p": p, "l": affected}
 
 
+def compute_multidrill(links, a, b, events, items):
+    # Multi-period failure drill, generalising compute_drill. Nodes start
+    # up and every link takes FILE's up flag; events apply in order (t
+    # non-decreasing, equal t kept in order), repeated setting idempotent.
+    # The first real down opens a period; the period closes on the tick at
+    # which the nodes and links currently down are all back up (only down
+    # objects still outstanding matter, so an object recovered early never
+    # delays the close). A real down after a close opens another period; a
+    # close and a reopen may share a tick, objects may recur across
+    # periods, and the last period may stay open.
+    node_up = {}
+    link_up = {(link["from"], link["to"]): link["up"] for link in links}
+    periods = []
+    current = None  # [start, end, down_nodes, down_links,
+                    #  ever_nodes, ever_links] while open
+
+    for t, kind, *rest in events:
+        if kind == 0:
+            node, up = rest
+            current_before = node_up.get(node, True)
+            if current_before == up:
+                continue
+            node_up[node] = up
+            if up:
+                if current is not None:
+                    current[2].discard(node)
+            else:
+                if current is None:
+                    current = [t, None, set(), set(), set(), set()]
+                    periods.append(current)
+                current[2].add(node)
+                current[4].add(node)
+        else:
+            u, v, up = rest
+            pair = (u, v)
+            current_before = link_up[pair]
+            if current_before == up:
+                continue
+            link_up[pair] = up
+            if up:
+                if current is not None:
+                    current[3].discard(pair)
+            else:
+                if current is None:
+                    current = [t, None, set(), set(), set(), set()]
+                    periods.append(current)
+                current[3].add(pair)
+                current[5].add(pair)
+        # The period closes on the tick its current down set empties; a
+        # later event at the same tick may reopen a fresh period.
+        if current is not None and not current[2] and not current[3]:
+            current[1] = t
+            current = None
+
+    if not periods:
+        return {"a": a, "b": b, "periods": []}
+
+    def phase_stats(records):
+        # [N, D, X, F(D,N), F(X,N), p95], exactly drill's per-phase stats:
+        # D is the audit status-0 count and X the status-1/2 count; both
+        # rates use _format_peak with N as the denominator, and N == 0
+        # gives 0.000000. p95 is the ceil(0.95*D)-th smallest delivered
+        # delay (1-based), null at 0.
+        delivered = 0
+        other = 0
+        delays = []
+        for _, _, _, s, d, _ in records:
+            if s == 0:
+                delivered += 1
+                delays.append(d)
+            else:
+                other += 1
+        total = delivered + other
+        if total:
+            f_delivered = _format_peak(delivered, total)
+            f_other = _format_peak(other, total)
+        else:
+            f_delivered = f_other = "0.000000"
+        if delivered:
+            delays.sort()
+            p95 = delays[(95 * delivered + 99) // 100 - 1]
+        else:
+            p95 = None
+        return [total, delivered, other, f_delivered, f_other, p95]
+
+    out_periods = []
+    for start, end, _down_nodes, _down_links, ever_nodes, ever_links \
+            in periods:
+        # Records bucket t < start (before), start <= t < end (during),
+        # t >= end (after); equal-tick events precede a record at that
+        # tick, so the start tick is "during" and the end tick is "after".
+        # An open period has an empty after phase.
+        buckets = [[], [], []]
+        for item in items:
+            t = item[2]
+            if not a <= t <= b:
+                continue
+            if t < start:
+                phase = 0
+            elif end is None or t < end:
+                phase = 1
+            else:
+                phase = 2
+            buckets[phase].append(item)
+        stats = [phase_stats(buckets[0]), phase_stats(buckets[1]),
+                 phase_stats(buckets[2])]
+
+        # An affected edge started up in FILE and, during this period, was
+        # itself down or had at least one endpoint ever down, in FILE
+        # order.
+        affected = []
+        for link in links:
+            if (link["up"]
+                    and ((link["from"], link["to"]) in ever_links
+                         or link["from"] in ever_nodes
+                         or link["to"] in ever_nodes)):
+                affected.append([link["from"], link["to"]])
+
+        out_periods.append([start,
+                            None if end is None else end,
+                            None if end is None else end - start,
+                            stats, affected])
+
+    return {"a": a, "b": b, "periods": out_periods}
+
+
 def compute_replay(nodes, links, a, b, events):
     # Event-driven replay over a mutable up-graph. The clock jumps to each
     # event's t and processes it atomically; equal t keeps input order, so
@@ -1458,6 +1585,109 @@ def compute_impair(nodes, links, source, destination, items):
              if delivered else "0.000000"]
     return {"source": source, "destination": destination,
             "packets": packets, "stats": stats}
+
+
+def _parse_drill_events(raw_events, up_pairs, node_set, a, b):
+    # Shared validation for drill/multidrill event lists: t is a bounded
+    # integer inside [a, b] and non-decreasing; node events carry a known
+    # node plus bool, link events carry an edge that is up in FILE plus
+    # bool. A link already down can neither open a failure nor be flipped
+    # back. Returns the normalized (t, kind, ...) tuples.
+    events = []
+    previous_time = None
+    for event in raw_events:
+        if not isinstance(event, list) or len(event) not in (4, 5):
+            fail(5)
+        t = event[0]
+        kind = event[1]
+        if type(t) is not int or not 0 <= t <= MAX_COST:
+            fail(5)
+        if not a <= t <= b:
+            fail(5)
+        if previous_time is not None and t < previous_time:
+            fail(5)
+        previous_time = t
+        if type(kind) is not int or kind not in (0, 1):
+            fail(5)
+        if kind == 0:
+            if len(event) != 4:
+                fail(5)
+            _, _, node, up = event
+            if type(node) is not str or node not in node_set:
+                fail(5)
+            if type(up) is not bool:
+                fail(5)
+            events.append((t, 0, node, up))
+        else:
+            if len(event) != 5:
+                fail(5)
+            _, _, u, v, up = event
+            if (type(u) is not str or type(v) is not str
+                    or (u, v) not in up_pairs):
+                fail(5)
+            if type(up) is not bool:
+                fail(5)
+            events.append((t, 1, u, v, up))
+    return events
+
+
+def _parse_drill_items(data, node_set, pair_set):
+    # Shared validation for drill/multidrill records, reusing the audit
+    # schema exactly: edges only need to exist in the topology, up or
+    # down, since the data is a record of paths already taken. Returns
+    # (pid, f, t, s, d, path) tuples in input (non-decreasing t) order.
+    items = []
+    seen_ids = set()
+    previous_time = None
+    for item in data:
+        if not isinstance(item, list) or len(item) != 6:
+            fail(5)
+        pid, f, t, s, d, path = item
+        if type(pid) is not str or not 1 <= len(pid) <= 64:
+            fail(5)
+        try:
+            pid.encode("utf-8")
+        except UnicodeEncodeError:
+            fail(5)
+        if pid in seen_ids:
+            fail(5)
+        seen_ids.add(pid)
+        if type(f) is not str or not 1 <= len(f) <= 64:
+            fail(5)
+        try:
+            f.encode("utf-8")
+        except UnicodeEncodeError:
+            fail(5)
+        if type(t) is not int or not 0 <= t <= MAX_COST:
+            fail(5)
+        if previous_time is not None and t < previous_time:
+            fail(5)
+        previous_time = t
+        if type(s) is not int or s not in (0, 1, 2):
+            fail(5)
+        if s == 2:
+            # A no-route loss carries no delay and no path at all.
+            if d is not None or path != []:
+                fail(5)
+        else:
+            if type(d) is not int or not 0 <= d <= MAX_TIME:
+                fail(5)
+            # A non-empty simple node array walking directed edges
+            # (length >= 2 for s=1, so a last edge exists).
+            if not isinstance(path, list) or not path:
+                fail(5)
+            if s == 1 and len(path) < 2:
+                fail(5)
+            for node in path:
+                if type(node) is not str or node not in node_set:
+                    fail(5)
+            if len(set(path)) != len(path):
+                fail(5)
+            for x, y in zip(path, path[1:]):
+                if (x, y) not in pair_set:
+                    fail(5)
+        items.append((pid, f, t, s, d, path))
+    return items
 
 
 def main():
@@ -2128,6 +2358,33 @@ def main():
                         fail(5)
             items.append((pid, f, t, s, d, path))
         result = compute_drill(links, a, b, events, items)
+    elif argv[1] == "multidrill":
+        if len(argv) != 7:
+            fail(2)
+        file_path, a_text, b_text, events_text, data_text = \
+            argv[2], argv[3], argv[4], argv[5], argv[6]
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        a = _bounded_int_arg(a_text)
+        b = _bounded_int_arg(b_text)
+        if a > b:
+            fail(5)
+        try:
+            raw_events = json.loads(
+                events_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(raw_events, list) or not isinstance(data, list):
+            fail(5)
+        up_pairs = {(link["from"], link["to"]) for link in links
+                    if link["up"]}
+        pair_set = {(link["from"], link["to"]) for link in links}
+        events = _parse_drill_events(raw_events, up_pairs, node_set, a, b)
+        items = _parse_drill_items(data, node_set, pair_set)
+        result = compute_multidrill(links, a, b, events, items)
     elif argv[1] == "replay":
         if len(argv) != 6:
             fail(2)
