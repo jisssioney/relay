@@ -15,11 +15,13 @@ Usage: python relay.py route FILE SOURCE
        python relay.py replay FILE A B DATA
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
+       python relay.py impair FILE S D DATA
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance also those in
-FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail those in DATA),
+FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair those in
+DATA),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
 P/C/RULES/A/B/W/schema/topology/unknown-node/overflow error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
@@ -1190,6 +1192,82 @@ def compute_lfail(nodes, links, source, destination, wait, items):
             "p": packets}
 
 
+def compute_impair(nodes, links, source, destination, items):
+    # Impairment replay on a static up-graph. Config items (0, t, u, v,
+    # n, j) set the drop modulus n and latency jitter j of the directed
+    # link u->v; they never touch its traversal counter, and repeated
+    # identical settings are idempotent. Packet items (1, t, pid) are
+    # routed at their t over the lowest-cost path in the up-graph, ties
+    # going to the node sequence smallest in Unicode code point order
+    # (exactly the shortest_paths tie-break). Config items never flip
+    # link states, so the up-graph is static and the path is computed
+    # once here; each packet then walks it edge by edge, incrementing
+    # the edge's counter and accumulating latency+j before judging the
+    # drop: a nonzero n drops the packet when the fresh counter value
+    # is a multiple of n, and the walk stops at the first such edge.
+    _, path_of = shortest_paths(nodes, links, source)
+    path = path_of[destination]
+
+    latency_of = {}
+    n_of = {}
+    j_of = {}
+    count_of = {}
+    for link in links:
+        pair = (link["from"], link["to"])
+        latency_of[pair] = link["latency"]
+        n_of[pair] = 0
+        j_of[pair] = 0
+        count_of[pair] = 0
+
+    packets = []
+    delivered = 0
+    lost = 0
+    unreachable = 0
+    delay_sum = 0
+    for item in items:
+        if item[0] == 0:
+            _, _, u, v, n, j = item
+            pair = (u, v)
+            n_of[pair] = n
+            j_of[pair] = j
+            continue
+        _, t, pid = item
+        if path is None:
+            unreachable += 1
+            packets.append([pid, t, 2, None, None, []])
+            continue
+        delay = 0
+        status = 0
+        used = path
+        for i in range(len(path) - 1):
+            pair = (path[i], path[i + 1])
+            count_of[pair] += 1
+            delay += latency_of[pair] + j_of[pair]
+            if t + delay > MAX_TIME:
+                fail(5)
+            n = n_of[pair]
+            if n and count_of[pair] % n == 0:
+                # The packet is lost on this edge; later edges are
+                # neither counted nor timed.
+                status = 1
+                used = path[:i + 2]
+                break
+        if status == 0:
+            delivered += 1
+            delay_sum += delay
+        else:
+            lost += 1
+        packets.append([pid, t, status, t + delay, delay, used])
+
+    stats = [delivered, lost, unreachable,
+             _format_peak(lost, delivered + lost)
+             if delivered + lost else "0.000000",
+             _format_peak(delay_sum, delivered)
+             if delivered else "0.000000"]
+    return {"source": source, "destination": destination,
+            "packets": packets, "stats": stats}
+
+
 def main():
     argv = sys.argv
     if len(argv) < 2:
@@ -1841,6 +1919,69 @@ def main():
                 items.append((t, pid))
         result = compute_lfail(nodes, links, source, destination,
                                wait, items)
+    elif argv[1] == "impair":
+        if len(argv) != 6:
+            fail(2)
+        file_path, source, destination = argv[2], argv[3], argv[4]
+        data_text = argv[5]
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        if (source not in node_set or destination not in node_set
+                or source == destination):
+            fail(5)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        latency_of = {(link["from"], link["to"]): link["latency"]
+                      for link in links}
+        items = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) < 2:
+                fail(5)
+            t = item[0]
+            kind = item[1]
+            if type(t) is not int or not 0 <= t <= MAX_COST:
+                fail(5)
+            if previous_time is not None and t < previous_time:
+                fail(5)
+            previous_time = t
+            if type(kind) is not int or kind not in (0, 1):
+                fail(5)
+            if kind == 0:
+                if len(item) != 6:
+                    fail(5)
+                _, _, u, v, n, j = item
+                if (type(u) is not str or type(v) is not str
+                        or (u, v) not in pair_set):
+                    fail(5)
+                if type(n) is not int or not 0 <= n <= MAX_COST:
+                    fail(5)
+                if (type(j) is not int
+                        or not 0 <= latency_of[(u, v)] + j <= MAX_COST):
+                    fail(5)
+                items.append((0, t, u, v, n, j))
+            else:
+                if len(item) != 3:
+                    fail(5)
+                _, _, pid = item
+                if type(pid) is not str or not 1 <= len(pid) <= 64:
+                    fail(5)
+                try:
+                    pid.encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(5)
+                if pid in seen_ids:
+                    fail(5)
+                seen_ids.add(pid)
+                items.append((1, t, pid))
+        result = compute_impair(nodes, links, source, destination, items)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
