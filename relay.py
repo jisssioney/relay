@@ -22,6 +22,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py slocmp FILE A B W OLD NEW EVENTS DATA
        python relay.py slogate FILE A B W CUR NEW EVENTS DATA
        python relay.py hotload FILE STATE A B W BASE OP EVENTS DATA
+       python relay.py snapshot STATE OP
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
        python relay.py impair FILE S D DATA
@@ -34,15 +35,19 @@ FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/audit
 those in DATA, for drill/multidrill/convstat/slosum those in
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
 those in OLD/NEW/EVENTS/DATA, for slogate those in
-CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA),
+CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA,
+for snapshot those in STATE/OP/IN),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
 P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
 unknown-node/overflow/re-failure error; for hotload code 5 also covers
 a STATE whose v/p/h structure, version continuity, or version conflict
-is invalid.
+is invalid; for snapshot code 5 also covers v/p/h structure or range,
+OP shape, or a BASE that does not equal the current v.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
-STATE untouched, and reports the slogate gate codes in why.
+STATE untouched, and reports the slogate gate codes in why. Snapshot
+status 0 wrote bytes, 1 was idempotent (canonical bytes already in
+place), and 2 is an audit; it never partially writes.
 """
 
 import hashlib
@@ -2167,22 +2172,57 @@ def _validate_hotload_state(data):
     return v, p, [list(entry) for entry in h]
 
 
+def _state_bytes(state):
+    # Canonical on-disk form: top-level key order v,p,h, compact,
+    # non-ASCII emitted as UTF-8 (ensure_ascii=False), integers decimal,
+    # exactly one trailing LF.
+    text = json.dumps(state, ensure_ascii=False,
+                      separators=(",", ":")) + "\n"
+    return text.encode("utf-8")
+
+
 def _write_state_atomic(path, state):
     # Replace the state file atomically: serialize, flush+fsync a
     # sibling temp file, os.replace it over the destination, then fsync
-    # the directory. Any failure removes the temp file (never leaving
-    # residue) and the destination stays byte-for-byte untouched.
-    text = json.dumps(state, ensure_ascii=False,
-                      separators=(",", ":")) + "\n"
-    payload = text.encode("utf-8")
+    # the directory. The staging file is created exclusively in the
+    # destination's directory with an incrementing suffix, so a stale or
+    # concurrent staging file is never truncated: a name collision only
+    # retries under the next name. Any failure removes just the staging
+    # file this call acquired (never one owned by another process) and
+    # leaves the destination byte-for-byte untouched.
+    payload = _state_bytes(state)
     directory = os.path.dirname(os.path.abspath(path))
-    tmp_path = path + ".tmp"
+    suffix = 0
+    fd = None
+    tmp_path = None
+    while True:
+        candidate = "%s.tmp%d" % (path, suffix)
+        try:
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                         0o666)
+            tmp_path = candidate
+            break
+        except FileExistsError:
+            suffix += 1
+        except OSError:
+            fail(3)
     try:
-        with open(tmp_path, "wb") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
+        try:
+            f = os.fdopen(fd, "wb")
+        except OSError:
+            os.close(fd)
+            fail(3)
+        try:
+            with f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError:
+            fail(3)
+        try:
+            os.replace(tmp_path, path)
+        except OSError:
+            fail(3)
         try:
             dir_fd = os.open(directory, os.O_RDONLY)
             try:
@@ -2191,12 +2231,15 @@ def _write_state_atomic(path, state):
                 os.close(dir_fd)
         except OSError:
             pass
-    except OSError:
+    except SystemExit:
+        # Writing, syncing, or replacing failed: drop only this call's
+        # staging file; os.replace already succeeded only on the success
+        # path, in which case the unlink merely misses a vanished file.
         try:
             os.remove(tmp_path)
         except OSError:
             pass
-        fail(3)
+        raise
 
 
 def _validate_hotload_records(links, events, data, node_set, pair_set, a, b):
@@ -2252,6 +2295,95 @@ def _validate_hotload_records(links, events, data, node_set, pair_set, a, b):
                     fail(5)
                 if not link_up[(x, y)]:
                     fail(5)
+
+
+def _normalize_state(data):
+    # Validate a decoded hotload-state document and rebuild it as a
+    # canonical {"v", "p", "h"} dict (insertion order v,p,h, every
+    # history entry a fresh list), shared by hotload and snapshot.
+    v, p, h = _validate_hotload_state(data)
+    return {"v": v, "p": p, "h": h}
+
+
+def _try_read_bytes(path):
+    # Raw bytes of an existing file, or None if it cannot be opened
+    # (missing, unreadable, a directory, ...). The caller decides
+    # whether that forces a write; bytes are never decoded here.
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def run_snapshot(state_path, op_text):
+    # python relay.py snapshot STATE OP
+    # OP is [0, OUT] (export), [1, BASE, IN] (import), or [2] (audit).
+    # Following hotload, every input is read and strictly decoded first
+    # (read errors code 3, JSON/UTF-8/duplicate-key/non-finite errors
+    # code 4) before any structural check (code 5). All persistence goes
+    # through the exclusive-create atomic writer, and stdout
+    # (op,status,state in that key order) is emitted only after every
+    # write has committed.
+    raw_state = _load_state(state_path)
+    try:
+        op = json.loads(op_text, parse_constant=_reject_constant,
+                        parse_float=_finite_float,
+                        object_pairs_hook=_object_no_dup)
+    except (ValueError, RecursionError):
+        fail(4)
+    # Gross OP shape decides kind and locates IN; the STATE/IN v,p,h
+    # contract is verified only after every input is decoded.
+    if not isinstance(op, list) or not op or type(op[0]) is not int:
+        fail(5)
+    kind = op[0]
+    if kind not in (0, 1, 2):
+        fail(5)
+    raw_incoming = None
+    out_path = None
+    base = None
+    if kind == 0:
+        if len(op) != 2 or type(op[1]) is not str or not op[1]:
+            fail(5)
+        out_path = op[1]
+    elif kind == 1:
+        if (len(op) != 3 or type(op[1]) is not int
+                or not 0 <= op[1] <= MAX_COST or type(op[2]) is not str
+                or not op[2]):
+            fail(5)
+        base, in_path = op[1], op[2]
+        raw_incoming = _load_state(in_path)
+    elif len(op) != 1:
+        fail(5)
+
+    state = _normalize_state(raw_state)
+    if kind == 0:
+        # Export: atomically materialize the canonical STATE bytes at
+        # OUT; an OUT already holding those exact bytes is a no-op. An
+        # OUT that cannot even be opened simply forces the write.
+        payload = _state_bytes(state)
+        if _try_read_bytes(out_path) == payload:
+            status = 1
+        else:
+            _write_state_atomic(out_path, state)
+            status = 0
+    elif kind == 1:
+        # Import: IN is already fully validated; BASE must equal the
+        # current v, then a matching state is idempotent and any other
+        # state atomically replaces STATE.
+        incoming = _normalize_state(raw_incoming)
+        if base != state["v"]:
+            fail(5)
+        if _state_bytes(incoming) == _state_bytes(state):
+            status = 1
+        else:
+            _write_state_atomic(state_path, incoming)
+            state = incoming
+            status = 0
+    else:
+        # Audit: report the validated current state without touching it.
+        status = 2
+    return {"op": kind, "status": status, "state": state}
 
 
 def main():
@@ -3467,6 +3599,10 @@ def main():
                              "h": new_history}
                 _write_state_atomic(state_path, new_state)
                 result = {"s": 0, "v": new_v, "p": target_policy, "why": []}
+    elif argv[1] == "snapshot":
+        if len(argv) != 4:
+            fail(2)
+        result = run_snapshot(argv[2], argv[3])
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
