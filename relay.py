@@ -14,6 +14,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py quality FILE A B DATA
        python relay.py replay FILE A B DATA
        python relay.py audit FILE A B DATA
+       python relay.py drill FILE A B EVENTS DATA
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
        python relay.py impair FILE S D DATA
@@ -22,9 +23,10 @@ Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance also those in
 FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/audit
-those in DATA),
+those in DATA, for drill those in EVENTS/DATA),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
-P/C/RULES/A/B/W/schema/topology/unknown-node/overflow error.
+P/C/RULES/A/B/W/schema/topology/unknown-node/overflow/re-failure
+error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline.
 """
@@ -997,6 +999,131 @@ def compute_audit(links, a, b, items):
             "links": link_rows, "reroutes": reroutes}
 
 
+def compute_drill(links, a, b, events, items):
+    # Failure-window drill. Nodes start up and every link takes FILE's up
+    # flag; events are applied in order (t non-decreasing, equal t kept in
+    # order) and atomically, with repeated setting idempotent. The first
+    # real down opens one failure period; it closes at the tick on which
+    # every object that was ever down is back up. Any real down after the
+    # close is a second failure and exits 5. Records with a <= t <= b are
+    # bucketed before/during/after relative to that one period: equal-tick
+    # events are all applied before a record at the same tick, so the
+    # start tick is "during" and the end tick is "after". With no failure
+    # every record is "before"; an unrecovered period leaves "after" empty.
+    node_up = {}
+    link_up = {(link["from"], link["to"]): link["up"] for link in links}
+    down_nodes = set()       # nodes down right now
+    down_links = set()       # links down right now
+    ever_nodes = set()       # nodes down at least once during the period
+    ever_links = set()       # links down at least once during the period
+    failure_start = None
+    failure_end = None
+
+    for t, kind, *rest in events:
+        if kind == 0:
+            node, up = rest
+            current = node_up.get(node, True)
+            if current == up:
+                continue
+            node_up[node] = up
+            if up:
+                down_nodes.discard(node)
+            else:
+                if failure_end is not None:
+                    fail(5)
+                if failure_start is None:
+                    failure_start = t
+                down_nodes.add(node)
+                ever_nodes.add(node)
+        else:
+            u, v, up = rest
+            pair = (u, v)
+            current = link_up[pair]
+            if current == up:
+                continue
+            link_up[pair] = up
+            if up:
+                down_links.discard(pair)
+            else:
+                if failure_end is not None:
+                    fail(5)
+                if failure_start is None:
+                    failure_start = t
+                down_links.add(pair)
+                ever_links.add(pair)
+        # An event batch closes the period at its own tick once every
+        # object ever down is back up; events share the tick in order.
+        if (failure_start is not None and failure_end is None
+                and not down_nodes and not down_links):
+            failure_end = t
+
+    buckets = [[], [], []]
+    for item in items:
+        t = item[2]
+        if not a <= t <= b:
+            continue
+        if failure_start is None or t < failure_start:
+            phase = 0
+        elif failure_end is None or t < failure_end:
+            phase = 1
+        else:
+            phase = 2
+        buckets[phase].append(item)
+
+    def phase_stats(records):
+        # [N, D, X, F(D,N), F(X,N), p95]: D is the audit status-0 count
+        # and X the status-1/2 count; both rates use _format_peak with N
+        # as the denominator, and N == 0 gives 0.000000. p95 is the
+        # ceil(0.95*D)-th smallest delivered delay (1-based), null at 0.
+        delivered = 0
+        other = 0
+        delays = []
+        for _, _, _, s, d, _ in records:
+            if s == 0:
+                delivered += 1
+                delays.append(d)
+            else:
+                other += 1
+        total = delivered + other
+        if total:
+            f_delivered = _format_peak(delivered, total)
+            f_other = _format_peak(other, total)
+        else:
+            f_delivered = f_other = "0.000000"
+        if delivered:
+            delays.sort()
+            p95 = delays[(95 * delivered + 99) // 100 - 1]
+        else:
+            p95 = None
+        return [total, delivered, other, f_delivered, f_other, p95]
+
+    p = [phase_stats(buckets[0]), phase_stats(buckets[1]),
+         phase_stats(buckets[2])]
+
+    # An affected edge started up in FILE and was itself down or has at
+    # least one endpoint that was ever down, listed in FILE order.
+    affected = []
+    for link in links:
+        pair = (link["from"], link["to"])
+        if (link["up"]
+                and (pair in ever_links
+                     or link["from"] in ever_nodes
+                     or link["to"] in ever_nodes)):
+            affected.append([link["from"], link["to"]])
+
+    if failure_start is None:
+        f = None
+        r = [None, None]
+    elif failure_end is None:
+        f = failure_start
+        r = [None, None]
+    else:
+        f = failure_start
+        r = [failure_end, failure_end - failure_start]
+
+    return {"a": a, "b": b, "f": f, "r": r, "p": p, "l": affected}
+
+
 def compute_replay(nodes, links, a, b, events):
     # Event-driven replay over a mutable up-graph. The clock jumps to each
     # event's t and processes it atomically; equal t keeps input order, so
@@ -1885,6 +2012,122 @@ def main():
                         fail(5)
             items.append((pid, f, t, s, d, path))
         result = compute_audit(links, a, b, items)
+    elif argv[1] == "drill":
+        if len(argv) != 7:
+            fail(2)
+        file_path, a_text, b_text, events_text, data_text = \
+            argv[2], argv[3], argv[4], argv[5], argv[6]
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        a = _bounded_int_arg(a_text)
+        b = _bounded_int_arg(b_text)
+        if a > b:
+            fail(5)
+        try:
+            raw_events = json.loads(
+                events_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(raw_events, list) or not isinstance(data, list):
+            fail(5)
+        # A link event may target only an edge that is up in FILE; a link
+        # already down can neither open a failure nor be flipped back.
+        up_pairs = {(link["from"], link["to"]) for link in links
+                    if link["up"]}
+        events = []
+        previous_time = None
+        for event in raw_events:
+            if not isinstance(event, list) or len(event) not in (4, 5):
+                fail(5)
+            t = event[0]
+            kind = event[1]
+            if type(t) is not int or not 0 <= t <= MAX_COST:
+                fail(5)
+            if not a <= t <= b:
+                fail(5)
+            if previous_time is not None and t < previous_time:
+                fail(5)
+            previous_time = t
+            if type(kind) is not int or kind not in (0, 1):
+                fail(5)
+            if kind == 0:
+                if len(event) != 4:
+                    fail(5)
+                _, _, node, up = event
+                if type(node) is not str or node not in node_set:
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                events.append((t, 0, node, up))
+            else:
+                if len(event) != 5:
+                    fail(5)
+                _, _, u, v, up = event
+                if (type(u) is not str or type(v) is not str
+                        or (u, v) not in up_pairs):
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                events.append((t, 1, u, v, up))
+        # Records reuse the audit schema exactly: edges only need to exist
+        # in the topology, up or down, since the data is a record of paths
+        # already taken.
+        pair_set = {(link["from"], link["to"]) for link in links}
+        items = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 6:
+                fail(5)
+            pid, f, t, s, d, path = item
+            if type(pid) is not str or not 1 <= len(pid) <= 64:
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if pid in seen_ids:
+                fail(5)
+            seen_ids.add(pid)
+            if type(f) is not str or not 1 <= len(f) <= 64:
+                fail(5)
+            try:
+                f.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if type(t) is not int or not 0 <= t <= MAX_COST:
+                fail(5)
+            if previous_time is not None and t < previous_time:
+                fail(5)
+            previous_time = t
+            if type(s) is not int or s not in (0, 1, 2):
+                fail(5)
+            if s == 2:
+                # A no-route loss carries no delay and no path at all.
+                if d is not None or path != []:
+                    fail(5)
+            else:
+                if type(d) is not int or not 0 <= d <= MAX_TIME:
+                    fail(5)
+                # A non-empty simple node array walking directed edges
+                # (length >= 2 for s=1, so a last edge exists).
+                if not isinstance(path, list) or not path:
+                    fail(5)
+                if s == 1 and len(path) < 2:
+                    fail(5)
+                for node in path:
+                    if type(node) is not str or node not in node_set:
+                        fail(5)
+                if len(set(path)) != len(path):
+                    fail(5)
+                for x, y in zip(path, path[1:]):
+                    if (x, y) not in pair_set:
+                        fail(5)
+            items.append((pid, f, t, s, d, path))
+        result = compute_drill(links, a, b, events, items)
     elif argv[1] == "replay":
         if len(argv) != 6:
             fail(2)
