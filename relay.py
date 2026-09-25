@@ -181,19 +181,32 @@ def compute_metric(nodes, links, source, order_names):
             best[dest] = (key, (hop_count, cost, bandwidth, latency),
                           list(path))
 
-    def dfs(path, visited, hop_count, cost, bandwidth, latency):
-        consider(path, hop_count, cost, bandwidth, latency)
-        u = path[-1]
-        for to, w, bw, lat in adj[u]:
-            if to not in visited:
-                visited.add(to)
-                path.append(to)
-                dfs(path, visited, hop_count + 1, cost + w,
-                    min(bandwidth, bw), latency + lat)
-                path.pop()
-                visited.remove(to)
-
-    dfs([source], {source}, 0, 0, MAX_COST, 0)
+    # Iterative DFS with an explicit stack, so the enumeration depth is
+    # bounded by heap, not by the Python recursion limit. metrics[d] holds
+    # the accumulated (hop, cost, bandwidth, latency) for path[:d+1].
+    path = [source]
+    visited = {source}
+    metrics = [(0, 0, MAX_COST, 0)]
+    consider(path, 0, 0, MAX_COST, 0)
+    stack = [iter(adj[source])]
+    while stack:
+        try:
+            to, w, bw, lat = next(stack[-1])
+        except StopIteration:
+            stack.pop()
+            if stack:
+                metrics.pop()
+                visited.remove(path.pop())
+            continue
+        if to in visited:
+            continue
+        visited.add(to)
+        path.append(to)
+        hop_count, cost, bandwidth, latency = metrics[-1]
+        entry = (hop_count + 1, cost + w, min(bandwidth, bw), latency + lat)
+        metrics.append(entry)
+        consider(path, *entry)
+        stack.append(iter(adj[to]))
 
     routes = []
     for n in sorted(nodes):
@@ -300,9 +313,11 @@ def main():
         result = compute_metric(nodes, links, source, order_names)
     else:
         fail(2)
-    sys.stdout.write(
-        json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n"
-    )
+    # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
+    # would apply the locale encoding and newline conversion (e.g. \r\n
+    # on Windows), corrupting the required byte-exact output.
+    out = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    sys.stdout.buffer.write(out.encode("utf-8") + b"\n")
 
 
 if __name__ == "__main__":
