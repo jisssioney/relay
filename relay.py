@@ -21,6 +21,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py sloeval FILE A B W POLICY EVENTS DATA
        python relay.py slocmp FILE A B W OLD NEW EVENTS DATA
        python relay.py slogate FILE A B W CUR NEW EVENTS DATA
+       python relay.py hotload FILE STATE A B W BASE OP EVENTS DATA
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
        python relay.py impair FILE S D DATA
@@ -32,10 +33,12 @@ FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/audit
 those in DATA, for drill/multidrill/convstat/slosum those in
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
 those in OLD/NEW/EVENTS/DATA, for slogate those in
-CUR/NEW/EVENTS/DATA),
+CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
 P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/schema/topology/unknown-node/
-overflow/re-failure error.
+overflow/re-failure error (hotload also treats a STATE/OP structure,
+range, version-conflict, or v+1 overflow error as 5; its STATE read or
+atomic write errors are 3).
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline.
 """
@@ -43,6 +46,7 @@ newline.
 import hashlib
 import json
 import math
+import os
 import sys
 from bisect import bisect_left, bisect_right
 from collections import deque
@@ -147,6 +151,104 @@ def load_network(path, metrics=False, strict=False):
         seen_pairs.add(pair)
 
     return nodes, links, node_set
+
+
+def _read_state_text(path):
+    # Read the hotload STATE file. I/O errors are exit 3; a byte stream
+    # that is not UTF-8 cannot be JSON, matching load_network's 4.
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        fail(3)
+    except UnicodeDecodeError:
+        fail(4)
+
+
+def _write_state_atomic(path, payload):
+    # Atomically replace STATE with the already-encoded UTF-8 payload.
+    # The staging file sits next to STATE (same filesystem, so
+    # os.replace is atomic) under a fixed deterministic name; a stale
+    # staging file from a crashed earlier run is simply truncated. The
+    # payload is flushed and fsynced before os.replace, so readers only
+    # ever see the complete old or new bytes. Any failure unlinks the
+    # staging file, leaves the original untouched, and exits 3.
+    directory = os.path.dirname(os.path.abspath(path))
+    tmp_path = os.path.join(directory, "." + os.path.basename(path)
+                            + ".hotload-tmp")
+    try:
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except OSError:
+            # os.replace may have failed after the staging file was
+            # fully written; drop it before reporting the error.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        fail(3)
+
+
+def _valid_policy6(value):
+    # sloeval's POLICY contract shared by slogate/hotload: six
+    # non-boolean integers in [0, MAX_COST].
+    if not isinstance(value, list) or len(value) != 6:
+        return False
+    return all(type(x) is int and 0 <= x <= MAX_COST for x in value)
+
+
+def _parse_hotload_state(raw):
+    # STATE is {"v": v, "p": p, "h": h} with key order v,p,h; v and p are
+    # integers in [0, MAX_COST], and h is the contiguous version history
+    # [[v, p], ...] starting at version 0, exactly one entry per version,
+    # whose last entry equals [v, p]. Returns (v, p, h).
+    if not isinstance(raw, dict) or list(raw) != ["v", "p", "h"]:
+        fail(5)
+    v = raw["v"]
+    p = raw["p"]
+    h = raw["h"]
+    if type(v) is not int or not 0 <= v <= MAX_COST:
+        fail(5)
+    if not _valid_policy6(p):
+        fail(5)
+    if not isinstance(h, list) or len(h) != v + 1:
+        fail(5)
+    for i, entry in enumerate(h):
+        if not isinstance(entry, list) or len(entry) != 2:
+            fail(5)
+        hv, hp = entry
+        if type(hv) is not int or hv != i:
+            fail(5)
+        if not _valid_policy6(hp):
+            fail(5)
+    if h[-1][0] != v or h[-1][1] != p:
+        fail(5)
+    return v, p, h
+
+
+def _parse_hotload_op(raw):
+    # OP is [0, p] to load policy p or [1, target] to roll back to a
+    # version already present in h. The policy itself follows sloeval's
+    # six-integer contract; target is a plain integer (membership in h is
+    # checked against the parsed history by the caller).
+    if not isinstance(raw, list) or len(raw) != 2:
+        fail(5)
+    code, value = raw
+    if type(code) is not int or code not in (0, 1):
+        fail(5)
+    if code == 0:
+        if not _valid_policy6(value):
+            fail(5)
+    else:
+        if type(value) is not int or not 0 <= value <= MAX_COST:
+            fail(5)
+    return code, value
 
 
 def shortest_paths(nodes, links, source):
@@ -2985,6 +3087,87 @@ def main():
         events = _parse_drill_events(raw_events, up_pairs, node_set, a, b)
         result = compute_slogate(links, node_set, pair_set, a, b, width,
                                  cur, new, events, data)
+    elif argv[1] == "hotload":
+        if len(argv) != 11:
+            fail(2)
+        file_path, state_path, a_text, b_text, width_text, base_text, \
+            op_text, events_text, data_text = (argv[2], argv[3], argv[4],
+                                               argv[5], argv[6], argv[7],
+                                               argv[8], argv[9], argv[10])
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        a = _bounded_int_arg(a_text)
+        b = _bounded_int_arg(b_text)
+        if a > b:
+            fail(5)
+        width = _bounded_int_arg(width_text)
+        if width < 1:
+            fail(5)
+        base = _bounded_int_arg(base_text)
+        state_text = _read_state_text(state_path)
+        try:
+            state = json.loads(state_text, parse_constant=_reject_constant,
+                               parse_float=_finite_float,
+                               object_pairs_hook=_object_no_dup)
+            op = json.loads(op_text, parse_constant=_reject_constant,
+                            parse_float=_finite_float,
+                            object_pairs_hook=_object_no_dup)
+            raw_events = json.loads(
+                events_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        v, p, h = _parse_hotload_state(state)
+        op_code, op_value = _parse_hotload_op(op)
+        if op_code == 0:
+            candidate = op_value
+            idempotent = candidate == p
+        else:
+            # A rollback target must name a version already in h; h has
+            # exactly one contiguous entry per version in [0, v].
+            target = op_value
+            if target > v:
+                fail(5)
+            candidate = h[target][1]
+            idempotent = target == v
+        if not isinstance(raw_events, list) or not isinstance(data, list):
+            fail(5)
+        up_pairs = {(link["from"], link["to"]) for link in links
+                    if link["up"]}
+        pair_set = {(link["from"], link["to"]) for link in links}
+        events = _parse_drill_events(raw_events, up_pairs, node_set, a, b)
+        # The gate reuses slogate verbatim from the current policy to the
+        # candidate; it has no side effects, so running it on the
+        # idempotent path too keeps full input validation ahead of the
+        # verdict while its result is simply ignored there.
+        gate = compute_slogate(links, node_set, pair_set, a, b, width,
+                               p, candidate, events, data)
+        why = gate["why"]
+        if idempotent:
+            # Same policy (load) or the current version (rollback):
+            # success without a version bump and without touching STATE;
+            # BASE is irrelevant on this path.
+            result = {"s": 2, "v": v, "p": p, "why": []}
+        elif base != v:
+            # A real change must be staged against the current version.
+            fail(5)
+        elif why:
+            # Rejection leaves STATE and the version/policy unchanged.
+            result = {"s": 1, "v": v, "p": p, "why": why}
+        else:
+            # Allowed load or rollback: append the target policy at v+1
+            # and atomically replace STATE. v+1 must stay in range.
+            if v >= MAX_COST:
+                fail(5)
+            new_v = v + 1
+            new_state = {"v": new_v, "p": candidate,
+                         "h": h + [[new_v, candidate]]}
+            state_out = json.dumps(new_state, ensure_ascii=False,
+                                   separators=(",", ":")) + "\n"
+            _write_state_atomic(state_path, state_out.encode("utf-8"))
+            result = {"s": 0, "v": new_v, "p": candidate, "why": []}
     elif argv[1] == "replay":
         if len(argv) != 6:
             fail(2)
