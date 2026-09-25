@@ -2,10 +2,11 @@
 
 Usage: python relay.py route FILE SOURCE
        python relay.py ecmp FILE SOURCE FLOW
+       python relay.py metric FILE SOURCE ORDER
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax,
-5 FLOW/schema/topology/unknown-source error. On failure stdout stays
-empty and stderr is exactly {"error":N} plus a newline.
+5 FLOW/ORDER/schema/topology/unknown-source error. On failure stdout
+stays empty and stderr is exactly {"error":N} plus a newline.
 """
 
 import hashlib
@@ -26,7 +27,7 @@ def _reject_constant(value):
     raise ValueError("invalid JSON constant: " + value)
 
 
-def load_network(path):
+def load_network(path, metrics=False):
     try:
         with open(path, "r", encoding="utf-8") as f:
             text = f.read()
@@ -45,6 +46,9 @@ def load_network(path):
     nodes = data["nodes"]
     links = data["links"]
 
+    base_keys = {"from", "to", "cost", "up"}
+    link_keys = base_keys | {"bandwidth", "latency"} if metrics else base_keys
+
     if not isinstance(nodes, list):
         fail(5)
     node_set = set()
@@ -57,7 +61,7 @@ def load_network(path):
         fail(5)
     seen_pairs = set()
     for link in links:
-        if not isinstance(link, dict) or set(link) != {"from", "to", "cost", "up"}:
+        if not isinstance(link, dict) or set(link) != link_keys:
             fail(5)
         frm = link["from"]
         to = link["to"]
@@ -71,6 +75,13 @@ def load_network(path):
             fail(5)
         if type(up) is not bool:
             fail(5)
+        if metrics:
+            bw = link["bandwidth"]
+            lat = link["latency"]
+            if type(bw) is not int or not 1 <= bw <= MAX_COST:
+                fail(5)
+            if type(lat) is not int or not 0 <= lat <= MAX_COST:
+                fail(5)
         pair = (frm, to)
         if pair in seen_pairs:
             fail(5)
@@ -139,6 +150,68 @@ def compute_routes(nodes, links, source):
             routes.append({"destination": n, "nextHop": p[1],
                            "cost": cost_of[n], "path": p})
     return {"source": source, "routes": routes}
+
+
+def compute_metric(nodes, links, source, order_names):
+    # Directed adjacency over up links only.
+    adj = {n: [] for n in nodes}
+    for link in links:
+        if link["up"]:
+            adj[link["from"]].append(
+                (link["to"], link["cost"], link["bandwidth"], link["latency"]))
+
+    # Enumerate every directed simple path from the source via DFS and keep
+    # the best one per destination under the ORDER metric hierarchy. Ties on
+    # every metric go to the path with the smallest Unicode code point order.
+    # best[n] = (comparison_key, (hop, cost, bandwidth, latency), path)
+    best = {}
+
+    def metric_key(hop_count, cost, bandwidth, latency):
+        m = {"hop": hop_count, "cost": cost, "bandwidth": bandwidth,
+             "latency": latency}
+        # bandwidth prefers the larger value; the others the smaller.
+        return tuple(-m[name] if name == "bandwidth" else m[name]
+                     for name in order_names)
+
+    def consider(path, hop_count, cost, bandwidth, latency):
+        key = metric_key(hop_count, cost, bandwidth, latency)
+        dest = path[-1]
+        cur = best.get(dest)
+        if cur is None or key < cur[0] or (key == cur[0] and path < cur[2]):
+            best[dest] = (key, (hop_count, cost, bandwidth, latency),
+                          list(path))
+
+    def dfs(path, visited, hop_count, cost, bandwidth, latency):
+        consider(path, hop_count, cost, bandwidth, latency)
+        u = path[-1]
+        for to, w, bw, lat in adj[u]:
+            if to not in visited:
+                visited.add(to)
+                path.append(to)
+                dfs(path, visited, hop_count + 1, cost + w,
+                    min(bandwidth, bw), latency + lat)
+                path.pop()
+                visited.remove(to)
+
+    dfs([source], {source}, 0, 0, MAX_COST, 0)
+
+    routes = []
+    for n in sorted(nodes):
+        if n == source:
+            routes.append({"destination": n, "nextHop": source, "hopCount": 0,
+                           "cost": 0, "bandwidth": None, "latency": 0,
+                           "path": [source]})
+        elif n not in best:
+            routes.append({"destination": n, "nextHop": None, "hopCount": None,
+                           "cost": None, "bandwidth": None, "latency": None,
+                           "path": []})
+        else:
+            _, (hop_count, cost, bandwidth, latency), path = best[n]
+            routes.append({"destination": n, "nextHop": path[1],
+                           "hopCount": hop_count, "cost": cost,
+                           "bandwidth": bandwidth, "latency": latency,
+                           "path": path})
+    return {"source": source, "order": order_names, "routes": routes}
 
 
 def compute_ecmp(nodes, links, source, flow):
@@ -212,6 +285,19 @@ def main():
         if source not in node_set:
             fail(5)
         result = compute_ecmp(nodes, links, source, flow)
+    elif argv[1] == "metric":
+        if len(argv) != 5:
+            fail(2)
+        file_path, source, order = argv[2], argv[3], argv[4]
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        order_names = order.split(",")
+        if (len(order_names) != 4
+                or set(order_names) != {"hop", "cost", "bandwidth", "latency"}
+                or len(set(order_names)) != 4):
+            fail(5)
+        if source not in node_set:
+            fail(5)
+        result = compute_metric(nodes, links, source, order_names)
     else:
         fail(2)
     sys.stdout.write(
