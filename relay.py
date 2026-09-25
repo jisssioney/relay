@@ -4,14 +4,17 @@ Usage: python relay.py route FILE SOURCE
        python relay.py ecmp FILE SOURCE FLOW
        python relay.py metric FILE SOURCE ORDER
        python relay.py protect FILE SOURCE DESTINATION DELAY EVENTS
+       python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax,
-5 FLOW/ORDER/DELAY/EVENTS/schema/topology/unknown-node error. On failure
-stdout stays empty and stderr is exactly {"error":N} plus a newline.
+duplicate key or non-finite number, 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/
+TABLE/schema/topology/unknown-node error. On failure stdout stays empty
+and stderr is exactly {"error":N} plus a newline.
 """
 
 import hashlib
 import json
+import math
 import sys
 
 MAX_COST = 2147483647
@@ -28,7 +31,25 @@ def _reject_constant(value):
     raise ValueError("invalid JSON constant: " + value)
 
 
-def load_network(path, metrics=False):
+def _finite_float(text):
+    # 1e999 and friends are syntactically valid JSON but not finite.
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError("non-finite number: " + text)
+    return value
+
+
+def _unique_object(pairs):
+    # JSON objects with duplicate keys are rejected outright.
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError("duplicate key: " + key)
+        obj[key] = value
+    return obj
+
+
+def load_network(path, metrics=False, strict=False):
     try:
         with open(path, "r", encoding="utf-8") as f:
             text = f.read()
@@ -38,7 +59,12 @@ def load_network(path, metrics=False):
         fail(4)
 
     try:
-        data = json.loads(text, parse_constant=_reject_constant)
+        if strict:
+            data = json.loads(text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_unique_object)
+        else:
+            data = json.loads(text, parse_constant=_reject_constant)
     except (ValueError, RecursionError):
         fail(4)
 
@@ -345,6 +371,42 @@ def compute_protect(nodes, links, source, destination, delay, events):
             "events": results}
 
 
+def compute_forward(nodes, links, source, destination, limit, table):
+    # Hop-by-hop forwarding along the explicit next-hop table over up
+    # links only. The clock starts at 0 and the trace includes the source.
+    up_pairs = set()
+    for link in links:
+        if link["up"]:
+            up_pairs.add((link["from"], link["to"]))
+
+    trace = [[0, source]]
+    visited = set()
+    current = source
+    clock = 0
+    hops = 0
+    while True:
+        if current == destination:
+            status = "delivered"
+            break
+        if current in visited:
+            status = "loop"
+            break
+        if hops == limit:
+            status = "hop_limit"
+            break
+        nxt = table[current]
+        if nxt is None or (current, nxt) not in up_pairs:
+            status = "unreachable"
+            break
+        visited.add(current)
+        current = nxt
+        clock += 1
+        hops += 1
+        trace.append([clock, current])
+    return {"source": source, "destination": destination, "limit": limit,
+            "status": status, "time": clock, "trace": trace}
+
+
 def main():
     argv = sys.argv
     if len(argv) < 2:
@@ -427,6 +489,34 @@ def main():
                 fail(5)
         result = compute_protect(nodes, links, source, destination,
                                  delay, events)
+    elif argv[1] == "forward":
+        if len(argv) != 7:
+            fail(2)
+        file_path, source, destination = argv[2], argv[3], argv[4]
+        limit_text, table_text = argv[5], argv[6]
+        nodes, links, node_set = load_network(file_path, strict=True)
+        if source not in node_set or destination not in node_set:
+            fail(5)
+        if (not limit_text
+                or any(c not in "0123456789" for c in limit_text)):
+            fail(5)
+        limit = int(limit_text)
+        if limit > MAX_COST:
+            fail(5)
+        try:
+            table = json.loads(table_text, parse_constant=_reject_constant,
+                               parse_float=_finite_float,
+                               object_pairs_hook=_unique_object)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(table, dict) or set(table) != node_set:
+            fail(5)
+        for value in table.values():
+            if value is not None and (type(value) is not str
+                                      or value not in node_set):
+                fail(5)
+        result = compute_forward(nodes, links, source, destination,
+                                 limit, table)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
