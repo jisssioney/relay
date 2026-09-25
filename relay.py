@@ -9,12 +9,14 @@ Usage: python relay.py route FILE SOURCE
        python relay.py reorder FILE FROM TO BASE WINDOW DATA
        python relay.py converge FILE SRC DST D R EVENTS
        python relay.py policy FILE S D P C RULES
+       python relay.py reserve FILE DATA
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/reorder/converge/policy also those in FILE/DATA/EVENTS/
-RULES), 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/
-DATA/D/R/P/C/RULES/schema/topology/unknown-node/overflow error.
+for queue/reorder/converge/policy/reserve also those in FILE/DATA/
+EVENTS/RULES), 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/
+WINDOW/DATA/D/R/P/C/RULES/schema/topology/unknown-node/overflow
+error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline.
 """
@@ -573,14 +575,37 @@ def compute_converge(nodes, links, source, destination, delay, run, events):
     return {"timeline": timeline}
 
 
+def _order_by_priority(rules):
+    # Indices of the rules sorted by ascending priority n, ties keeping
+    # their array order. n <= MAX_COST < 2**31, so a two-pass stable LSD
+    # radix sort on 16-bit digits runs in worst-case O(R) time and space
+    # for any R, where a comparison sort would take O(R log R) time.
+    order = list(range(len(rules)))
+    buf = [0] * len(rules)
+    for shift in (0, 16):
+        count = [0] * 65536
+        for i in order:
+            count[(rules[i][0] >> shift) & 0xFFFF] += 1
+        total = 0
+        for digit in range(65536):
+            count[digit], total = total, total + count[digit]
+        for i in order:
+            digit = (rules[i][0] >> shift) & 0xFFFF
+            buf[count[digit]] = i
+            count[digit] += 1
+        order, buf = buf, order
+    return order
+
+
 def compute_policy(nodes, links, source, destination, port, klass, rules):
     # Policy routing with a shortest-path fallback. Rules are considered
-    # by ascending priority n (ties keep their array order, which sorted
-    # guarantees by stability); a rule matches when its s/d equal the
-    # requested source/destination and its null port/class fields act as
-    # wildcards while the rest compare equal. The first matching rule
-    # whose path has no down edge supplies the route; with none usable
-    # the route falls back to the lowest-cost path over up links.
+    # by ascending priority n (ties keep their array order, which the
+    # radix sort guarantees by stability); a rule matches when its s/d
+    # equal the requested source/destination and its null port/class
+    # fields act as wildcards while the rest compare equal. The first
+    # matching rule whose path has no down edge supplies the route; with
+    # none usable the route falls back to the lowest-cost path over up
+    # links.
     up_of = {}
     cost_of_link = {}
     for link in links:
@@ -588,7 +613,7 @@ def compute_policy(nodes, links, source, destination, port, klass, rules):
         up_of[pair] = link["up"]
         cost_of_link[pair] = link["cost"]
 
-    for i in sorted(range(len(rules)), key=lambda i: rules[i][0]):
+    for i in _order_by_priority(rules):
         _, s, d, p, c, path = rules[i]
         if s != source or d != destination:
             continue
@@ -611,6 +636,117 @@ def compute_policy(nodes, links, source, destination, port, klass, rules):
     return {"source": source, "destination": destination,
             "port": port, "class": klass, "rule": None,
             "cost": cost, "path": path if path is not None else []}
+
+
+def compute_reserve(nodes, links, requests):
+    # Bandwidth reservation over up-directed simple paths. Each link's
+    # residual r starts at its capacity C = bandwidth. Requests are
+    # processed in array order; the candidates for one request are the
+    # up-directed simple s->d paths whose every edge has r >= b. The
+    # winner minimizes, in order, the post-reservation peak utilization
+    # max((C - r + b) / C) over its edges (fractions compared by integer
+    # cross-multiplication, never floats), the cost sum, and the path in
+    # Unicode code point order. Accepting subtracts b from r along the
+    # path; rejecting changes nothing. With no up path at all the status
+    # is unreachable, else with no candidate it is no_capacity.
+    bandwidth_of = {}
+    cost_of_link = {}
+    residual = {}
+    adj = {n: [] for n in nodes}
+    for link in links:
+        pair = (link["from"], link["to"])
+        bandwidth_of[pair] = link["bandwidth"]
+        cost_of_link[pair] = link["cost"]
+        residual[pair] = link["bandwidth"]
+        if link["up"]:
+            adj[link["from"]].append(link["to"])
+
+    allocations = []
+    for rid, s, d, b in requests:
+        # Reachability over up links, ignoring capacity.
+        seen = {s}
+        queue = deque([s])
+        reachable = False
+        while queue:
+            u = queue.popleft()
+            if u == d:
+                reachable = True
+                break
+            for v in adj[u]:
+                if v not in seen:
+                    seen.add(v)
+                    queue.append(v)
+        if not reachable:
+            allocations.append([rid, "unreachable", b, None, []])
+            continue
+
+        # Enumerate every candidate via iterative DFS, as in
+        # compute_metric, so the depth is bounded by heap, not by the
+        # Python recursion limit. best = (num, den, cost, path) with the
+        # peak utilization kept as the fraction num/den.
+        best = None
+        path = [s]
+        visited = {s}
+        stack = [iter(adj[s])]
+        while stack:
+            extended = False
+            for to in stack[-1]:
+                if to in visited:
+                    continue
+                if residual[(path[-1], to)] < b:
+                    continue
+                visited.add(to)
+                path.append(to)
+                if to == d:
+                    num = den = None
+                    cost = 0
+                    for a, z in zip(path, path[1:]):
+                        pair = (a, z)
+                        cap = bandwidth_of[pair]
+                        used = cap - residual[pair] + b
+                        cost += cost_of_link[pair]
+                        if num is None or used * den > num * cap:
+                            num, den = used, cap
+                    if best is None:
+                        better = True
+                    else:
+                        lhs = num * best[1]
+                        rhs = best[0] * den
+                        better = (lhs < rhs
+                                  or lhs == rhs
+                                  and (cost < best[2]
+                                       or cost == best[2]
+                                       and path < best[3]))
+                    if better:
+                        best = (num, den, cost, list(path))
+                    visited.remove(to)
+                    path.pop()
+                    continue
+                stack.append(iter(adj[to]))
+                extended = True
+                break
+            if not extended:
+                stack.pop()
+                if stack:
+                    visited.remove(path.pop())
+
+        if best is None:
+            allocations.append([rid, "no_capacity", b, None, []])
+            continue
+        _, _, cost, path = best
+        if cost > MAX_TIME:
+            fail(5)
+        for a, z in zip(path, path[1:]):
+            residual[(a, z)] -= b
+        allocations.append([rid, "accepted", b, cost, path])
+
+    link_entries = []
+    for link in links:
+        pair = (link["from"], link["to"])
+        cap = link["bandwidth"]
+        link_entries.append([link["from"], link["to"], cap,
+                             cap - residual[pair], residual[pair]])
+    return {"allocations": allocations, "links": link_entries}
 
 
 def main():
@@ -928,6 +1064,42 @@ def main():
             rules.append((n, s, d, p, c, path))
         result = compute_policy(nodes, links, source, destination,
                                 port, klass, rules)
+    elif argv[1] == "reserve":
+        if len(argv) != 4:
+            fail(2)
+        file_path, data_text = argv[2], argv[3]
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        requests = []
+        seen_ids = set()
+        for item in data:
+            if not isinstance(item, list) or len(item) != 4:
+                fail(5)
+            rid, s, d, b = item
+            if (type(rid) is not str or not 1 <= len(rid) <= 64
+                    or rid in seen_ids):
+                fail(5)
+            try:
+                rid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_ids.add(rid)
+            if (type(s) is not str or type(d) is not str
+                    or s not in node_set or d not in node_set or s == d):
+                fail(5)
+            # type(b) is int excludes the bool subclass.
+            if type(b) is not int or not 1 <= b <= MAX_COST:
+                fail(5)
+            requests.append((rid, s, d, b))
+        result = compute_reserve(nodes, links, requests)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
