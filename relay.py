@@ -14,11 +14,12 @@ Usage: python relay.py route FILE SOURCE
        python relay.py quality FILE A B DATA
        python relay.py replay FILE A B DATA
        python relay.py nfail FILE S D W DATA
+       python relay.py lfail FILE S D W DATA
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance also those in
-FILE/DATA/EVENTS/RULES, for quality/replay/nfail those in DATA),
+FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail those in DATA),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
 P/C/RULES/A/B/W/schema/topology/unknown-node/overflow error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
@@ -1085,6 +1086,110 @@ def compute_nfail(nodes, links, source, destination, wait, items):
             "p": packets}
 
 
+def compute_lfail(nodes, links, source, destination, wait, items):
+    # Link-failure protection switching with a debounced changeover delay.
+    # Primary: lowest-cost path in the initial up-graph, ties going to the
+    # node sequence smallest in Unicode code point order (exactly the
+    # shortest_paths tie-break). Backup: the same computation after
+    # deleting the primary's directed edges; no primary means no backup.
+    # Both are computed once here and never recomputed; link items only
+    # flip link up states (repeated setting is idempotent).
+    up_links = [link for link in links if link["up"]]
+    cost_of, path_of = shortest_paths(nodes, up_links, source)
+    primary_path = path_of[destination]
+    primary = ((cost_of[destination], primary_path)
+               if primary_path is not None else None)
+    backup = None
+    if primary_path is not None:
+        removed = set(zip(primary_path, primary_path[1:]))
+        blinks = [link for link in up_links
+                  if (link["from"], link["to"]) not in removed]
+        bcost_of, bpath_of = shortest_paths(nodes, blinks, source)
+        if bpath_of[destination] is not None:
+            backup = (bcost_of[destination], bpath_of[destination])
+
+    state = {(link["from"], link["to"]): link["up"] for link in links}
+    # Down-edge counts on each candidate path, kept incrementally so a
+    # link flip and the target selection are both O(1). Both paths were
+    # computed over up links only, so every edge on them starts up.
+    primary_edges = (set(zip(primary[1], primary[1][1:]))
+                     if primary is not None else set())
+    backup_edges = (set(zip(backup[1], backup[1][1:]))
+                    if backup is not None else set())
+    primary_down = 0
+    backup_down = 0
+
+    def target():
+        # The first all-up of the primary and the backup, else no path.
+        if primary is not None and primary_down == 0:
+            return primary
+        if backup is not None and backup_down == 0:
+            return backup
+        return None
+
+    active = primary
+    timer_start = None
+    timer_at = None
+    timer_target = None
+    switches = []
+    packets = []
+    i = 0
+    n = len(items)
+    while i < n or timer_at is not None:
+        wakes = []
+        if i < n:
+            wakes.append(items[i][0])
+        if timer_at is not None:
+            wakes.append(timer_at)
+        now = min(wakes)
+        # All items at this tick run in input order before a timer
+        # completing on it; a timer due before the next item's tick
+        # completes first.
+        while i < n and items[i][0] == now:
+            item = items[i]
+            i += 1
+            if len(item) == 4:
+                _, u, v, up = item
+                pair = (u, v)
+                if state[pair] == up:
+                    continue
+                state[pair] = up
+                delta = -1 if up else 1
+                if pair in primary_edges:
+                    primary_down += delta
+                if pair in backup_edges:
+                    backup_down += delta
+                new = target()
+                if new != active:
+                    # (Re)arm the changeover timer at t+W.
+                    timer_start = now
+                    timer_at = now + wait
+                    timer_target = new
+                else:
+                    # The active path is already the target: cancel.
+                    timer_start = timer_at = timer_target = None
+            else:
+                _, pid = item
+                if active is not None and (
+                        primary_down if active is primary
+                        else backup_down) == 0:
+                    packets.append([pid, now, 0, active[0], active[1]])
+                else:
+                    packets.append([pid, now, 1, None, []])
+        if timer_at is not None and timer_at == now:
+            active = timer_target
+            switches.append([timer_start, now,
+                             active[1] if active is not None else []])
+            timer_start = timer_at = timer_target = None
+
+    return {"m": [primary[0], primary[1]] if primary is not None
+            else [None, []],
+            "b": [backup[0], backup[1]] if backup is not None
+            else [None, []],
+            "s": switches,
+            "p": packets}
+
+
 def main():
     argv = sys.argv
     if len(argv) < 2:
@@ -1682,6 +1787,59 @@ def main():
                 seen_ids.add(pid)
                 items.append((t, pid))
         result = compute_nfail(nodes, links, source, destination,
+                               wait, items)
+    elif argv[1] == "lfail":
+        if len(argv) != 7:
+            fail(2)
+        file_path, source, destination = argv[2], argv[3], argv[4]
+        wait_text, data_text = argv[5], argv[6]
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        if (source not in node_set or destination not in node_set
+                or source == destination):
+            fail(5)
+        wait = _bounded_int_arg(wait_text)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        items = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) not in (2, 4):
+                fail(5)
+            t = item[0]
+            if type(t) is not int or not 0 <= t <= MAX_COST:
+                fail(5)
+            if previous_time is not None and t < previous_time:
+                fail(5)
+            previous_time = t
+            if len(item) == 4:
+                _, u, v, up = item
+                if (type(u) is not str or type(v) is not str
+                        or (u, v) not in pair_set):
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                items.append((t, u, v, up))
+            else:
+                _, pid = item
+                if type(pid) is not str or not 1 <= len(pid) <= 64:
+                    fail(5)
+                try:
+                    pid.encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(5)
+                if pid in seen_ids:
+                    fail(5)
+                seen_ids.add(pid)
+                items.append((t, pid))
+        result = compute_lfail(nodes, links, source, destination,
                                wait, items)
     else:
         fail(2)
