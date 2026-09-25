@@ -20,6 +20,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py slosum FILE A B W EVENTS DATA
        python relay.py sloeval FILE A B W POLICY EVENTS DATA
        python relay.py slocmp FILE A B W OLD NEW EVENTS DATA
+       python relay.py slogate FILE A B W CUR NEW EVENTS DATA
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
        python relay.py impair FILE S D DATA
@@ -30,9 +31,9 @@ for queue/reorder/converge/policy/reserve/rebalance also those in
 FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/audit
 those in DATA, for drill/multidrill/convstat/slosum those in
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
-those in OLD/NEW/EVENTS/DATA),
+those in OLD/NEW/EVENTS/DATA, for slogate those in CUR/NEW/EVENTS/DATA),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
-P/C/RULES/A/B/W/POLICY/OLD/NEW/schema/topology/unknown-node/overflow/
+P/C/RULES/A/B/W/POLICY/OLD/NEW/CUR/schema/topology/unknown-node/overflow/
 re-failure error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline.
@@ -1621,6 +1622,65 @@ def compute_slocmp(links, node_set, pair_set, a, b, width, old, new,
             "windows": windows, "runs": runs, "budget": budget}
 
 
+def compute_slogate(links, node_set, pair_set, a, b, width, cur, new,
+                    events, data):
+    # Deterministic atomic gate for an SLO policy change from CUR to NEW.
+    # Both policies follow sloeval's [u, o, d, f, s, g] contract and are
+    # evaluated over one shared compute_slosum summary exactly as in
+    # _sloeval_result; windows and budget are the corresponding slocmp
+    # values for the same inputs. The gate rejects (codes ascending and
+    # deduplicated) when any window adds a reason under NEW (0), when any
+    # per-slot excess delta NEW minus CUR has a positive non-null entry
+    # (1, null slots never compared), or when the fourth item of the
+    # budget difference, NEW-minus-CUR violating-window overshoot, is
+    # positive (2). windows are built directly from the two _sloeval_result evaluations, so the
+    # gate shares slocmp's window semantics (including add/delta) without
+    # materializing its full records; a mixed window only rejects on a
+    # positive delta. why is the rejection-code array, ok is its absence,
+    # and policy reports [CUR, NEW, NEW-CUR elementwise, NEW when allowed
+    # else CUR]. The same policy twice, and fault-free empty windows, are
+    # allowed; a rejection still exits successfully and changes no state.
+    summary = compute_slosum(links, node_set, pair_set, a, b, width,
+                             events, data)
+    cur_windows, _cur_runs, cur_budget = _sloeval_result(summary, cur)
+    new_windows, _new_runs, new_budget = _sloeval_result(summary, new)
+
+    windows = []
+    why = set()
+    for cur_w, new_w in zip(cur_windows, new_windows):
+        x, y, cur_ok, cur_reasons, cur_excess = cur_w
+        _, _, new_ok, new_reasons, new_excess = new_w
+        if cur_ok == new_ok:
+            t = 0
+        elif cur_ok:
+            t = 1
+        else:
+            t = 2
+        add = sorted(set(new_reasons) - set(cur_reasons))
+        remove = sorted(set(cur_reasons) - set(new_reasons))
+        delta = [None if c is None or n is None else n - c
+                 for c, n in zip(cur_excess, new_excess)]
+        if add:
+            why.add(0)
+        if any(d is not None and d > 0 for d in delta):
+            why.add(1)
+        windows.append([x, y, [cur_ok, cur_reasons, cur_excess],
+                        [new_ok, new_reasons, new_excess], t,
+                        [add, remove], delta])
+
+    budget_diff = [n - c for c, n in zip(cur_budget, new_budget)]
+    if budget_diff[3] > 0:
+        why.add(2)
+
+    budget = [cur_budget, new_budget, budget_diff]
+    why = sorted(why)
+    allowed = not why
+    policy = [cur, new, [n - c for c, n in zip(cur, new)],
+              new if allowed else cur]
+    return {"ok": allowed, "why": why, "policy": policy,
+            "windows": windows, "budget": budget}
+
+
 def compute_replay(nodes, links, a, b, events):
     # Event-driven replay over a mutable up-graph. The clock jumps to each
     # event's t and processes it atomically; equal t keeps input order, so
@@ -2898,6 +2958,51 @@ def main():
         events = _parse_drill_events(raw_events, up_pairs, node_set, a, b)
         result = compute_slocmp(links, node_set, pair_set, a, b, width,
                                 old, new, events, data)
+    elif argv[1] == "slogate":
+        if len(argv) != 10:
+            fail(2)
+        file_path, a_text, b_text, width_text, cur_text, new_text, \
+            events_text, data_text = (argv[2], argv[3], argv[4], argv[5],
+                                      argv[6], argv[7], argv[8], argv[9])
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        a = _bounded_int_arg(a_text)
+        b = _bounded_int_arg(b_text)
+        if a > b:
+            fail(5)
+        width = _bounded_int_arg(width_text)
+        if width < 1:
+            fail(5)
+        try:
+            cur = json.loads(cur_text, parse_constant=_reject_constant,
+                             parse_float=_finite_float,
+                             object_pairs_hook=_object_no_dup)
+            new = json.loads(new_text, parse_constant=_reject_constant,
+                             parse_float=_finite_float,
+                             object_pairs_hook=_object_no_dup)
+            raw_events = json.loads(
+                events_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        # CUR and NEW each follow sloeval's POLICY contract: [u, o, d, f,
+        # s, g], six non-boolean integers in [0, MAX_COST].
+        for policy in (cur, new):
+            if not isinstance(policy, list) or len(policy) != 6:
+                fail(5)
+            for value in policy:
+                if type(value) is not int or not 0 <= value <= MAX_COST:
+                    fail(5)
+        if not isinstance(raw_events, list) or not isinstance(data, list):
+            fail(5)
+        up_pairs = {(link["from"], link["to"]) for link in links
+                    if link["up"]}
+        pair_set = {(link["from"], link["to"]) for link in links}
+        events = _parse_drill_events(raw_events, up_pairs, node_set, a, b)
+        result = compute_slogate(links, node_set, pair_set, a, b, width,
+                                 cur, new, events, data)
     elif argv[1] == "replay":
         if len(argv) != 6:
             fail(2)
