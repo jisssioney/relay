@@ -16,6 +16,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py audit FILE A B DATA
        python relay.py drill FILE A B EVENTS DATA
        python relay.py multidrill FILE A B EVENTS DATA
+       python relay.py convstat FILE A B EVENTS DATA
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
        python relay.py impair FILE S D DATA
@@ -24,7 +25,7 @@ Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance also those in
 FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/audit
-those in DATA, for drill/multidrill those in EVENTS/DATA),
+those in DATA, for drill/multidrill/convstat those in EVENTS/DATA),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
 P/C/RULES/A/B/W/schema/topology/unknown-node/overflow/re-failure
 error.
@@ -36,6 +37,7 @@ import hashlib
 import json
 import math
 import sys
+from bisect import bisect_left, bisect_right
 from collections import deque
 
 MAX_COST = 2147483647
@@ -1251,6 +1253,203 @@ def compute_multidrill(links, a, b, events, items):
     return {"a": a, "b": b, "periods": out_periods}
 
 
+def compute_convstat(links, node_set, pair_set, a, b, events, data):
+    # Convergence correlation over multidrill failure periods. Periods
+    # open and close exactly as in compute_multidrill: nodes start up,
+    # links take FILE's up flag, events apply in order (t non-decreasing,
+    # equal t kept in order) with repeated setting idempotent, a period
+    # closes on the tick its current down set empties, and a close and a
+    # reopen may share a tick. Each record (t, f, path) reports flow f's
+    # path at tick t, [] meaning unreachable. A record inside a period's
+    # [start, end) window ([start, b] while the period is still open)
+    # affects its flow when the path is empty or differs from the flow's
+    # previous record, except that a flow's first non-empty path never
+    # affects. For a closed period, r is the earliest moment in
+    # [end, U) — U the next period's start, b + 1 for the last one — at
+    # which every affected flow's latest path is non-empty, r = end when
+    # that already holds at end; r and d stay null with no affected
+    # flows, an open period, or no timely recovery, else d = r - start.
+    # c counts adjacent path changes of the affected flows within
+    # [start, r], or within [start, U) when r is null.
+    node_up = {}
+    link_up = {(link["from"], link["to"]): link["up"] for link in links}
+    periods = []  # [start, end_or_None] in opening order
+    down_nodes = set()
+    down_links = set()
+    for t, kind, *rest in events:
+        if kind == 0:
+            node, up = rest
+            if node_up.get(node, True) == up:
+                continue
+            node_up[node] = up
+            if up:
+                down_nodes.discard(node)
+            else:
+                if not periods or periods[-1][1] is not None:
+                    periods.append([t, None])
+                down_nodes.add(node)
+        else:
+            u, v, up = rest
+            pair = (u, v)
+            if link_up[pair] == up:
+                continue
+            link_up[pair] = up
+            if up:
+                down_links.discard(pair)
+            else:
+                if not periods or periods[-1][1] is not None:
+                    periods.append([t, None])
+                down_links.add(pair)
+        # The period closes on the tick its current down set empties; a
+        # later event at the same tick may reopen a fresh period.
+        if (periods and periods[-1][1] is None
+                and not down_nodes and not down_links):
+            periods[-1][1] = t
+
+    # Record validation: t is a bounded integer inside [a, b] and
+    # non-decreasing, f a 1..64 code point UTF-8 string with at most one
+    # record per (t, f), and a non-empty path must be a known simple path
+    # whose nodes and links are all up once every event has been applied.
+    records = []
+    seen_marks = set()
+    previous_time = None
+    for item in data:
+        if not isinstance(item, list) or len(item) != 3:
+            fail(5)
+        t, f, path = item
+        if type(t) is not int or not 0 <= t <= MAX_COST:
+            fail(5)
+        if not a <= t <= b:
+            fail(5)
+        if previous_time is not None and t < previous_time:
+            fail(5)
+        previous_time = t
+        if type(f) is not str or not 1 <= len(f) <= 64:
+            fail(5)
+        try:
+            f.encode("utf-8")
+        except UnicodeEncodeError:
+            fail(5)
+        if (t, f) in seen_marks:
+            fail(5)
+        seen_marks.add((t, f))
+        if not isinstance(path, list):
+            fail(5)
+        if path:
+            for node in path:
+                if type(node) is not str or node not in node_set:
+                    fail(5)
+                if not node_up.get(node, True):
+                    fail(5)
+            if len(set(path)) != len(path):
+                fail(5)
+            for x, y in zip(path, path[1:]):
+                if (x, y) not in pair_set:
+                    fail(5)
+                if not link_up[(x, y)]:
+                    fail(5)
+        records.append((t, f, path))
+
+    # Per-flow history in input (non-decreasing t) order; same-flow
+    # same-tick uniqueness makes each flow's ticks strictly increasing.
+    flow_times = {}
+    flow_paths = {}
+    first_nonempty = {}
+    for g, (t, f, path) in enumerate(records):
+        if f not in flow_times:
+            flow_times[f] = []
+            flow_paths[f] = []
+        flow_times[f].append(t)
+        flow_paths[f].append(path)
+        if path and f not in first_nonempty:
+            first_nonempty[f] = g
+
+    # Single pass over the records marking affected flows. Affecting
+    # windows of distinct periods are disjoint, so a period pointer
+    # suffices; last_index keeps each flow's previous record globally,
+    # including records before the window.
+    n_periods = len(periods)
+    affected = [set() for _ in periods]
+    window_end = [p[1] if p[1] is not None else b + 1 for p in periods]
+    last_index = {}
+    pidx = 0
+    for g, (t, f, path) in enumerate(records):
+        while pidx < n_periods and t >= window_end[pidx]:
+            pidx += 1
+        if pidx < n_periods and periods[pidx][0] <= t:
+            prev = last_index.get(f)
+            if not path:
+                affected[pidx].add(f)
+            elif (prev is not None and g != first_nonempty[f]
+                    and path != records[prev][2]):
+                affected[pidx].add(f)
+        last_index[f] = g
+
+    gt = [t for t, _, _ in records]
+    out_periods = []
+    for i, (start, end) in enumerate(periods):
+        flows = affected[i]
+        next_u = periods[i + 1][0] if i + 1 < n_periods else b + 1
+        r = None
+        if end is not None and flows:
+            # Latest path per affected flow at the closing tick (records
+            # at t == end included); r = end when already all non-empty.
+            latest = {}
+            empty = 0
+            for f in flows:
+                j = bisect_right(flow_times[f], end) - 1
+                path = flow_paths[f][j] if j >= 0 else []
+                latest[f] = path
+                if not path:
+                    empty += 1
+            if empty == 0:
+                r = end
+            else:
+                # Sweep recovery records in (end, U) tick by tick. Only
+                # the count of empty-latest affected flows matters and a
+                # record changes it by at most one, so the sweep is
+                # linear in the records inside the window; recovery
+                # windows of distinct periods are disjoint.
+                g = bisect_right(gt, end)
+                hi = bisect_left(gt, next_u)
+                while g < hi and empty:
+                    tick = gt[g]
+                    while g < hi and gt[g] == tick:
+                        _, f, path = records[g]
+                        if f in latest:
+                            if not latest[f] and path:
+                                empty -= 1
+                            elif latest[f] and not path:
+                                empty += 1
+                            latest[f] = path
+                        g += 1
+                    if empty == 0:
+                        r = tick
+
+        # Adjacent path changes of affected flows, both records inside
+        # [start, r] when recovered and inside [start, U) otherwise.
+        c = 0
+        for f in flows:
+            ft = flow_times[f]
+            lo = bisect_left(ft, start)
+            if r is not None:
+                hi = bisect_right(ft, r)
+            else:
+                hi = bisect_left(ft, next_u)
+            fp = flow_paths[f]
+            for k in range(lo + 1, hi):
+                if fp[k] != fp[k - 1]:
+                    c += 1
+
+        out_periods.append([start,
+                            None if end is None else end,
+                            None if r is None else r,
+                            None if r is None else r - start,
+                            c, sorted(flows)])
+
+    return {"a": a, "b": b, "p": out_periods}
+
+
 def compute_replay(nodes, links, a, b, events):
     # Event-driven replay over a mutable up-graph. The clock jumps to each
     # event's t and processes it atomically; equal t keeps input order, so
@@ -2385,6 +2584,33 @@ def main():
         events = _parse_drill_events(raw_events, up_pairs, node_set, a, b)
         items = _parse_drill_items(data, node_set, pair_set)
         result = compute_multidrill(links, a, b, events, items)
+    elif argv[1] == "convstat":
+        if len(argv) != 7:
+            fail(2)
+        file_path, a_text, b_text, events_text, data_text = \
+            argv[2], argv[3], argv[4], argv[5], argv[6]
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        a = _bounded_int_arg(a_text)
+        b = _bounded_int_arg(b_text)
+        if a > b:
+            fail(5)
+        try:
+            raw_events = json.loads(
+                events_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(raw_events, list) or not isinstance(data, list):
+            fail(5)
+        up_pairs = {(link["from"], link["to"]) for link in links
+                    if link["up"]}
+        pair_set = {(link["from"], link["to"]) for link in links}
+        events = _parse_drill_events(raw_events, up_pairs, node_set, a, b)
+        result = compute_convstat(links, node_set, pair_set, a, b,
+                                  events, data)
     elif argv[1] == "replay":
         if len(argv) != 6:
             fail(2)
