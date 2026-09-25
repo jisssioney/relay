@@ -6,11 +6,13 @@ Usage: python relay.py route FILE SOURCE
        python relay.py protect FILE SOURCE DESTINATION DELAY EVENTS
        python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
        python relay.py queue FILE FROM TO CAP STEP DATA
+       python relay.py reorder FILE FROM TO BASE WINDOW DATA
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue also those in FILE/DATA), 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/
-TABLE/CAP/STEP/DATA/schema/topology/unknown-node/overflow error.
+for queue and reorder also those in FILE/DATA), 5 FLOW/ORDER/DELAY/
+EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/schema/topology/
+unknown-node/overflow error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline.
 """
@@ -453,6 +455,34 @@ def compute_queue(frm, to, cap, step, packets):
             "packets": results}
 
 
+def compute_reorder(frm, to, base, window, packets):
+    # Up-link resequencing. Each packet's one-way delay is base + jitter,
+    # so it arrives at time + delay; events are handled in (arrival, seq)
+    # order with the explicit clock jumping to each arrival. A packet more
+    # than window positions ahead of the next expected seq is discarded;
+    # otherwise it is buffered, and at that same clock time every buffered
+    # run starting at next is released in order.
+    events = sorted((time + base + jitter, seq, pid)
+                    for seq, (pid, time, jitter) in enumerate(packets))
+    rows = [None] * len(events)
+    buffered = {}  # seq -> (id, arrival)
+    nxt = 0
+    for arrival, seq, pid in events:
+        if seq - nxt > window:
+            rows[seq] = [pid, seq, arrival, "over_window", None, None]
+            continue
+        buffered[seq] = (pid, arrival)
+        while nxt in buffered:
+            bid, barrival = buffered.pop(nxt)
+            rows[nxt] = [bid, nxt, barrival, "released",
+                         arrival, arrival - barrival]
+            nxt += 1
+    for seq, (pid, arrival) in buffered.items():
+        rows[seq] = [pid, seq, arrival, "buffered", None, None]
+    return {"from": frm, "to": to, "base": base, "window": window,
+            "packets": [rows[seq] for _, seq, _ in events]}
+
+
 def main():
     argv = sys.argv
     if len(argv) < 2:
@@ -618,6 +648,54 @@ def main():
                 fail(5)
             packets.append((pid, time, size))
         result = compute_queue(frm, to, cap, step, packets)
+    elif argv[1] == "reorder":
+        if len(argv) != 8:
+            fail(2)
+        file_path, frm, to = argv[2], argv[3], argv[4]
+        base_text, window_text, data_text = argv[5], argv[6], argv[7]
+        nodes, links, node_set = load_network(file_path, strict=True)
+        if frm not in node_set or to not in node_set:
+            fail(5)
+        if not any(link["from"] == frm and link["to"] == to and link["up"]
+                   for link in links):
+            fail(5)
+        base = _bounded_int_arg(base_text)
+        window = _bounded_int_arg(window_text)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        packets = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            pid, time, jitter = item
+            if type(pid) is not str or pid == "" or pid in seen_ids:
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_ids.add(pid)
+            if type(time) is not int or not 0 <= time <= MAX_COST:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if type(jitter) is not int or not -MAX_COST <= jitter <= MAX_COST:
+                fail(5)
+            delay = base + jitter
+            arrival = time + delay
+            if not 0 <= delay <= MAX_COST or not 0 <= arrival <= MAX_COST:
+                fail(5)
+            packets.append((pid, time, jitter))
+        result = compute_reorder(frm, to, base, window, packets)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
