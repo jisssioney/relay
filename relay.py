@@ -11,12 +11,13 @@ Usage: python relay.py route FILE SOURCE
        python relay.py policy FILE S D P C RULES
        python relay.py reserve FILE DATA
        python relay.py rebalance FILE DATA LIMIT
+       python relay.py quality FILE A B DATA
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/reorder/converge/policy/reserve/rebalance also those in
+for queue/reorder/converge/policy/reserve/rebalance/quality also those in
 FILE/DATA/EVENTS/RULES), 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/
-STEP/BASE/WINDOW/DATA/D/R/P/C/RULES/schema/topology/unknown-node/
+STEP/BASE/WINDOW/DATA/D/R/P/C/RULES/A/B/schema/topology/unknown-node/
 overflow error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline.
@@ -884,6 +885,51 @@ def compute_rebalance(nodes, links, demands, limit):
                       for i, link in enumerate(links)]}
 
 
+def compute_quality(a, b, items):
+    # Per-flow delivery quality over the packets with a <= t <= b, kept in
+    # their input order (already non-decreasing in t, so same-time packets
+    # stay in input order). Lost packets (d is None) count toward the
+    # totals but are deleted from each flow's path sequence before the
+    # adjacent-path changes are counted. Rates and means go through
+    # _format_peak, so no float rounding can leak into the output.
+    total = 0
+    delivered = 0
+    delay_sum = 0
+    delays = []
+    flows = {}  # f -> [last delivered path or None, path changes]
+    for _, f, t, d, path in items:
+        if t < a or t > b:
+            continue
+        total += 1
+        entry = flows.get(f)
+        if entry is None:
+            entry = flows[f] = [None, 0]
+        if d is None:
+            continue
+        delivered += 1
+        delay_sum += d
+        delays.append(d)
+        if entry[0] is not None and path != entry[0]:
+            entry[1] += 1
+        entry[0] = path
+
+    lost = total - delivered
+    rate = _format_peak(lost, total) if total else "0.000000"
+
+    if delivered:
+        delays.sort()
+        p95 = delays[(95 * delivered + 99) // 100 - 1]
+        delay = [delivered, delays[0], delays[-1],
+                 _format_peak(delay_sum, delivered), p95]
+    else:
+        delay = [0, None, None, None, None]
+
+    return {"start": a, "end": b,
+            "stats": [total, delivered, lost, rate],
+            "delay": delay,
+            "changes": [[f, flows[f][1]] for f in sorted(flows)]}
+
+
 def main():
     argv = sys.argv
     if len(argv) < 2:
@@ -1287,6 +1333,81 @@ def main():
             demands.append((rid, s, d, b, path))
         limit = _bounded_int_arg(limit_text)
         result = compute_rebalance(nodes, links, demands, limit)
+    elif argv[1] == "quality":
+        if len(argv) != 6:
+            fail(2)
+        file_path, a_text, b_text, data_text = (argv[2], argv[3], argv[4],
+                                                argv[5])
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        a = _bounded_int_arg(a_text)
+        b = _bounded_int_arg(b_text)
+        if a > b:
+            fail(5)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        up_of = {}
+        for link in links:
+            up_of[(link["from"], link["to"])] = link["up"]
+        items = []
+        seen_ids = {}
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 5:
+                fail(5)
+            pid, f, t, d, path = item
+            if type(pid) is not str or not 1 <= len(pid) <= 64:
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if type(f) is not str or not 1 <= len(f) <= 64:
+                fail(5)
+            try:
+                f.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if type(t) is not int or not 0 <= t <= MAX_COST:
+                fail(5)
+            if previous_time is not None and t < previous_time:
+                fail(5)
+            previous_time = t
+            if d is None:
+                # A lost packet carries no path.
+                if path != []:
+                    fail(5)
+            else:
+                if type(d) is not int or not 0 <= d <= MAX_COST:
+                    fail(5)
+                if not isinstance(path, list) or not path:
+                    fail(5)
+                for node in path:
+                    if type(node) is not str or node not in node_set:
+                        fail(5)
+                if len(set(path)) != len(path):
+                    fail(5)
+                for x, y in zip(path, path[1:]):
+                    pair = (x, y)
+                    if pair not in up_of or not up_of[pair]:
+                        fail(5)
+            # A repeated id must repeat the whole item: identical copies
+            # are deduplicated, a different item under the same id is an
+            # error.
+            key = (f, t, d, tuple(path))
+            if pid in seen_ids:
+                if seen_ids[pid] != key:
+                    fail(5)
+                continue
+            seen_ids[pid] = key
+            items.append((pid, f, t, d, path))
+        result = compute_quality(a, b, items)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
