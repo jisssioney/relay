@@ -12,6 +12,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py reserve FILE DATA
        python relay.py rebalance FILE DATA LIMIT
        python relay.py quality FILE A B DATA
+       python relay.py audit FILE A B DATA
        python relay.py replay FILE A B DATA
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
@@ -20,7 +21,7 @@ Usage: python relay.py route FILE SOURCE
 Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance also those in
-FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair those in
+FILE/DATA/EVENTS/RULES, for quality/audit/replay/nfail/lfail/impair those in
 DATA),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
 P/C/RULES/A/B/W/schema/topology/unknown-node/overflow error.
@@ -932,6 +933,66 @@ def compute_quality(a, b, items):
             "changes": changes}
 
 
+def compute_audit(nodes, links, a, b, items):
+    # Replay analysis over the items with a <= t <= b, kept in input order
+    # (t is non-decreasing and equal t keeps input order). Each validated
+    # item is (id, f, t, s, d, path): s=0 delivered, s=1 lost on its path's
+    # final edge (the attribution is exactly that one edge), s=2 no route
+    # (d None, path empty). Every s=0/1 path edge counts one traversal.
+    index_of = {(link["from"], link["to"]): i for i, link in enumerate(links)}
+    traversals = [0] * len(links)
+    attributed = [0] * len(links)
+
+    total = delivered = lost = unreachable = 0
+    delays = []
+    flow_paths = {}  # f -> paths of its delivered packets, in order
+    for _, f, t, s, d, path in items:
+        if not a <= t <= b:
+            continue
+        total += 1
+        # Every flow seen in the window is listed; only delivered packets
+        # survive into the path sequence c is counted over, so a flow with
+        # no delivered packet gets c=0 (exactly the quality rule).
+        delivered_paths = flow_paths.setdefault(f, [])
+        edges = list(zip(path, path[1:]))
+        for pair in edges:
+            traversals[index_of[pair]] += 1
+        if s == 0:
+            delivered += 1
+            delays.append(d)
+            delivered_paths.append(path)
+        elif s == 1:
+            lost += 1
+            attributed[index_of[edges[-1]]] += 1
+        else:
+            unreachable += 1
+
+    summary = [total, delivered, lost, unreachable,
+               _format_peak(lost, delivered + lost)
+               if delivered + lost else "0.000000"]
+
+    n = delivered
+    if n:
+        delays.sort()
+        # mean keeps the same exact six-decimal half-up rule as every rate;
+        # p95 is the ceil(0.95*n)-th smallest as a 1-based index.
+        delay = [n, _format_peak(sum(delays), n),
+                 delays[(95 * n + 99) // 100 - 1]]
+    else:
+        delay = [0, None, None]
+
+    link_stats = [[link["from"], link["to"], traversals[i], attributed[i],
+                   _format_peak(attributed[i], traversals[i])
+                   if traversals[i] else "0.000000"]
+                  for i, link in enumerate(links)]
+
+    reroutes = [[f, sum(1 for x, y in zip(paths, paths[1:]) if x != y)]
+                for f, paths in sorted(flow_paths.items())]
+
+    return {"start": a, "end": b, "summary": summary, "delay": delay,
+            "links": link_stats, "reroutes": reroutes}
+
+
 def compute_replay(nodes, links, a, b, events):
     # Event-driven replay over a mutable up-graph. The clock jumps to each
     # event's t and processes it atomically; equal t keeps input order, so
@@ -1747,6 +1808,84 @@ def main():
             seen_ids[pid] = signature
             items.append((pid, f, t, d, path))
         result = compute_quality(a, b, items)
+    elif argv[1] == "audit":
+        if len(argv) != 6:
+            fail(2)
+        file_path, a_text, b_text, data_text = \
+            argv[2], argv[3], argv[4], argv[5]
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        a = _bounded_int_arg(a_text)
+        b = _bounded_int_arg(b_text)
+        if a > b:
+            fail(5)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        # Audit paths must walk directed edges that exist in FILE; unlike
+        # quality, an edge's up flag does not matter here.
+        pair_set = {(link["from"], link["to"]) for link in links}
+        items = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 6:
+                fail(5)
+            pid, f, t, s, d, path = item
+            if type(pid) is not str or not 1 <= len(pid) <= 64:
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if pid in seen_ids:
+                fail(5)
+            seen_ids.add(pid)
+            if type(f) is not str or not 1 <= len(f) <= 64:
+                fail(5)
+            try:
+                f.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if type(t) is not int or not 0 <= t <= MAX_COST:
+                fail(5)
+            if previous_time is not None and t < previous_time:
+                fail(5)
+            previous_time = t
+            if type(s) is not int or s not in (0, 1, 2):
+                fail(5)
+            if s == 2:
+                # A no-route packet fixes d null and path empty.
+                if d is not None or not isinstance(path, list) or path:
+                    fail(5)
+            else:
+                # s=0 delivered and s=1 lost carry a delay and a non-empty
+                # simple node array walking edges that exist in FILE; a lost
+                # packet attributes to its final edge, so the path has an
+                # edge and therefore length at least 2.
+                if type(d) is not int or not 0 <= d <= MAX_TIME:
+                    fail(5)
+                if not isinstance(path, list):
+                    fail(5)
+                # A lost packet attributes to a final edge, so its path has
+                # at least two nodes; a delivered path is merely non-empty.
+                min_len = 2 if s == 1 else 1
+                if len(path) < min_len:
+                    fail(5)
+                for node in path:
+                    if type(node) is not str or node not in node_set:
+                        fail(5)
+                if len(set(path)) != len(path):
+                    fail(5)
+                for x, y in zip(path, path[1:]):
+                    if (x, y) not in pair_set:
+                        fail(5)
+            items.append((pid, f, t, s, d, path))
+        result = compute_audit(nodes, links, a, b, items)
     elif argv[1] == "replay":
         if len(argv) != 6:
             fail(2)
