@@ -5,10 +5,12 @@ Usage: python relay.py route FILE SOURCE
        python relay.py metric FILE SOURCE ORDER
        python relay.py protect FILE SOURCE DESTINATION DELAY EVENTS
        python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
+       python relay.py queue FILE FROM TO CAP STEP DATA
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
-(for forward also duplicate keys or non-finite numbers in FILE/TABLE),
-5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/schema/topology/unknown-node error.
+(for forward also duplicate keys or non-finite numbers in FILE/TABLE,
+for queue also those in FILE/DATA), 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/
+TABLE/CAP/STEP/DATA/schema/topology/unknown-node/overflow error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline.
 """
@@ -17,9 +19,11 @@ import hashlib
 import json
 import math
 import sys
+from collections import deque
 
 MAX_COST = 2147483647
 MAX_FLOW_LEN = 256
+MAX_TIME = 9223372036854775807
 
 
 def fail(code):
@@ -406,6 +410,49 @@ def compute_forward(links, source, destination, limit, table):
             "status": status, "time": time, "trace": trace}
 
 
+def _bounded_int_arg(text):
+    # Decimal command-line integer in [0, MAX_COST]. Leading zeros are
+    # stripped before int() so absurdly long digit strings cannot trip
+    # Python's integer conversion digit limit.
+    if not text or any(c not in "0123456789" for c in text):
+        fail(5)
+    digits = text.lstrip("0") or "0"
+    if len(digits) > 10:
+        fail(5)
+    value = int(digits)
+    if value > MAX_COST:
+        fail(5)
+    return value
+
+
+def compute_queue(frm, to, cap, step, packets):
+    # Store-and-forward shaper on a single directed link. A packet holds
+    # buffer space from its arrival until its departure; starts are never
+    # earlier than the previous departure, so departures leave the buffer
+    # in FIFO order and a deque gives O(1) amortized release per packet.
+    buffer = deque()  # (depart, size) of packets still occupying capacity
+    occupancy = 0
+    last_depart = 0
+    results = []
+    for pid, time, size in packets:
+        while buffer and buffer[0][0] <= time:
+            occupancy -= buffer.popleft()[1]
+        if occupancy + size > cap:
+            # Dropped packets do not alter the schedule.
+            results.append([pid, "drop", None, None, None])
+            continue
+        start = time if time > last_depart else last_depart
+        depart = start + size * step
+        if depart > MAX_TIME:
+            fail(5)
+        last_depart = depart
+        occupancy += size
+        buffer.append((depart, size))
+        results.append([pid, "ok", start, depart, start - time])
+    return {"from": frm, "to": to, "cap": cap, "step": step,
+            "packets": results}
+
+
 def main():
     argv = sys.argv
     if len(argv) < 2:
@@ -520,6 +567,57 @@ def main():
                     and (type(value) is not str or value not in node_set)):
                 fail(5)
         result = compute_forward(links, source, destination, limit, table)
+    elif argv[1] == "queue":
+        if len(argv) != 8:
+            fail(2)
+        file_path, frm, to = argv[2], argv[3], argv[4]
+        cap_text, step_text, data_text = argv[5], argv[6], argv[7]
+        nodes, links, node_set = load_network(file_path, strict=True)
+        if frm not in node_set or to not in node_set:
+            fail(5)
+        if not any(link["from"] == frm and link["to"] == to and link["up"]
+                   for link in links):
+            fail(5)
+        cap = _bounded_int_arg(cap_text)
+        if cap < 1:
+            fail(5)
+        step = _bounded_int_arg(step_text)
+        if step < 1:
+            fail(5)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        packets = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if (not isinstance(item, dict)
+                    or set(item) != {"id", "time", "size"}):
+                fail(5)
+            pid = item["id"]
+            time = item["time"]
+            size = item["size"]
+            if type(pid) is not str or pid == "" or pid in seen_ids:
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_ids.add(pid)
+            if type(time) is not int or not 0 <= time <= MAX_COST:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if type(size) is not int or not 1 <= size <= MAX_COST:
+                fail(5)
+            packets.append((pid, time, size))
+        result = compute_queue(frm, to, cap, step, packets)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
