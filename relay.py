@@ -23,6 +23,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py slogate FILE A B W CUR NEW EVENTS DATA
        python relay.py hotload FILE STATE A B W BASE OP EVENTS DATA
        python relay.py snapshot STATE OP
+       python relay.py config PACK OP
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
        python relay.py impair FILE S D DATA
@@ -36,14 +37,18 @@ those in DATA, for drill/multidrill/convstat/slosum those in
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
 those in OLD/NEW/EVENTS/DATA, for slogate those in
 CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA, for
-snapshot those in STATE/OP/IN),
+snapshot those in STATE/OP/IN, for config those in PACK/OP/IN),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
 P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
 unknown-node/overflow/re-failure error; for hotload code 5 also covers
 a STATE whose v/p/h structure, version continuity, or version conflict
 is invalid; for snapshot code 5 also covers an invalid OP shape, path,
 or BASE, a STATE/IN whose v/p/h structure, key order, or version
-continuity is invalid, and a BASE that conflicts with the current v.
+continuity is invalid, and a BASE that conflicts with the current v;
+for config code 5 also covers an invalid OP shape, path, or BASE, a
+PACK/IN whose v/t/p/h structure, key order, topology, version
+continuity, or last-entry match is invalid, and a BASE that conflicts
+with the current v.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -110,6 +115,14 @@ def load_network(path, metrics=False, strict=False):
     except (ValueError, RecursionError):
         fail(4)
 
+    return _validate_topology(data, metrics)
+
+
+def _validate_topology(data, metrics=False):
+    # Structural checks applied to an already-decoded topology, shared
+    # by load_network (FILE mode) and the config pack validator (the t
+    # member, which follows metric's FILE mode). With metrics=True the
+    # links must also carry bandwidth/latency, as in metric's FILE.
     if not isinstance(data, dict) or set(data) != {"nodes", "links"}:
         fail(5)
     nodes = data["nodes"]
@@ -2171,6 +2184,42 @@ def _validate_hotload_state(data):
     return v, p, [list(entry) for entry in h]
 
 
+def _validate_config_pack(data):
+    # A config pack is {"v": v, "t": t, "p": p, "h": h} with keys in
+    # that order: v is the current version, t the current topology
+    # (metric's FILE mode), p the current policy (slogate's six-int
+    # POLICY), and h a non-empty version-zero continuous history of
+    # [version, t, p] triples whose every t/p is valid and whose last
+    # entry is exactly [v, t, p]. Returns the normalized (v, t, p, h).
+    if not isinstance(data, dict) or list(data.keys()) != ["v", "t", "p", "h"]:
+        fail(5)
+    v = data["v"]
+    t = data["t"]
+    p = data["p"]
+    h = data["h"]
+    if type(v) is not int or not 0 <= v <= MAX_COST:
+        fail(5)
+    _validate_topology(t, metrics=True)
+    if not _is_policy(p):
+        fail(5)
+    if not isinstance(h, list) or len(h) == 0 or len(h) != v + 1:
+        fail(5)
+    expected_version = 0
+    for entry in h:
+        if not isinstance(entry, list) or len(entry) != 3:
+            fail(5)
+        hv, ht, hp = entry
+        if type(hv) is not int or hv != expected_version:
+            fail(5)
+        _validate_topology(ht, metrics=True)
+        if not _is_policy(hp):
+            fail(5)
+        expected_version += 1
+    if h[-1][0] != v or h[-1][1] != t or h[-1][2] != p:
+        fail(5)
+    return v, t, p, [list(entry) for entry in h]
+
+
 def _state_payload(state):
     # Canonical on-disk form: top-level key order v,p,h, compact
     # separators, non-ASCII UTF-8, integers in decimal, one trailing LF.
@@ -3555,6 +3604,73 @@ def main():
                 result = {"op": 1, "status": 0, "state": in_state}
         else:
             result = {"op": 2, "status": 2, "state": state}
+    elif argv[1] == "config":
+        if len(argv) != 4:
+            fail(2)
+        pack_path, op_text = argv[2], argv[3]
+        # Read/decode PACK first (read errors code 3, strict JSON
+        # errors code 4), then parse the inline OP, then check shapes.
+        raw_pack = _load_state(pack_path)
+        try:
+            op = json.loads(op_text, parse_constant=_reject_constant,
+                            parse_float=_finite_float,
+                            object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(op, list) or len(op) == 0 \
+                or type(op[0]) is not int:
+            fail(5)
+        kind = op[0]
+        if kind == 0:
+            # [0, OUT]: export PACK to OUT.
+            if len(op) != 2 or type(op[1]) is not str or len(op[1]) == 0:
+                fail(5)
+            out_path = op[1]
+        elif kind == 1:
+            # [1, BASE, IN]: import IN into PACK.
+            if len(op) != 3 or type(op[1]) is not int \
+                    or not 0 <= op[1] <= MAX_COST \
+                    or type(op[2]) is not str or len(op[2]) == 0:
+                fail(5)
+            base, in_path = op[1], op[2]
+        elif kind == 2:
+            # [2]: audit only, nothing is written.
+            if len(op) != 1:
+                fail(5)
+        else:
+            fail(5)
+        v, topo, policy, history = _validate_config_pack(raw_pack)
+        pack = {"v": v, "t": topo, "p": policy, "h": history}
+        if kind == 0:
+            try:
+                with open(out_path, "rb") as f:
+                    existing = f.read()
+            except FileNotFoundError:
+                existing = None
+            except OSError:
+                fail(3)
+            if existing == _state_payload(pack):
+                # OUT already holds the canonical bytes: do not write.
+                result = {"op": 0, "status": 1, "config": pack}
+            else:
+                _write_state_atomic(out_path, pack)
+                result = {"op": 0, "status": 0, "config": pack}
+        elif kind == 1:
+            raw_in = _load_state(in_path)
+            in_v, in_topo, in_policy, in_history = \
+                _validate_config_pack(raw_in)
+            in_pack = {"v": in_v, "t": in_topo, "p": in_policy,
+                       "h": in_history}
+            if base != v:
+                fail(5)
+            if in_pack == pack:
+                # Importing the pack already current is idempotent.
+                result = {"op": 1, "status": 1, "config": pack}
+            else:
+                _write_state_atomic(pack_path, in_pack)
+                result = {"op": 1, "status": 0, "config": in_pack}
+        else:
+            result = {"op": 2, "status": 2, "config": pack}
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
