@@ -18,6 +18,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py multidrill FILE A B EVENTS DATA
        python relay.py convstat FILE A B EVENTS DATA
        python relay.py slosum FILE A B W EVENTS DATA
+       python relay.py sloeval FILE A B W POLICY EVENTS DATA
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
        python relay.py impair FILE S D DATA
@@ -27,9 +28,9 @@ Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 for queue/reorder/converge/policy/reserve/rebalance also those in
 FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/audit
 those in DATA, for drill/multidrill/convstat/slosum those in
-EVENTS/DATA),
+EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
-P/C/RULES/A/B/W/schema/topology/unknown-node/overflow/re-failure
+P/C/RULES/A/B/W/POLICY/schema/topology/unknown-node/overflow/re-failure
 error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline.
@@ -1503,6 +1504,68 @@ def compute_slosum(links, node_set, pair_set, a, b, width, events, data):
     return {"a": a, "b": b, "width": width, "windows": windows}
 
 
+def compute_sloeval(links, node_set, pair_set, a, b, width, policy,
+                    events, data):
+    # Windowed convergence-SLO evaluation. Windows come from compute_slosum
+    # and each is checked against policy [u, o, d, f, s, g]: u caps the
+    # unrecovered count U, o the still-open count O, d the recovery p95
+    # ds[4], f the affected-flow total F, s the change total S, and g the
+    # number of violating windows the budget still tolerates. A window is
+    # compliant when every reason list is empty; thresholds are inclusive,
+    # so equality never violates. Reason codes, in order: 0 for U > u,
+    # 1 for O > o, 2 for a window with periods (C + O > 0) but no recovery
+    # delay sample (ds[0] = 0), 3 for ds[0] > 0 with p95 > d, 4 for F > f,
+    # 5 for S > s. The excess vector reports q(z) = max(z, 0) of each
+    # overshoot, with the p95 slot null when ds[0] = 0.
+    summary = compute_slosum(links, node_set, pair_set, a, b, width,
+                             events, data)
+    u_lim, o_lim, d_lim, f_lim, s_lim, g = policy
+    windows = []
+    for x, y, closed, unrecovered, open_count, ds, flows_total, c_total \
+            in summary["windows"]:
+        reasons = []
+        if unrecovered > u_lim:
+            reasons.append(0)
+        if open_count > o_lim:
+            reasons.append(1)
+        if closed + open_count > 0 and ds[0] == 0:
+            reasons.append(2)
+        if ds[0] > 0 and ds[4] > d_lim:
+            reasons.append(3)
+        if flows_total > f_lim:
+            reasons.append(4)
+        if c_total > s_lim:
+            reasons.append(5)
+        excess = [max(unrecovered - u_lim, 0),
+                  max(open_count - o_lim, 0),
+                  max(ds[4] - d_lim, 0) if ds[0] > 0 else None,
+                  max(flows_total - f_lim, 0),
+                  max(c_total - s_lim, 0)]
+        windows.append([x, y, not reasons, reasons, excess])
+
+    # Maximal runs of adjacent violating windows; the windows tile [a, b]
+    # in order, so adjacency is consecutive index.
+    runs = []
+    violations = 0
+    i = 0
+    count = len(windows)
+    while i < count:
+        if windows[i][2]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < count and not windows[j + 1][2]:
+            j += 1
+        runs.append([windows[i][0], windows[j][1], j - i + 1])
+        violations += j - i + 1
+        i = j + 1
+
+    budget = [g, violations, max(g - violations, 0),
+              max(violations - g, 0)]
+    return {"a": a, "b": b, "width": width, "policy": policy,
+            "windows": windows, "runs": runs, "budget": budget}
+
+
 def compute_replay(nodes, links, a, b, events):
     # Event-driven replay over a mutable up-graph. The clock jumps to each
     # event's t and processes it atomically; equal t keeps input order, so
@@ -2694,6 +2757,47 @@ def main():
         events = _parse_drill_events(raw_events, up_pairs, node_set, a, b)
         result = compute_slosum(links, node_set, pair_set, a, b, width,
                                 events, data)
+    elif argv[1] == "sloeval":
+        if len(argv) != 9:
+            fail(2)
+        file_path, a_text, b_text, width_text, policy_text, events_text, \
+            data_text = (argv[2], argv[3], argv[4], argv[5], argv[6],
+                         argv[7], argv[8])
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        a = _bounded_int_arg(a_text)
+        b = _bounded_int_arg(b_text)
+        if a > b:
+            fail(5)
+        width = _bounded_int_arg(width_text)
+        if width < 1:
+            fail(5)
+        try:
+            policy = json.loads(policy_text, parse_constant=_reject_constant,
+                                parse_float=_finite_float,
+                                object_pairs_hook=_object_no_dup)
+            raw_events = json.loads(
+                events_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        # POLICY is [u, o, d, f, s, g], six non-boolean integers in
+        # [0, MAX_COST].
+        if not isinstance(policy, list) or len(policy) != 6:
+            fail(5)
+        for value in policy:
+            if type(value) is not int or not 0 <= value <= MAX_COST:
+                fail(5)
+        if not isinstance(raw_events, list) or not isinstance(data, list):
+            fail(5)
+        up_pairs = {(link["from"], link["to"]) for link in links
+                    if link["up"]}
+        pair_set = {(link["from"], link["to"]) for link in links}
+        events = _parse_drill_events(raw_events, up_pairs, node_set, a, b)
+        result = compute_sloeval(links, node_set, pair_set, a, b, width,
+                                 policy, events, data)
     elif argv[1] == "replay":
         if len(argv) != 6:
             fail(2)
