@@ -7,12 +7,13 @@ Usage: python relay.py route FILE SOURCE
        python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
        python relay.py queue FILE FROM TO CAP STEP DATA
        python relay.py reorder FILE FROM TO BASE WINDOW DATA
+       python relay.py converge FILE SRC DST D R EVENTS
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/reorder also those in FILE/DATA), 5 FLOW/ORDER/DELAY/EVENTS/
-LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/schema/topology/unknown-node/
-overflow error.
+for queue/reorder/converge also those in FILE/DATA/EVENTS), 5 FLOW/
+ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/schema/
+topology/unknown-node/overflow error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline.
 """
@@ -484,6 +485,90 @@ def compute_reorder(frm, to, base, window, packets):
             "packets": results}
 
 
+def compute_converge(nodes, links, source, destination, delay, run, events):
+    # Debounced route recomputation after link changes. The clock starts at
+    # 0 with the initial route installed. Events are applied first at each
+    # tick; a real change cancels any outstanding cycle and rearms the
+    # trigger at t+D and completion at t+D+R. The trigger recomputes the
+    # shortest path over the current topology and the completion installs
+    # it; a change in between invalidates the pending result and restarts
+    # the cycle. Setting a link to its current state changes nothing and
+    # leaves the timer untouched.
+    state = {(link["from"], link["to"]): link["up"] for link in links}
+
+    def live_links():
+        # shortest_paths reads each dict's "up" flag, so mirror the current
+        # state there rather than relying on the original link values.
+        return [{**link, "up": state[(link["from"], link["to"])]}
+                for link in links
+                if state[(link["from"], link["to"])]]
+
+    cost_of, path_of = shortest_paths(nodes, live_links(), source)
+    installed_cost = cost_of[destination]
+    installed_path = path_of[destination]
+
+    def reachable(path):
+        return path is not None and all(
+            state[pair] for pair in zip(path, path[1:]))
+
+    def entry(now, kind):
+        # The last three fields always describe the currently installed
+        # route; an installed path with a down edge is not reachable.
+        if installed_path is not None and reachable(installed_path):
+            return [now, kind, installed_cost, installed_path, True]
+        return [now, kind, None, [], False]
+
+    timeline = [entry(0, 0)]
+
+    trigger_at = None
+    complete_at = None
+    pending_cost = None
+    pending_path = None
+    i = 0
+    n = len(events)
+    while i < n or trigger_at is not None or complete_at is not None:
+        wakes = []
+        if i < n:
+            wakes.append(events[i]["time"])
+        if trigger_at is not None:
+            wakes.append(trigger_at)
+        if complete_at is not None:
+            wakes.append(complete_at)
+        now = min(wakes)
+        # All events at this tick run before either timer, and the trigger
+        # at the same tick fires before the completion.
+        while i < n and events[i]["time"] == now:
+            event = events[i]
+            pair = (event["from"], event["to"])
+            i += 1
+            if state[pair] != event["up"]:
+                # Every real change cancels the unfinished cycle (whether
+                # or not the trigger has fired) and rearms both timers.
+                state[pair] = event["up"]
+                trigger_at = now + delay
+                complete_at = trigger_at + run
+                if complete_at > MAX_TIME:
+                    fail(5)
+                pending_cost = None
+                pending_path = None
+            timeline.append(entry(now, 1))
+        if trigger_at is not None and trigger_at == now:
+            cost_of, path_of = shortest_paths(nodes, live_links(), source)
+            pending_cost = cost_of[destination]
+            pending_path = path_of[destination]
+            trigger_at = None
+            timeline.append(entry(now, 2))
+        if complete_at is not None and complete_at == now:
+            installed_cost = pending_cost
+            installed_path = pending_path
+            complete_at = None
+            pending_cost = None
+            pending_path = None
+            timeline.append(entry(now, 3))
+
+    return {"timeline": timeline}
+
+
 def main():
     argv = sys.argv
     if len(argv) < 2:
@@ -698,6 +783,46 @@ def main():
                 fail(5)
             packets.append((pid, seq, arrival))
         result = compute_reorder(frm, to, base, window, packets)
+    elif argv[1] == "converge":
+        if len(argv) != 8:
+            fail(2)
+        file_path, source, destination = argv[2], argv[3], argv[4]
+        delay_text, run_text, events_text = argv[5], argv[6], argv[7]
+        nodes, links, node_set = load_network(file_path, strict=True)
+        if source not in node_set or destination not in node_set:
+            fail(5)
+        delay = _bounded_int_arg(delay_text)
+        run = _bounded_int_arg(run_text)
+        try:
+            events = json.loads(events_text, parse_constant=_reject_constant,
+                                parse_float=_finite_float,
+                                object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(events, list):
+            fail(5)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        previous_time = None
+        for event in events:
+            if (not isinstance(event, dict)
+                    or list(event) != ["time", "from", "to", "up"]):
+                fail(5)
+            time = event["time"]
+            frm = event["from"]
+            to = event["to"]
+            up = event["up"]
+            if type(time) is not int or not 0 <= time <= MAX_COST:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if (type(frm) is not str or type(to) is not str
+                    or (frm, to) not in pair_set):
+                fail(5)
+            if type(up) is not bool:
+                fail(5)
+        result = compute_converge(nodes, links, source, destination,
+                                  delay, run, events)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
