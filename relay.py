@@ -12,11 +12,12 @@ Usage: python relay.py route FILE SOURCE
        python relay.py reserve FILE DATA
        python relay.py rebalance FILE DATA LIMIT
        python relay.py quality FILE A B DATA
+       python relay.py replay FILE A B DATA
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable, 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance also those in
-FILE/DATA/EVENTS/RULES, for quality those in DATA), 5 FLOW/ORDER/
+FILE/DATA/EVENTS/RULES, for quality/replay those in DATA), 5 FLOW/ORDER/
 DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/P/C/RULES/
 A/B/schema/topology/unknown-node/overflow error.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
@@ -927,6 +928,54 @@ def compute_quality(a, b, items):
             "changes": changes}
 
 
+def compute_replay(nodes, links, a, b, events):
+    # Event-driven replay over a mutable up-graph. The clock jumps to each
+    # event's t and processes it atomically; equal t keeps input order, so
+    # a link item at the same tick before a packet already affects it.
+    # Link items only flip their link's "up" flag in place (repeated
+    # setting is idempotent); every packet item is routed on the current
+    # up-graph over the lowest-cost path, ties going to the complete node
+    # sequence smallest in Unicode code point order (exactly the
+    # shortest_paths tie-break), and its delay is the latency sum along
+    # that path. Only packets with a <= t <= b are collected, in event
+    # order; stats/delay/changes reuse compute_quality on those packets.
+    index_of = {}
+    latency_of = {}
+    for index, link in enumerate(links):
+        pair = (link["from"], link["to"])
+        index_of[pair] = index
+        latency_of[pair] = link["latency"]
+
+    packets = []
+    items = []
+    for event in events:
+        if event[0] == 0:
+            _, _, u, v, up = event
+            links[index_of[(u, v)]]["up"] = up
+            continue
+        _, t, pid, f, s, d = event
+        _, path_of = shortest_paths(nodes, links, s)
+        path = path_of[d]
+        if path is None:
+            delay = None
+            out_path = []
+        else:
+            delay = 0
+            for x, y in zip(path, path[1:]):
+                delay += latency_of[(x, y)]
+            if delay > MAX_TIME:
+                fail(5)
+            out_path = path
+        if a <= t <= b:
+            packets.append([pid, f, t, delay, out_path])
+            items.append((pid, f, t, delay, out_path))
+
+    summary = compute_quality(a, b, items)
+    return {"start": a, "end": b, "packets": packets,
+            "stats": summary["stats"], "delay": summary["delay"],
+            "changes": summary["changes"]}
+
+
 def main():
     argv = sys.argv
     if len(argv) < 2:
@@ -1406,6 +1455,74 @@ def main():
             seen_ids[pid] = signature
             items.append((pid, f, t, d, path))
         result = compute_quality(a, b, items)
+    elif argv[1] == "replay":
+        if len(argv) != 6:
+            fail(2)
+        file_path, a_text, b_text, data_text = \
+            argv[2], argv[3], argv[4], argv[5]
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        a = _bounded_int_arg(a_text)
+        b = _bounded_int_arg(b_text)
+        if a > b:
+            fail(5)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        events = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) < 2:
+                fail(5)
+            t = item[0]
+            kind = item[1]
+            if type(t) is not int or not 0 <= t <= MAX_COST:
+                fail(5)
+            if previous_time is not None and t < previous_time:
+                fail(5)
+            previous_time = t
+            if type(kind) is not int or kind not in (0, 1):
+                fail(5)
+            if kind == 0:
+                if len(item) != 5:
+                    fail(5)
+                _, _, u, v, up = item
+                if (type(u) is not str or type(v) is not str
+                        or (u, v) not in pair_set):
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                events.append((0, t, u, v, up))
+            else:
+                if len(item) != 6:
+                    fail(5)
+                _, _, pid, f, s, d = item
+                if type(pid) is not str or not 1 <= len(pid) <= 64:
+                    fail(5)
+                try:
+                    pid.encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(5)
+                if pid in seen_ids:
+                    fail(5)
+                seen_ids.add(pid)
+                if type(f) is not str or not 1 <= len(f) <= 64:
+                    fail(5)
+                try:
+                    f.encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(5)
+                if (type(s) is not str or type(d) is not str
+                        or s not in node_set or d not in node_set):
+                    fail(5)
+                events.append((1, t, pid, f, s, d))
+        result = compute_replay(nodes, links, a, b, events)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
