@@ -51,7 +51,9 @@ continuity, or last-entry match is invalid, and a BASE that conflicts
 with the current v; for config op 3 code 5 also covers an invalid TS or
 Q, a TS version absent from h, a Q endpoint absent from the current t,
 and a rollback write whose BASE conflicts with v or whose v is already
-MAX_COST.
+MAX_COST; for config op 4 code 5 also covers an invalid BASE or LOG, a
+BASE absent from h, and any replay mismatch, gap, conflict, or
+overflow.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -2362,6 +2364,82 @@ def _config_rollback(pack_path, pack, v, topo, policy, history, base,
             "config": new_pack}
 
 
+def _config_replay(pack_path, pack, v, topo, policy, history, base, log):
+    # Replay op (config op 4): replay LOG of [seq, pre, t, p] entries onto
+    # the version-zero continuous history. BASE is a non-boolean bounded
+    # integer naming a version present in h; each entry's two integers are
+    # non-boolean and bounded, t follows the metric topology contract, p
+    # the six-int policy contract. Validation and the full replay run
+    # first, entirely in memory: the first entry has pre == BASE, each
+    # entry has seq == pre + 1, and later entries chain pre to the prior
+    # seq. An entry with seq <= v must exactly match the existing
+    # h[seq] == [seq, t, p] (reuse, s=0); the first entry with seq > v
+    # must be v + 1, after which entries append [seq, t, p] in order
+    # (new, s=1). Any mismatch, gap, conflict, or overflow fails 5 before
+    # any write. With no new entries the replay is idempotent (status 1);
+    # otherwise the pack is replaced atomically once (status 0). O(S)
+    # time and space with S the total input/output size.
+    if type(base) is bool or base > v:
+        fail(5)
+    if not isinstance(log, list) or not log:
+        fail(5)
+
+    entries = []
+    expected_pre = base
+    for item in log:
+        if not isinstance(item, list) or len(item) != 4:
+            fail(5)
+        seq, pre, t, p = item
+        if type(seq) is bool or type(pre) is bool \
+                or type(seq) is not int or type(pre) is not int \
+                or not 0 <= seq <= MAX_COST or not 0 <= pre <= MAX_COST:
+            fail(5)
+        if pre != expected_pre or seq != pre + 1:
+            fail(5)
+        _validate_topology(t, metrics=True)
+        if not _is_policy(p):
+            fail(5)
+        entries.append([seq, pre, t, p])
+        expected_pre = seq
+
+    steps = []
+    new_history = list(history)
+    added = 0
+    first_new_seen = False
+    for seq, pre, t, p in entries:
+        if seq <= v:
+            # Existing version: must match h[seq] exactly.
+            old = history[seq]
+            if old[0] != seq or old[1] != t or old[2] != p:
+                fail(5)
+            steps.append([seq, pre, 0])
+        else:
+            # The first new version must be exactly v + 1; every later
+            # entry follows by construction of the pre/seq chain, so the
+            # appended versions stay continuous with no gaps.
+            if not first_new_seen:
+                if seq != v + 1:
+                    fail(5)
+                first_new_seen = True
+            new_history.append([seq, t, p])
+            added += 1
+            steps.append([seq, pre, 1])
+
+    if added == 0:
+        # No new entries: nothing is written.
+        return {"op": 4, "status": 1, "applied": 0, "steps": steps,
+                "config": pack}
+
+    new_v = v + added
+    # Entries chain upward by one from the first new version v + 1, so the
+    # last LOG entry is the new current version and its t/p are current.
+    new_pack = {"v": new_v, "t": entries[-1][2], "p": entries[-1][3],
+                "h": new_history}
+    _write_state_atomic(pack_path, new_pack)
+    return {"op": 4, "status": 0, "applied": added, "steps": steps,
+            "config": new_pack}
+
+
 def _validate_hotload_records(links, events, data, node_set, pair_set, a, b):
     # Stream validation matching slogate's data contract (the record
     # checks inside compute_convstat) without running the windowed gate:
@@ -3757,6 +3835,28 @@ def main():
                         or (s, d) in seen_queries:
                     fail(5)
                 seen_queries.add((s, d))
+        elif kind == 4:
+            # [4, BASE, LOG]: replay. BASE is a non-boolean bounded
+            # integer; LOG a non-empty list whose entries are
+            # [seq, pre, t, p] with two non-boolean bounded integers, a
+            # metric topology, and a six-int policy.
+            if len(op) != 3 or type(op[1]) is not int \
+                    or type(op[1]) is bool \
+                    or not 0 <= op[1] <= MAX_COST:
+                fail(5)
+            base = op[1]
+            log = op[2]
+            if not isinstance(log, list) or not log:
+                fail(5)
+            for entry in log:
+                if not isinstance(entry, list) or len(entry) != 4:
+                    fail(5)
+                seq, pre = entry[0], entry[1]
+                if type(seq) is bool or type(pre) is bool \
+                        or type(seq) is not int or type(pre) is not int \
+                        or not 0 <= seq <= MAX_COST \
+                        or not 0 <= pre <= MAX_COST:
+                    fail(5)
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -3791,6 +3891,9 @@ def main():
                 result = {"op": 1, "status": 0, "config": in_pack}
         elif kind == 2:
             result = {"op": 2, "status": 2, "config": pack}
+        elif kind == 4:
+            result = _config_replay(pack_path, pack, v, topo, policy,
+                                    history, base, log)
         else:
             result = _config_rollback(pack_path, pack, v, topo, policy,
                                       history, base, ts_list, q_pairs)
