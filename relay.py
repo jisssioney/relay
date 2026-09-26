@@ -48,7 +48,10 @@ continuity is invalid, and a BASE that conflicts with the current v;
 for config code 5 also covers an invalid OP shape, path, or BASE, a
 PACK/IN whose v/t/p/h structure, key order, topology, version
 continuity, or last-entry match is invalid, and a BASE that conflicts
-with the current v.
+with the current v; for config op 3 code 5 also covers an invalid TS or
+Q, a TS version absent from h, a Q endpoint absent from the current t,
+and a rollback write whose BASE conflicts with v or whose v is already
+MAX_COST.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -2271,6 +2274,94 @@ def _write_state_atomic(path, state):
         fail(3)
 
 
+def _config_rollback(pack_path, pack, v, topo, policy, history, base,
+                     ts_list, q_pairs):
+    # Multi-version safe rollback (config op 3). Every TS version must
+    # appear in the history (version-zero continuous over 0..v) and every
+    # Q endpoint must be a node of the current topology. For each TS in
+    # order, each [s, d] in Q is routed on the current topology and on
+    # that version's topology with the route subcommand's lowest-cost
+    # path (R = [cost, path], [null, []] when unreachable; a target
+    # topology missing an endpoint counts as no route). A version passes
+    # when every currently reachable pair stays reachable at no higher
+    # cost; the first passing version is selected. No passer is status 2;
+    # a selected configuration equal to the current one is status 1 and
+    # BASE is ignored; otherwise BASE must equal v with v < MAX_COST, the
+    # selected [t, p] is appended to the untruncated history as version
+    # v+1 and the pack is replaced atomically (status 0). Runs T*K
+    # Dijkstra searches (one per distinct source per trial topology, the
+    # current topology's shared across trials), each O(V^2 + E), and
+    # keeps the TK trial rows of at most V-node paths: O(TK(V^2 + E) + S)
+    # time and O(TKV + S) space with S the total input/output size.
+    cur_nodes = topo["nodes"]
+    cur_links = topo["links"]
+    cur_node_set = set(cur_nodes)
+    for ts in ts_list:
+        if ts > v:
+            fail(5)
+    for s, d in q_pairs:
+        if s not in cur_node_set or d not in cur_node_set:
+            fail(5)
+
+    # Routes on the current topology, computed once per distinct source.
+    cur_cost = {}
+    cur_path = {}
+    for s, _d in q_pairs:
+        if s not in cur_cost:
+            cur_cost[s], cur_path[s] = shortest_paths(cur_nodes, cur_links,
+                                                      s)
+
+    trials = []
+    selected = None
+    for ts in ts_list:
+        target = history[ts][1]
+        t_nodes = target["nodes"]
+        t_links = target["links"]
+        t_node_set = set(t_nodes)
+        t_cost = {}
+        t_path = {}
+        rows = []
+        passes = True
+        for s, d in q_pairs:
+            old_cost = cur_cost[s][d]
+            old_r = ([old_cost, cur_path[s][d]] if old_cost is not None
+                     else [None, []])
+            if s not in t_node_set or d not in t_node_set:
+                new_r = [None, []]
+            else:
+                if s not in t_cost:
+                    t_cost[s], t_path[s] = shortest_paths(t_nodes, t_links,
+                                                          s)
+                new_cost = t_cost[s][d]
+                new_r = ([new_cost, t_path[s][d]] if new_cost is not None
+                         else [None, []])
+            if old_cost is not None \
+                    and (new_r[0] is None or new_r[0] > old_cost):
+                passes = False
+            rows.append([s, d, old_r, new_r])
+        trials.append([ts, passes, rows])
+        if selected is None and passes:
+            selected = ts
+
+    if selected is None:
+        return {"op": 3, "status": 2, "selected": None, "trials": trials,
+                "config": pack}
+    sel_t = history[selected][1]
+    sel_p = history[selected][2]
+    if sel_t == topo and sel_p == policy:
+        # Rolling back to the configuration already current is
+        # idempotent; BASE is ignored and nothing is written.
+        return {"op": 3, "status": 1, "selected": selected,
+                "trials": trials, "config": pack}
+    if base != v or v >= MAX_COST:
+        fail(5)
+    new_pack = {"v": v + 1, "t": sel_t, "p": sel_p,
+                "h": history + [[v + 1, sel_t, sel_p]]}
+    _write_state_atomic(pack_path, new_pack)
+    return {"op": 3, "status": 0, "selected": selected, "trials": trials,
+            "config": new_pack}
+
+
 def _validate_hotload_records(links, events, data, node_set, pair_set, a, b):
     # Stream validation matching slogate's data contract (the record
     # checks inside compute_convstat) without running the windowed gate:
@@ -3637,6 +3728,35 @@ def main():
             # [2]: audit only, nothing is written.
             if len(op) != 1:
                 fail(5)
+        elif kind == 3:
+            # [3, BASE, TS, Q]: multi-version safe rollback. BASE is a
+            # bounded integer; TS a non-empty list of distinct bounded
+            # integers; Q a non-empty list of distinct [s, d] pairs.
+            if len(op) != 4 or type(op[1]) is not int \
+                    or not 0 <= op[1] <= MAX_COST:
+                fail(5)
+            base = op[1]
+            ts_list = op[2]
+            if not isinstance(ts_list, list) or not ts_list:
+                fail(5)
+            seen_versions = set()
+            for ts in ts_list:
+                if type(ts) is not int or not 0 <= ts <= MAX_COST \
+                        or ts in seen_versions:
+                    fail(5)
+                seen_versions.add(ts)
+            q_pairs = op[3]
+            if not isinstance(q_pairs, list) or not q_pairs:
+                fail(5)
+            seen_queries = set()
+            for pair in q_pairs:
+                if not isinstance(pair, list) or len(pair) != 2:
+                    fail(5)
+                s, d = pair
+                if type(s) is not str or type(d) is not str \
+                        or (s, d) in seen_queries:
+                    fail(5)
+                seen_queries.add((s, d))
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -3669,8 +3789,11 @@ def main():
             else:
                 _write_state_atomic(pack_path, in_pack)
                 result = {"op": 1, "status": 0, "config": in_pack}
-        else:
+        elif kind == 2:
             result = {"op": 2, "status": 2, "config": pack}
+        else:
+            result = _config_rollback(pack_path, pack, v, topo, policy,
+                                      history, base, ts_list, q_pairs)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
