@@ -75,7 +75,15 @@ config op 11 code 5 also covers an invalid G shape or segment, an
 out-of-range b/c, a first segment b that is not B, a later segment b
 that is not the previous segment's c, a segment c that is not the
 chained o after its last item, and a decreasing e across segment
-boundaries, plus op 10's per-item checks within every segment.
+boundaries, plus op 10's per-item checks within every segment;
+config op 12 code 5 also covers a mode outside 0/1, an out-of-range
+B/I, an I above the segment count, a C that is not a non-empty path,
+a checkpoint whose key order, types, or b/i/v/d values conflict with
+B/I/G[:I], a prefix commit missing from PACK.h or conflicting with
+it, and op 11's segment-chain and per-item checks over the whole G;
+for config op 12 code 3 also covers a C read/write error and code 4
+a C with invalid UTF-8/JSON syntax, duplicate keys, or non-finite
+numbers.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -2835,6 +2843,146 @@ def _config_segmented_rollback_log(pack_path, pack, v, history, mode,
             "segments": out_segments, "config": new_pack}
 
 
+def _config_checkpoint(pack_path, pack, v, history, mode, base, segments,
+                       index, ckpt_path):
+    # Checkpointed segmented rollback log (config op 12):
+    # [12, m, B, G, I, C]. B and G follow op 11 exactly; I is a
+    # non-boolean integer in 0..len(G) splitting G into the checkpointed
+    # prefix G[:I] and the remaining suffix G[I:]; C is a non-empty
+    # checkpoint file path. The checkpoint is {"b": B, "i": I, "v": cv,
+    # "d": digest} with keys in that order, where cv is B when I is 0
+    # else the c of the I-th segment (1-based), and digest is the
+    # lowercase hex SHA-256 of G[:I] in the canonical byte form with the
+    # trailing LF removed. The whole of G is validated in memory against
+    # one shared simulated history with op 11's per-item and
+    # segment-chain checks, except that every prefix commit must
+    # reference a version already present in PACK.h and match it (never
+    # an append), while suffix commits follow op 11's replay rule
+    # (verify a known version else append consecutively in memory).
+    # mode 0 (generate) writes the checkpoint to C in the canonical byte
+    # form via one atomic replace, or nothing when C already holds those
+    # bytes (status 1); PACK is never touched and segments is [].
+    # mode 1 (restore) reads C (read errors code 3; UTF-8/JSON syntax,
+    # duplicate keys, and non-finite numbers code 4), requires its key
+    # order, types, and b/i/v/d values to match the checkpoint
+    # recomputed from B/I/G (else code 5), validates the prefix against
+    # PACK.h the same way, then replays G[I:] like op 11's mode 1:
+    # existing versions are verified, missing versions append
+    # consecutively from v+1, and PACK is replaced atomically once when
+    # anything appended; C is never written. Replaying the same restore
+    # again only verifies, so repeated restores are idempotent (status
+    # 1, no write). segments echoes the suffix segments as op-11
+    # [b, c, steps] rows ([] for mode 0); applied counts the appended
+    # versions (always 0 for mode 0). On any failure PACK and C keep
+    # their original bytes. O(S) time and space with S the total
+    # input/output size.
+    if base > v:
+        fail(5)
+    if index == 0:
+        ckpt_v = base
+    else:
+        ckpt_v = segments[index - 1][2]
+    digest = hashlib.sha256(
+        _state_payload(segments[:index])[:-1]).hexdigest()
+    checkpoint = {"b": base, "i": index, "v": ckpt_v, "d": digest}
+    if mode == 1:
+        saved = _load_state(ckpt_path)
+        if not isinstance(saved, dict) \
+                or list(saved.keys()) != ["b", "i", "v", "d"]:
+            fail(5)
+        saved_b, saved_i, saved_v, saved_d = \
+            saved["b"], saved["i"], saved["v"], saved["d"]
+        if type(saved_b) is not int or type(saved_i) is not int \
+                or type(saved_v) is not int \
+                or not 0 <= saved_b <= MAX_COST \
+                or not 0 <= saved_i <= MAX_COST \
+                or not 0 <= saved_v <= MAX_COST \
+                or type(saved_d) is not str:
+            fail(5)
+        if saved != checkpoint:
+            # b/i/v or the digest conflicts with B/I/G[:I].
+            fail(5)
+    sim_history = [list(entry) for entry in history]
+    out_segments = []
+    applied = 0
+    prev_e = None
+    chain_o = base
+    for seg_index, (b, log, c) in enumerate(segments):
+        if b != chain_o:
+            fail(5)
+        in_prefix = seg_index < index
+        steps = []
+        prev_o = None
+        prev_n = None
+        prev_a = None
+        for item in log:
+            e, r, o, n, a = item
+            if prev_e is not None and e < prev_e:
+                fail(5)
+            expected_o = b if prev_o is None \
+                else (prev_n if prev_a else prev_o)
+            if o != expected_o or r > o:
+                fail(5)
+            target_t, target_p = sim_history[r][1], sim_history[r][2]
+            if sim_history[o][1] == target_t \
+                    and sim_history[o][2] == target_p:
+                if a or n != o:
+                    fail(5)
+            elif n != o + 1:
+                fail(5)
+            s = 0
+            if a:
+                # A commit: the prefix only verifies a version already
+                # in PACK.h; the suffix follows op 11's replay rule
+                # (verify a known version else append consecutively).
+                if n < len(sim_history):
+                    if sim_history[n][1] != target_t \
+                            or sim_history[n][2] != target_p:
+                        fail(5)
+                elif not in_prefix and n == len(sim_history):
+                    sim_history.append([n, target_t, target_p])
+                    applied += 1
+                    s = 1
+                else:
+                    fail(5)
+            steps.append([e, r, o, n, a, s])
+            prev_e, prev_o, prev_n, prev_a = e, o, n, a
+        end_o = prev_n if prev_a else prev_o
+        if c != end_o:
+            fail(5)
+        chain_o = c
+        if not in_prefix:
+            out_segments.append([b, c, steps])
+    if mode == 0:
+        try:
+            with open(ckpt_path, "rb") as f:
+                existing = f.read()
+        except FileNotFoundError:
+            existing = None
+        except OSError:
+            fail(3)
+        if existing == _state_payload(checkpoint):
+            # C already holds the canonical bytes: do not write.
+            return {"op": 12, "mode": 0, "status": 1,
+                    "checkpoint": checkpoint, "applied": 0,
+                    "segments": [], "config": pack}
+        _write_state_atomic(ckpt_path, checkpoint)
+        return {"op": 12, "mode": 0, "status": 0,
+                "checkpoint": checkpoint, "applied": 0,
+                "segments": [], "config": pack}
+    if applied == 0:
+        # Every suffix commit verified against h: idempotent, no write.
+        return {"op": 12, "mode": 1, "status": 1,
+                "checkpoint": checkpoint, "applied": 0,
+                "segments": out_segments, "config": pack}
+    new_pack = {"v": v + applied, "t": sim_history[-1][1],
+                "p": sim_history[-1][2], "h": sim_history}
+    _write_state_atomic(pack_path, new_pack)
+    return {"op": 12, "mode": 1, "status": 0,
+            "checkpoint": checkpoint, "applied": applied,
+            "segments": out_segments, "config": new_pack}
+
+
 def _validate_hotload_records(links, events, data, node_set, pair_set, a, b):
     # Stream validation matching slogate's data contract (the record
     # checks inside compute_convstat) without running the windowed gate:
@@ -4387,6 +4535,57 @@ def main():
                     fail(5)
             elif out_path is not None:
                 fail(5)
+        elif kind == 12:
+            # [12, m, B, G, I, C]: checkpointed segmented rollback log.
+            # m is 0 (generate the checkpoint into C, PACK untouched) or
+            # 1 (restore from C and replay the remaining segments); B is
+            # a bounded non-boolean integer (the base version the first
+            # segment's b must equal); G a non-empty list of [b, L, c]
+            # segments shaped exactly like op 11's; I a non-boolean
+            # integer in 0..len(G) splitting G into the checkpointed
+            # prefix G[:I] and the replayed suffix G[I:]; C a non-empty
+            # checkpoint file path. The B-present-in-h check, the
+            # checkpoint key-order/type/digest checks, the prefix
+            # commit-reference checks against PACK.h, and op 11's
+            # segment-chain and per-item checks run after PACK
+            # validation in _config_checkpoint.
+            if len(op) != 6 or type(op[1]) is not int \
+                    or op[1] not in (0, 1) \
+                    or type(op[2]) is not int \
+                    or not 0 <= op[2] <= MAX_COST:
+                fail(5)
+            mode, base = op[1], op[2]
+            segments = op[3]
+            if not isinstance(segments, list) or not segments:
+                fail(5)
+            for segment in segments:
+                if not isinstance(segment, list) or len(segment) != 3:
+                    fail(5)
+                seg_b, seg_log, seg_c = segment
+                if type(seg_b) is not int or type(seg_c) is not int \
+                        or not 0 <= seg_b <= MAX_COST \
+                        or not 0 <= seg_c <= MAX_COST:
+                    fail(5)
+                if not isinstance(seg_log, list) or not seg_log:
+                    fail(5)
+                for item in seg_log:
+                    if not isinstance(item, list) or len(item) != 5:
+                        fail(5)
+                    e, r, o, n, a = item
+                    if type(e) is not int or type(r) is not int \
+                            or type(o) is not int or type(n) is not int \
+                            or not 0 <= e <= MAX_COST \
+                            or not 0 <= r <= MAX_COST \
+                            or not 0 <= o <= MAX_COST \
+                            or not 0 <= n <= MAX_COST \
+                            or type(a) is not bool:
+                        fail(5)
+            index = op[4]
+            if type(index) is not int or not 0 <= index <= len(segments):
+                fail(5)
+            ckpt_path = op[5]
+            if type(ckpt_path) is not str or len(ckpt_path) == 0:
+                fail(5)
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -4452,6 +4651,10 @@ def main():
             result = _config_segmented_rollback_log(pack_path, pack, v,
                                                     history, mode, base,
                                                     segments, out_path)
+        elif kind == 12:
+            result = _config_checkpoint(pack_path, pack, v, history,
+                                        mode, base, segments, index,
+                                        ckpt_path)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
