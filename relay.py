@@ -55,8 +55,10 @@ MAX_COST; for config op 4 code 5 also covers an invalid LOG shape or
 record, a record t/p that is not a valid topology/policy, a BASE absent
 from h, a broken seq/pre chain, a gap or duplicate in the appended
 versions, an h[seq] conflict on a reused version, and a new version
-that would overflow MAX_COST; for config op 5 code 5 also covers an
-invalid F/T or OUT path and an F/T interval outside 0..v.
+that would overflow MAX_COST; config op 6 reuses op 4's exact code 5
+checks as a read-only preview that never writes; for config op 5 code 5
+also covers an invalid F/T or OUT path and an F/T interval outside
+0..v.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -2367,20 +2369,19 @@ def _config_rollback(pack_path, pack, v, topo, policy, history, base,
             "config": new_pack}
 
 
-def _config_replay(pack_path, pack, v, history, base, log):
-    # Replay a LOG of [seq, pre, t, p] records against the version-zero
-    # continuous history (config op 4). BASE must be a version present
-    # in h; the first record's pre is BASE, every seq is pre + 1, and
-    # each later pre is the previous seq. Records are validated and
-    # simulated entirely in memory before anything is written: a record
-    # at seq <= v must equal h[seq] = [seq, t, p] exactly (reused, s=0),
-    # and the first record past v must be v+1, after which records append
-    # consecutively as [seq, t, p] (s=1), never past MAX_COST. A bad
-    # shape or range, a broken chain, a gap, an h conflict, or overflow
-    # fails with code 5 and leaves PACK untouched. No new records is
-    # status 1 (idempotent, no write); otherwise one atomic replace
-    # yields status 0. O(S) time and space with S the total
-    # input/output size.
+def _config_replay_sim(pack, v, history, base, log):
+    # Shared in-memory replay simulation for config ops 4 and 6. BASE
+    # must be a version present in the version-zero continuous history
+    # h: the first record's pre is BASE, every seq is pre + 1, and each
+    # later pre is the previous seq. A record at seq <= v must equal
+    # h[seq] = [seq, t, p] exactly (reused, s=0), and the first record
+    # past v must be v+1, after which records append consecutively as
+    # [seq, t, p] (s=1), never past MAX_COST. A bad shape or range, a
+    # broken chain, a gap, or an h conflict fails with code 5. Nothing
+    # is written: the caller decides what to do with the simulated pack.
+    # Returns (applied, steps, new_pack); with no new records applied is
+    # 0 and new_pack is the current pack. O(S) time and space with S the
+    # total input/output size.
     if base > v:
         fail(5)
     new_history = [list(entry) for entry in history]
@@ -2413,12 +2414,43 @@ def _config_replay(pack_path, pack, v, history, base, log):
             steps.append([seq, pre, 1])
         expected_pre = seq
     if applied == 0:
-        return {"op": 4, "status": 1, "applied": 0, "steps": steps,
-                "config": pack}
+        return 0, steps, pack
     new_pack = {"v": v + applied, "t": new_history[-1][1],
                 "p": new_history[-1][2], "h": new_history}
+    return applied, steps, new_pack
+
+
+def _config_replay(pack_path, pack, v, history, base, log):
+    # Replay a LOG of [seq, pre, t, p] records against the history
+    # (config op 4). Validation and simulation are shared with the op 6
+    # preview in _config_replay_sim; this wrapper performs the same
+    # in-memory pass and, when it adds new records, replaces the pack
+    # atomically once (status 0). No new records is status 1
+    # (idempotent, no write).
+    applied, steps, new_pack = _config_replay_sim(pack, v, history,
+                                                  base, log)
+    if applied == 0:
+        return {"op": 4, "status": 1, "applied": 0, "steps": steps,
+                "config": pack}
     _write_state_atomic(pack_path, new_pack)
     return {"op": 4, "status": 0, "applied": applied, "steps": steps,
+            "config": new_pack}
+
+
+def _config_preview(pack, v, history, base, log):
+    # Read-only replay preview (config op 6). Runs exactly the op 4
+    # validation and in-memory simulation via _config_replay_sim but
+    # never writes PACK, any other file, or a temp file: the returned
+    # status/applied/steps/config are precisely what op 4 with the same
+    # inputs would produce (its config's v,t,p,h byte-identical), so
+    # repeated previews emit the same output while PACK stays untouched.
+    # Status 0 when the LOG adds new versions, 1 when all are reused.
+    applied, steps, new_pack = _config_replay_sim(pack, v, history,
+                                                  base, log)
+    if applied == 0:
+        return {"op": 6, "status": 1, "applied": 0, "steps": steps,
+                "config": pack}
+    return {"op": 6, "status": 0, "applied": applied, "steps": steps,
             "config": new_pack}
 
 
@@ -3847,12 +3879,14 @@ def main():
                         or (s, d) in seen_queries:
                     fail(5)
                 seen_queries.add((s, d))
-        elif kind == 4:
-            # [4, BASE, LOG]: replay. BASE is a bounded non-boolean
-            # integer; LOG a non-empty list of [seq, pre, t, p] records
-            # whose seq/pre are bounded non-boolean integers. The chain,
-            # topology, policy, and history conflicts are checked after
-            # PACK validation in _config_replay.
+        elif kind == 4 or kind == 6:
+            # [4, BASE, LOG] replay / [6, BASE, LOG] read-only preview.
+            # BASE is a bounded non-boolean integer; LOG a non-empty
+            # list of [seq, pre, t, p] records whose seq/pre are bounded
+            # non-boolean integers. The chain, topology, policy, and
+            # history conflicts are checked after PACK validation in
+            # _config_replay_sim. Op 6 validates and simulates exactly
+            # like op 4 but never writes anything.
             if len(op) != 3 or type(op[1]) is not int \
                     or not 0 <= op[1] <= MAX_COST:
                 fail(5)
@@ -3919,6 +3953,8 @@ def main():
                                       history, base, ts_list, q_pairs)
         elif kind == 4:
             result = _config_replay(pack_path, pack, v, history, base, log)
+        elif kind == 6:
+            result = _config_preview(pack, v, history, base, log)
         elif kind == 5:
             result = _config_export_log(out_path, v, history, from_v, to_v)
     else:
