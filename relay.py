@@ -55,7 +55,8 @@ MAX_COST; for config op 4 code 5 also covers an invalid LOG shape or
 record, a record t/p that is not a valid topology/policy, a BASE absent
 from h, a broken seq/pre chain, a gap or duplicate in the appended
 versions, an h[seq] conflict on a reused version, and a new version
-that would overflow MAX_COST.
+that would overflow MAX_COST; for config op 5 code 5 also covers an
+invalid F/T or OUT path and an F/T interval outside 0..v.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -2421,6 +2422,36 @@ def _config_replay(pack_path, pack, v, history, base, log):
             "config": new_pack}
 
 
+def _config_export_log(out_path, v, history, from_v, to_v):
+    # Export the replay log for versions from_v+1..to_v (config op 5).
+    # The interval must satisfy 0 <= from_v < to_v <= v. LOG is the
+    # ascending records [i, i-1, h[i][1], h[i][2]] for i in
+    # from_v+1..to_v — exactly the LOG that op 4 with BASE=from_v would
+    # replay onto the pack truncated at from_v to rebuild the pack
+    # truncated at to_v. PACK is never modified; OUT receives only the
+    # LOG array in the canonical byte form via one atomic replace, or
+    # nothing when OUT already holds those bytes (status 1). O(S) time
+    # and space with S the total input/output size.
+    if not from_v < to_v <= v:
+        fail(5)
+    log = [[i, i - 1, history[i][1], history[i][2]]
+           for i in range(from_v + 1, to_v + 1)]
+    try:
+        with open(out_path, "rb") as f:
+            existing = f.read()
+    except FileNotFoundError:
+        existing = None
+    except OSError:
+        fail(3)
+    if existing == _state_payload(log):
+        # OUT already holds the canonical bytes: do not write.
+        return {"op": 5, "status": 1, "from": from_v, "to": to_v,
+                "count": to_v - from_v, "log": log}
+    _write_state_atomic(out_path, log)
+    return {"op": 5, "status": 0, "from": from_v, "to": to_v,
+            "count": to_v - from_v, "log": log}
+
+
 def _validate_hotload_records(links, events, data, node_set, pair_set, a, b):
     # Stream validation matching slogate's data contract (the record
     # checks inside compute_convstat) without running the windowed gate:
@@ -3837,6 +3868,18 @@ def main():
                         or not 0 <= seq <= MAX_COST \
                         or not 0 <= pre <= MAX_COST:
                     fail(5)
+        elif kind == 5:
+            # [5, F, T, OUT]: export the replay log for versions
+            # F+1..T. F and T are bounded non-boolean integers; OUT a
+            # non-empty path. The 0 <= F < T <= v interval is checked
+            # after PACK validation in _config_export_log.
+            if len(op) != 4 or type(op[1]) is not int \
+                    or type(op[2]) is not int \
+                    or not 0 <= op[1] <= MAX_COST \
+                    or not 0 <= op[2] <= MAX_COST \
+                    or type(op[3]) is not str or len(op[3]) == 0:
+                fail(5)
+            from_v, to_v, out_path = op[1], op[2], op[3]
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -3876,6 +3919,8 @@ def main():
                                       history, base, ts_list, q_pairs)
         elif kind == 4:
             result = _config_replay(pack_path, pack, v, history, base, log)
+        elif kind == 5:
+            result = _config_export_log(out_path, v, history, from_v, to_v)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
