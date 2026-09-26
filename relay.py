@@ -60,7 +60,10 @@ checks as a read-only preview that never writes; config op 7 reuses
 the same checks as a read-only diff audit that never writes;
 config op 8 code 5 also covers a mode outside 0/1, an out-of-range
 b/e, an invalid event t/p, a b that conflicts with the current v, and
-a new version that would overflow MAX_COST; for config op 5 code 5
+a new version that would overflow MAX_COST; config op 9 code 5 also
+covers a mode outside 0/1, an out-of-range b/e/r, an r absent from h,
+a b that conflicts with the current v, and a new version that would
+overflow MAX_COST; for config op 5 code 5
 also covers an invalid F/T or OUT path and an F/T interval outside
 0..v.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
@@ -2556,6 +2559,49 @@ def _config_event_clock(pack_path, pack, v, topo, policy, history, mode,
             "config": new_pack}
 
 
+def _config_rollback_tx(pack_path, pack, v, topo, policy, history, mode,
+                        base, event, source):
+    # Source-version rollback transaction (config op 9):
+    # [9, m, b, e, r]. Like op 8, mode 0 previews in memory only — no
+    # file, temp file, or other side effect — and mode 1 commits via the
+    # same atomic pack replace. r must be a version present in the
+    # version-zero continuous history h; the target [t, p] is h[r][1:].
+    # A target equal to the current topology and policy is idempotent:
+    # status 1, b is ignored, nothing is written, and old/new both stay
+    # at v. Otherwise b must equal the current v and v must be below
+    # MAX_COST (else code 5); the candidate appends [v+1, t, p] to the
+    # untruncated history as version v+1, so rolling back to the same
+    # target again matches the now-current [t, p] and adds no version.
+    # applied is true only for a mode-1 change commit; a preview of the
+    # same change differs solely by mode and applied and reports the
+    # same candidate config. diff is the [n, l, p] delta of the current
+    # [t, p] against h[r]'s, in op 7's row structure, code-point
+    # ordering, and six-integer policy delta. O(S) time and space with S
+    # the total input/output size.
+    if source > v:
+        fail(5)
+    target_t = history[source][1]
+    target_p = history[source][2]
+    n, l, p_delta = _config_state_diff(topo, target_t, policy, target_p)
+    diff = [n, l, p_delta]
+    if target_t == topo and target_p == policy:
+        return {"op": 9, "mode": mode, "status": 1, "event": event,
+                "source": source, "old": v, "new": v, "applied": False,
+                "diff": diff, "config": pack}
+    if base != v or v >= MAX_COST:
+        fail(5)
+    new_pack = {"v": v + 1, "t": target_t, "p": target_p,
+                "h": history + [[v + 1, target_t, target_p]]}
+    if mode == 1:
+        _write_state_atomic(pack_path, new_pack)
+        applied = True
+    else:
+        applied = False
+    return {"op": 9, "mode": mode, "status": 0, "event": event,
+            "source": source, "old": v, "new": v + 1,
+            "applied": applied, "diff": diff, "config": new_pack}
+
+
 def _config_export_log(out_path, v, history, from_v, to_v):
     # Export the replay log for versions from_v+1..to_v (config op 5).
     # The interval must satisfy 0 <= from_v < to_v <= v. LOG is the
@@ -4034,6 +4080,24 @@ def main():
                 fail(5)
             mode, base, event = op[1], op[2], op[3]
             new_t, new_p = op[4], op[5]
+        elif kind == 9:
+            # [9, m, b, e, r]: source-version rollback transaction.
+            # Mirrors op 8's m/b/e: m is 0 (read-only preview) or 1
+            # (atomic commit); b (expected version), e (event time), and
+            # r (source version) are bounded non-boolean integers. r's
+            # presence in h is checked after PACK validation in
+            # _config_rollback_tx, along with the b conflict and the
+            # MAX_COST overflow.
+            if len(op) != 5 or type(op[1]) is not int \
+                    or op[1] not in (0, 1) \
+                    or type(op[2]) is not int \
+                    or type(op[3]) is not int \
+                    or type(op[4]) is not int \
+                    or not 0 <= op[2] <= MAX_COST \
+                    or not 0 <= op[3] <= MAX_COST \
+                    or not 0 <= op[4] <= MAX_COST:
+                fail(5)
+            mode, base, event, source = op[1], op[2], op[3], op[4]
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -4087,6 +4151,9 @@ def main():
             result = _config_event_clock(pack_path, pack, v, topo, policy,
                                          history, mode, base, event,
                                          new_t, new_p)
+        elif kind == 9:
+            result = _config_rollback_tx(pack_path, pack, v, topo, policy,
+                                         history, mode, base, event, source)
         elif kind == 5:
             result = _config_export_log(out_path, v, history, from_v, to_v)
     else:
