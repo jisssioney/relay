@@ -63,7 +63,12 @@ b/e, an invalid event t/p, a b that conflicts with the current v, and
 a new version that would overflow MAX_COST; config op 9 code 5 also
 covers a mode outside 0/1, an out-of-range b/e/r, an r absent from h,
 a b that conflicts with the current v, and a new version that would
-overflow MAX_COST; for config op 5 code 5
+overflow MAX_COST; config op 10 code 5 also covers a mode outside 0/1,
+an O that is not a non-empty path for m=0 or not null for m=1, an
+empty L or an invalid [e, r, o, n, a] record, a decreasing e, a broken
+o chain, an r above its o, a B absent from h, an n/a pair inconsistent
+with the h[o] target comparison, and a commit whose h[n] is absent
+from h or mismatches it; for config op 5 code 5
 also covers an invalid F/T or OUT path and an F/T interval outside
 0..v.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
@@ -2632,6 +2637,94 @@ def _config_export_log(out_path, v, history, from_v, to_v):
             "count": to_v - from_v, "log": log}
 
 
+def _config_rollback_log(pack_path, pack, v, history, mode, base, log,
+                         out_path):
+    # Rollback log export/replay (config op 10): [10, m, B, L, O]. L is
+    # a non-empty list of [e, r, o, n, a] rollback records: e is a
+    # non-decreasing event tick, o the version the record rolls back
+    # from (B for the first record, afterwards the previous record's n
+    # when that record committed and its o otherwise), r <= o the
+    # version whose h[r] = [r, t, p] supplies the rollback target, and
+    # n the resulting version. A target equal to h[o]'s [t, p] is a
+    # no-op and must carry a=false, n=o; any other record must carry
+    # n=o+1, with a=false a precheck and a=true a commit. mode 0 only
+    # validates the records against the recorded history — a commit's
+    # h[n] must exist and equal the target — and atomically writes L to
+    # O in the canonical config bytes, or nothing when O already holds
+    # them. mode 1 validates the same chain, ignores the a=false
+    # prechecks, verifies a commit whose n is already in h against that
+    # entry, and otherwise appends [n, t, p] consecutively from the
+    # current v+1, replacing PACK once atomically; replaying the same
+    # log again finds every version already present and stays a
+    # no-write. applied counts the appended versions, steps appends to
+    # each record an s flag that is 1 exactly for the records that
+    # appended one, and config is the resulting pack. O(S) time and
+    # space with S the total input/output size.
+    if base > v:
+        fail(5)
+    sim_history = [list(entry) for entry in history]
+    steps = []
+    applied = 0
+    expected_o = base
+    previous_e = None
+    for record in log:
+        e, r, o, n, a = record
+        if previous_e is not None and e < previous_e:
+            fail(5)
+        previous_e = e
+        if o != expected_o or r > o:
+            fail(5)
+        target = sim_history[r][1:]
+        if target == sim_history[o][1:]:
+            # Rolling back to the configuration already current at o is
+            # a no-op precheck.
+            if a or n != o:
+                fail(5)
+        elif n != o + 1:
+            fail(5)
+        s = 0
+        if a:
+            if n < len(sim_history):
+                # A commit landing on a version already recorded must
+                # match it exactly: mode 0 certifies the log against h,
+                # mode 1 re-checks the version before reusing it.
+                if sim_history[n][1:] != target:
+                    fail(5)
+            elif mode == 1:
+                # n == o + 1 and o never exceeds the simulated current
+                # version, so appends are consecutive from v+1.
+                sim_history.append([n, target[0], target[1]])
+                applied += 1
+                s = 1
+            else:
+                fail(5)
+        steps.append([e, r, o, n, a, s])
+        expected_o = n if a else o
+    if mode == 0:
+        try:
+            with open(out_path, "rb") as f:
+                existing = f.read()
+        except FileNotFoundError:
+            existing = None
+        except OSError:
+            fail(3)
+        if existing == _state_payload(log):
+            # O already holds the canonical bytes: do not write.
+            return {"op": 10, "status": 1, "applied": 0, "steps": steps,
+                    "config": pack}
+        _write_state_atomic(out_path, log)
+        return {"op": 10, "status": 0, "applied": 0, "steps": steps,
+                "config": pack}
+    if applied == 0:
+        return {"op": 10, "status": 1, "applied": 0, "steps": steps,
+                "config": pack}
+    new_pack = {"v": v + applied, "t": sim_history[-1][1],
+                "p": sim_history[-1][2], "h": sim_history}
+    _write_state_atomic(pack_path, new_pack)
+    return {"op": 10, "status": 0, "applied": applied, "steps": steps,
+            "config": new_pack}
+
+
 def _validate_hotload_records(links, events, data, node_set, pair_set, a, b):
     # Stream validation matching slogate's data contract (the record
     # checks inside compute_convstat) without running the windowed gate:
@@ -4098,6 +4191,42 @@ def main():
                     or not 0 <= op[4] <= MAX_COST:
                 fail(5)
             mode, base, event, source = op[1], op[2], op[3], op[4]
+        elif kind == 10:
+            # [10, m, B, L, O]: rollback log export (m=0, O a non-empty
+            # path) / replay (m=1, O null). B is a bounded non-boolean
+            # integer (the version the first record rolls back from); L
+            # a non-empty list of [e, r, o, n, a] records whose e/r/o/n
+            # are bounded non-boolean integers and a a boolean. The
+            # B-present-in-h check, the e/o chain, the r <= o and
+            # target rules, and the commit checks run after PACK
+            # validation in _config_rollback_log.
+            if len(op) != 5 or type(op[1]) is not int \
+                    or op[1] not in (0, 1) \
+                    or type(op[2]) is not int \
+                    or not 0 <= op[2] <= MAX_COST:
+                fail(5)
+            mode, base = op[1], op[2]
+            log = op[3]
+            if not isinstance(log, list) or not log:
+                fail(5)
+            for record in log:
+                if not isinstance(record, list) or len(record) != 5:
+                    fail(5)
+                e, r, o, n, a = record
+                if type(e) is not int or type(r) is not int \
+                        or type(o) is not int or type(n) is not int \
+                        or not 0 <= e <= MAX_COST \
+                        or not 0 <= r <= MAX_COST \
+                        or not 0 <= o <= MAX_COST \
+                        or not 0 <= n <= MAX_COST \
+                        or type(a) is not bool:
+                    fail(5)
+            out_path = op[4]
+            if mode == 0:
+                if type(out_path) is not str or len(out_path) == 0:
+                    fail(5)
+            elif out_path is not None:
+                fail(5)
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -4154,6 +4283,9 @@ def main():
         elif kind == 9:
             result = _config_rollback_tx(pack_path, pack, v, topo, policy,
                                          history, mode, base, event, source)
+        elif kind == 10:
+            result = _config_rollback_log(pack_path, pack, v, history,
+                                          mode, base, log, out_path)
         elif kind == 5:
             result = _config_export_log(out_path, v, history, from_v, to_v)
     else:
