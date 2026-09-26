@@ -55,7 +55,10 @@ MAX_COST; for config op 4 code 5 also covers an invalid LOG shape or
 record, a record t/p that is not a valid topology/policy, a BASE absent
 from h, a broken seq/pre chain, a gap or duplicate in the appended
 versions, an h[seq] conflict on a reused version, and a new version
-that would overflow MAX_COST.
+that would overflow MAX_COST; for config op 5 code 3 also covers an
+unreadable OUT or a failed atomic write, and code 5 also covers an
+invalid F/T/OUT, a non-integer or out-of-range F/T, and an interval
+with F >= T or T beyond the current v.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -2421,6 +2424,38 @@ def _config_replay(pack_path, pack, v, history, base, log):
             "config": new_pack}
 
 
+def _config_export_log(history, f, t, out_path):
+    # Export the replay LOG spanning versions F+1..T (config op 5). LOG
+    # is ordered by ascending i and each record is exactly
+    # [i, i-1, h[i][1], h[i][2]], i.e. the log that op 4 replays to take
+    # the pack truncated at F (v/t/p = h[F]) to the pack truncated at T
+    # (v/t/p = h[T]). PACK is never touched. OUT holds only the LOG array
+    # in canonical bytes (compact, non-ASCII unescaped UTF-8, decimal
+    # integers, one trailing LF); the read/compare/atomic-replace follows
+    # the same contract as op 0: identical existing bytes are status 1 and
+    # leave OUT alone, otherwise one atomic replace gives status 0. Any
+    # read or write failure is code 3 and preserves the existing OUT
+    # bytes with no leftover temp file. O(S) time and space with S the
+    # total input/output size.
+    log = [[i, i - 1, history[i][1], history[i][2]]
+           for i in range(f + 1, t + 1)]
+    payload = _state_payload(log)
+    try:
+        with open(out_path, "rb") as fp:
+            existing = fp.read()
+    except FileNotFoundError:
+        existing = None
+    except OSError:
+        fail(3)
+    if existing == payload:
+        # OUT already holds the canonical bytes: do not write.
+        return {"op": 5, "status": 1, "from": f, "to": t,
+                "count": t - f, "log": log}
+    _write_state_atomic(out_path, log)
+    return {"op": 5, "status": 0, "from": f, "to": t,
+            "count": t - f, "log": log}
+
+
 def _validate_hotload_records(links, events, data, node_set, pair_set, a, b):
     # Stream validation matching slogate's data contract (the record
     # checks inside compute_convstat) without running the windowed gate:
@@ -3837,6 +3872,19 @@ def main():
                         or not 0 <= seq <= MAX_COST \
                         or not 0 <= pre <= MAX_COST:
                     fail(5)
+        elif kind == 5:
+            # [5, F, T, OUT]: export the replay LOG for F+1..T. F and T
+            # are bounded non-boolean integers with 0 <= F < T <= v
+            # (checked against the pack after PACK validation); OUT is a
+            # non-empty path. The LOG build and atomic write run in
+            # _config_export_log.
+            if len(op) != 4 or type(op[1]) is not int \
+                    or type(op[2]) is not int \
+                    or not 0 <= op[1] <= MAX_COST \
+                    or not 0 <= op[2] <= MAX_COST \
+                    or type(op[3]) is not str or len(op[3]) == 0:
+                fail(5)
+            f, t, out_path = op[1], op[2], op[3]
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -3876,6 +3924,12 @@ def main():
                                       history, base, ts_list, q_pairs)
         elif kind == 4:
             result = _config_replay(pack_path, pack, v, history, base, log)
+        elif kind == 5:
+            # The interval is checked against the validated pack: T must
+            # name an existing version and F must precede it.
+            if not f < t <= v:
+                fail(5)
+            result = _config_export_log(history, f, t, out_path)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
