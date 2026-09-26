@@ -2746,46 +2746,49 @@ def _config_rollback_log(pack_path, pack, v, history, mode, base, log,
             "config": new_pack}
 
 
-def _config_segmented_rollback_log(pack_path, pack, v, history, mode,
-                                   base, segments, out_path):
-    # Segmented rollback log export/replay (config op 11):
-    # [11, m, B, G, O]. G is a non-empty list of [b, L, c] segments
-    # whose L is a non-empty list of op-10 [e, r, o, n, a] items and
-    # whose b/c are bounded non-boolean integers. The segments chain
-    # like one flat op-10 log: the first segment's b is B, every later
-    # b is the previous segment's c, each segment's first item carries
-    # o=b, and c is the chained o after the segment's last item (its n
-    # when that item committed, else its o); e is non-decreasing across
-    # segment boundaries too. Every item follows op 10's per-item
-    # checks (r <= o, the target-equality n/a rule, the commit
-    # reference/append rule) against one shared simulated history.
-    # mode 0 (O a non-empty path) only validates the references — a
-    # commit's h[n] must equal the target — and writes G to OUT in the
-    # canonical byte form via one atomic replace, or nothing when OUT
-    # already holds those bytes (status 1); PACK is never touched.
-    # mode 1 (O null) validates the same way, ignores the a=false
-    # items, and for each commit either verifies h[n] against the
-    # target when n is already in h or appends [n, t, p] consecutively
-    # from v+1, replacing PACK atomically once after every segment
-    # validated; replaying the same G again only verifies, so repeated
-    # replays are idempotent (status 1, no write). segments echoes each
-    # segment as [b, c, steps] with steps the op-10 [e, r, o, n, a, s]
-    # items (s=1 for an appended version else 0); applied counts the
-    # appends. O(S) time and space with S the total input/output size.
+def _segmented_replay_core(v, history, base, segments, append_from,
+                           track_prefix=False):
+    # Shared single linear pass over a non-empty G = [[b, L, c], ...]
+    # of segmented rollback logs, used by config ops 11-13 so none of
+    # them keeps its own per-record state machine. The segments chain
+    # like one flat op-10 log: the first segment's b is base, every
+    # later b is the previous segment's c, each segment's first item
+    # carries o=b, and c is the chained o after the segment's last item
+    # (its n when that item committed else its o); event times e are
+    # non-decreasing across segment boundaries too. Each
+    # [e, r, o, n, a] item satisfies r <= o; when h[o] already equals
+    # the h[r] target it is a no-op (a false, n=o), otherwise n=o+1.
+    # A commit (a true) must find h[n] equal to the target when n is
+    # already present in the simulated history; otherwise, only on a
+    # segment with seg_index >= append_from, it may append
+    # [n, t, p] consecutively when n == len(sim_history), growing the
+    # history from v+1; anything else fails with code 5, and base > v
+    # fails the same way. One pass returns (sim_history, applied, rows,
+    # selected): rows are the per-segment [b, c, steps] echoes in input
+    # order with each step [e, r, o, n, a, s] (s=1 for an appended
+    # version else 0); selected is the longest matched prefix when
+    # track_prefix is set - the index of the first segment carrying a
+    # commit whose n was not already in the original PACK.h
+    # (len(segments) when every such commit was) - and -1 otherwise.
+    # O(S) time and space with S the total input/output size.
     if base > v:
         fail(5)
     sim_history = [list(entry) for entry in history]
-    out_segments = []
+    history_len = len(sim_history)
+    rows = []
     applied = 0
     prev_e = None
     chain_o = base
-    for b, log, c in segments:
+    nseg = len(segments)
+    selected = nseg
+    for seg_index, (b, log, c) in enumerate(segments):
         if b != chain_o:
             fail(5)
+        seg_known = True
         steps = []
         prev_o = None
         prev_n = None
-        prev_a = None
+        prev_a = False
         for item in log:
             e, r, o, n, a = item
             if prev_e is not None and e < prev_e:
@@ -2803,17 +2806,23 @@ def _config_segmented_rollback_log(pack_path, pack, v, history, mode,
                 fail(5)
             s = 0
             if a:
-                # A commit: the target must already be h[n] (export
-                # always, replay when n is a known version) or append
-                # consecutively from v+1 (replay only).
+                # A commit: a version already in the simulated history
+                # must match the target (it counts toward the matched
+                # prefix only when it was in PACK.h itself); an
+                # append-eligible segment may append consecutively, and
+                # anything else is an error.
                 if n < len(sim_history):
                     if sim_history[n][1] != target_t \
                             or sim_history[n][2] != target_p:
                         fail(5)
-                elif mode == 1 and n == len(sim_history):
+                    if track_prefix and n >= history_len:
+                        seg_known = False
+                elif seg_index >= append_from and n == len(sim_history):
                     sim_history.append([n, target_t, target_p])
                     applied += 1
                     s = 1
+                    if track_prefix:
+                        seg_known = False
                 else:
                     fail(5)
             steps.append([e, r, o, n, a, s])
@@ -2822,7 +2831,39 @@ def _config_segmented_rollback_log(pack_path, pack, v, history, mode,
         if c != end_o:
             fail(5)
         chain_o = c
-        out_segments.append([b, c, steps])
+        rows.append([b, c, steps])
+        if track_prefix and not seg_known and selected == nseg:
+            # First segment whose commits are not all already in PACK.h:
+            # the longest matching prefix ends right before it.
+            selected = seg_index
+    return sim_history, applied, rows, \
+        selected if track_prefix else -1
+
+
+def _config_segmented_rollback_log(pack_path, pack, v, history, mode,
+                                   base, segments, out_path):
+    # Segmented rollback log export/replay (config op 11):
+    # [11, m, B, G, O]. G is a non-empty list of [b, L, c] segments
+    # whose L is a non-empty list of op-10 [e, r, o, n, a] items and
+    # whose b/c are bounded non-boolean integers. The segment chain,
+    # the non-decreasing e across segment boundaries, and every per-item
+    # check (r <= o, the target-equality n/a rule, the commit
+    # reference/append rule) run against one shared simulated history in
+    # _segmented_replay_core: export (mode 0) only verifies commits
+    # already present in h, while replay (mode 1) appends
+    # [n, t, p] consecutively from v+1. mode 0 (O a non-empty path)
+    # writes G to OUT in the canonical byte form via one atomic replace,
+    # or nothing when OUT already holds those bytes (status 1); PACK is
+    # never touched. mode 1 (O null) replaces PACK atomically once after
+    # the whole validated pass when anything appended; replaying the
+    # same G again only verifies, so repeated replays are idempotent
+    # (status 1, no write). segments echoes each segment as
+    # [b, c, steps] with steps the op-10 [e, r, o, n, a, s] items (s=1
+    # for an appended version else 0); applied counts the appends. O(S)
+    # time and space with S the total input/output size.
+    append_from = 0 if mode == 1 else len(segments)
+    sim_history, applied, out_segments, _selected = \
+        _segmented_replay_core(v, history, base, segments, append_from)
     if mode == 0:
         try:
             with open(out_path, "rb") as f:
@@ -2859,22 +2900,20 @@ def _config_checkpoint(pack_path, pack, v, history, mode, base, segments,
     # "d": digest} with keys in that order, where cv is B when I is 0
     # else the c of the I-th segment (1-based), and digest is the
     # lowercase hex SHA-256 of G[:I] in the canonical byte form with the
-    # trailing LF removed. The whole of G is validated in memory against
-    # one shared simulated history with op 11's per-item and
-    # segment-chain checks, except that every prefix commit must
-    # reference a version already present in PACK.h and match it (never
-    # an append), while suffix commits follow op 11's replay rule
+    # trailing LF removed. The whole of G is validated in one pass by
+    # _segmented_replay_core against one shared simulated history: the
+    # prefix segments only verify a commit already present in PACK.h
+    # (append_from = I), while the suffix follows op 11's replay rule
     # (verify a known version else append consecutively in memory).
     # mode 0 (generate) writes the checkpoint to C in the canonical byte
     # form via one atomic replace, or nothing when C already holds those
     # bytes (status 1); PACK is never touched and segments is [].
     # mode 1 (restore) reads C (read errors code 3; UTF-8/JSON syntax,
-    # duplicate keys, and non-finite numbers code 4), requires its key
-    # order, types, and b/i/v/d values to match the checkpoint
-    # recomputed from B/I/G (else code 5), validates the prefix against
-    # PACK.h the same way, then replays G[I:] like op 11's mode 1:
-    # existing versions are verified, missing versions append
-    # consecutively from v+1, and PACK is replaced atomically once when
+    # duplicate keys, and non-finite numbers code 4) before the pass and
+    # requires its key order, types, and b/i/v/d values to match the
+    # checkpoint recomputed from B/I/G (else code 5); the pass then
+    # validates the prefix against PACK.h the same way and replays
+    # G[I:] like op 11's mode 1, replacing PACK atomically once when
     # anything appended; C is never written. Replaying the same restore
     # again only verifies, so repeated restores are idempotent (status
     # 1, no write). segments echoes the suffix segments as op-11
@@ -2892,6 +2931,8 @@ def _config_checkpoint(pack_path, pack, v, history, mode, base, segments,
         _state_payload(segments[:index])[:-1]).hexdigest()
     checkpoint = {"b": base, "i": index, "v": ckpt_v, "d": digest}
     if mode == 1:
+        # Read and match C before any validation writes: on any failure
+        # PACK and C keep their original bytes.
         saved = _load_state(ckpt_path)
         if not isinstance(saved, dict) \
                 or list(saved.keys()) != ["b", "i", "v", "d"]:
@@ -2908,57 +2949,9 @@ def _config_checkpoint(pack_path, pack, v, history, mode, base, segments,
         if saved != checkpoint:
             # b/i/v or the digest conflicts with B/I/G[:I].
             fail(5)
-    sim_history = [list(entry) for entry in history]
-    out_segments = []
-    applied = 0
-    prev_e = None
-    chain_o = base
-    for seg_index, (b, log, c) in enumerate(segments):
-        if b != chain_o:
-            fail(5)
-        in_prefix = seg_index < index
-        steps = []
-        prev_o = None
-        prev_n = None
-        prev_a = None
-        for item in log:
-            e, r, o, n, a = item
-            if prev_e is not None and e < prev_e:
-                fail(5)
-            expected_o = b if prev_o is None \
-                else (prev_n if prev_a else prev_o)
-            if o != expected_o or r > o:
-                fail(5)
-            target_t, target_p = sim_history[r][1], sim_history[r][2]
-            if sim_history[o][1] == target_t \
-                    and sim_history[o][2] == target_p:
-                if a or n != o:
-                    fail(5)
-            elif n != o + 1:
-                fail(5)
-            s = 0
-            if a:
-                # A commit: the prefix only verifies a version already
-                # in PACK.h; the suffix follows op 11's replay rule
-                # (verify a known version else append consecutively).
-                if n < len(sim_history):
-                    if sim_history[n][1] != target_t \
-                            or sim_history[n][2] != target_p:
-                        fail(5)
-                elif not in_prefix and n == len(sim_history):
-                    sim_history.append([n, target_t, target_p])
-                    applied += 1
-                    s = 1
-                else:
-                    fail(5)
-            steps.append([e, r, o, n, a, s])
-            prev_e, prev_o, prev_n, prev_a = e, o, n, a
-        end_o = prev_n if prev_a else prev_o
-        if c != end_o:
-            fail(5)
-        chain_o = c
-        if not in_prefix:
-            out_segments.append([b, c, steps])
+    sim_history, applied, all_segments, _selected = \
+        _segmented_replay_core(v, history, base, segments, index)
+    out_segments = all_segments[index:]
     if mode == 0:
         try:
             with open(ckpt_path, "rb") as f:
@@ -3006,19 +2999,19 @@ def _config_multi_checkpoint(pack_path, pack, v, history, mode, base,
     # touched and segments is []. mode 1 (restore) reads C (read errors
     # code 3; UTF-8/JSON syntax, duplicate keys, and non-finite numbers
     # code 4), requires its key order, types, and b/points values to
-    # match the manifest recomputed from B/G (else code 5), then
-    # validates the whole G like op 11's mode 1 replay and selects the
-    # largest i for which every G[:i] commit exists in PACK.h and
-    # matches (never an append); G[i:] is replayed per op 11: existing
-    # versions are verified and missing ones append consecutively from
-    # v+1, replacing PACK atomically once when anything appends. C is
-    # never written and a repeated restore only verifies, so restores
-    # are idempotent (status 1, no write). selected is len(G) for mode
-    # 0 and the selected i for mode 1; segments echoes the suffix
-    # segments as op-11 [b, c, steps] rows ([] for mode 0); applied
-    # counts the appended versions. On any failure PACK and C keep
-    # their original bytes. O(S) time and space with S the total
-    # input/output size.
+    # match the manifest recomputed from B/G (else code 5), then the
+    # shared pass validates the whole G like op 11's mode 1 replay and
+    # selects the largest i for which every G[:i] commit exists in
+    # PACK.h and matches (never an append); G[i:] is replayed per op 11:
+    # existing versions are verified and missing ones append
+    # consecutively from v+1, replacing PACK atomically once when
+    # anything appends. C is never written and a repeated restore only
+    # verifies, so restores are idempotent (status 1, no write).
+    # selected is len(G) for mode 0 and the selected i for mode 1;
+    # segments echoes the suffix segments as op-11 [b, c, steps] rows
+    # ([] for mode 0); applied counts the appended versions. On any
+    # failure PACK and C keep their original bytes. O(S) time and space
+    # with S the total input/output size.
     if base > v:
         fail(5)
     nseg = len(segments)
@@ -3042,6 +3035,8 @@ def _config_multi_checkpoint(pack_path, pack, v, history, mode, base,
                                      separators=(",", ":")).encode("utf-8"))
     manifest = {"b": base, "points": points}
     if mode == 1:
+        # Read and match C before the pass: on any failure PACK and C
+        # keep their original bytes.
         saved = _load_state(ckpt_path)
         if not isinstance(saved, dict) \
                 or list(saved.keys()) != ["b", "points"]:
@@ -3065,66 +3060,13 @@ def _config_multi_checkpoint(pack_path, pack, v, history, mode, base,
         if saved != manifest:
             # b/points conflict with the manifest recomputed from B/G.
             fail(5)
-    sim_history = [list(entry) for entry in history]
-    history_len = len(sim_history)
-    all_segments = []
-    applied = 0
-    prev_e = None
-    chain_o = base
-    selected = nseg
-    for seg_index, (b, log, c) in enumerate(segments):
-        if b != chain_o:
-            fail(5)
-        steps = []
-        prev_o = None
-        prev_n = None
-        prev_a = None
-        seg_all_known = True
-        for item in log:
-            e, r, o, nv, a = item
-            if prev_e is not None and e < prev_e:
-                fail(5)
-            expected_o = b if prev_o is None \
-                else (prev_n if prev_a else prev_o)
-            if o != expected_o or r > o:
-                fail(5)
-            target_t, target_p = sim_history[r][1], sim_history[r][2]
-            if sim_history[o][1] == target_t \
-                    and sim_history[o][2] == target_p:
-                if a or nv != o:
-                    fail(5)
-            elif nv != o + 1:
-                fail(5)
-            s = 0
-            if a:
-                # A commit: a version already in the simulated history
-                # must match the target (it counts toward the prefix
-                # only when it was in PACK.h itself); otherwise mode 1
-                # appends consecutively and anything else is an error.
-                if nv < len(sim_history):
-                    if sim_history[nv][1] != target_t \
-                            or sim_history[nv][2] != target_p:
-                        fail(5)
-                    if nv >= history_len:
-                        seg_all_known = False
-                elif mode == 1 and nv == len(sim_history):
-                    sim_history.append([nv, target_t, target_p])
-                    applied += 1
-                    s = 1
-                    seg_all_known = False
-                else:
-                    fail(5)
-            steps.append([e, r, o, nv, a, s])
-            prev_e, prev_o, prev_n, prev_a = e, o, nv, a
-        end_o = prev_n if prev_a else prev_o
-        if c != end_o:
-            fail(5)
-        chain_o = c
-        if not seg_all_known and selected == nseg:
-            # First segment whose commits are not all already in PACK.h:
-            # the longest matching prefix ends right before it.
-            selected = seg_index
-        all_segments.append([b, c, steps])
+    # mode 0 verifies every commit against PACK.h (no append); mode 1
+    # may append on every segment. The same pass also reports the
+    # longest prefix whose commits were all already in PACK.h.
+    append_from = 0 if mode == 1 else nseg
+    sim_history, applied, all_segments, selected = \
+        _segmented_replay_core(v, history, base, segments, append_from,
+                               track_prefix=True)
     if mode == 0:
         try:
             with open(ckpt_path, "rb") as f:
