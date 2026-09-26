@@ -83,7 +83,13 @@ B/I/G[:I], a prefix commit missing from PACK.h or conflicting with
 it, and op 11's segment-chain and per-item checks over the whole G;
 for config op 12 code 3 also covers a C read/write error and code 4
 a C with invalid UTF-8/JSON syntax, duplicate keys, or non-finite
-numbers.
+numbers; config op 13 code 5 also covers a mode outside 0/1, a C that
+is not a non-empty path, a manifest whose key order, types, or
+b/points values conflict with B/G, a selected point whose prefix
+commit is missing from PACK.h or conflicts with it, and op 11's
+segment-chain and per-item checks over the whole G; for config op 13
+code 3 also covers a C read/write error and code 4 a C with invalid
+UTF-8/JSON syntax, duplicate keys, or non-finite numbers.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -2983,6 +2989,174 @@ def _config_checkpoint(pack_path, pack, v, history, mode, base, segments,
             "segments": out_segments, "config": new_pack}
 
 
+def _config_multi_checkpoint(pack_path, pack, v, history, mode, base,
+                             segments, ckpt_path):
+    # Multi-checkpoint restore (config op 13): [13, m, B, G, C]. B and
+    # G follow op 11 exactly and C is a non-empty manifest path. The
+    # manifest is {"b": B, "points": points} with keys in that order and
+    # one point [i, cv, d, prev] per i in 0..len(G): cv is B for i=0
+    # else the c of segment i-1, d is the lowercase hex SHA-256 of
+    # canonical G[:i] with the trailing LF removed, and prev is null for
+    # i=0 else i-1. The point digests are hashed incrementally over the
+    # growing canonical prefix, so building all points stays O(S).
+    # mode 0 (generate) validates G exactly like op 11's export (every
+    # commit references a version already present in PACK.h and matching
+    # it) and writes the manifest to C via one atomic replace, or
+    # nothing when C already holds those bytes (status 1); PACK is never
+    # touched and segments is []. mode 1 (restore) reads C (read errors
+    # code 3; UTF-8/JSON syntax, duplicate keys, and non-finite numbers
+    # code 4), requires its key order, types, and b/points values to
+    # match the manifest recomputed from B/G (else code 5), then
+    # validates the whole G like op 11's mode 1 replay and selects the
+    # largest i for which every G[:i] commit exists in PACK.h and
+    # matches (never an append); G[i:] is replayed per op 11: existing
+    # versions are verified and missing ones append consecutively from
+    # v+1, replacing PACK atomically once when anything appends. C is
+    # never written and a repeated restore only verifies, so restores
+    # are idempotent (status 1, no write). selected is len(G) for mode
+    # 0 and the selected i for mode 1; segments echoes the suffix
+    # segments as op-11 [b, c, steps] rows ([] for mode 0); applied
+    # counts the appended versions. On any failure PACK and C keep
+    # their original bytes. O(S) time and space with S the total
+    # input/output size.
+    if base > v:
+        fail(5)
+    nseg = len(segments)
+    point_v = [base]
+    for _b, _log, seg_c in segments:
+        point_v.append(seg_c)
+    # Incremental hash of "[" + dumps(G[:i] elements joined by ","):
+    # copying the hasher at each boundary yields the SHA-256 of
+    # canonical G[:i] (closing "]" included, trailing LF excluded).
+    hasher = hashlib.sha256(b"[")
+    points = []
+    for i in range(nseg + 1):
+        prefix_hasher = hasher.copy()
+        prefix_hasher.update(b"]")
+        prev_i = None if i == 0 else i - 1
+        points.append([i, point_v[i], prefix_hasher.hexdigest(), prev_i])
+        if i < nseg:
+            if i > 0:
+                hasher.update(b",")
+            hasher.update(json.dumps(segments[i], ensure_ascii=False,
+                                     separators=(",", ":")).encode("utf-8"))
+    manifest = {"b": base, "points": points}
+    if mode == 1:
+        saved = _load_state(ckpt_path)
+        if not isinstance(saved, dict) \
+                or list(saved.keys()) != ["b", "points"]:
+            fail(5)
+        saved_points = saved["points"]
+        if type(saved["b"]) is not int or not 0 <= saved["b"] <= MAX_COST \
+                or not isinstance(saved_points, list) \
+                or len(saved_points) != nseg + 1:
+            fail(5)
+        for point in saved_points:
+            if not isinstance(point, list) or len(point) != 4:
+                fail(5)
+            pi, pv, pd, pprev = point
+            if type(pi) is not int or not 0 <= pi <= MAX_COST \
+                    or type(pv) is not int or not 0 <= pv <= MAX_COST \
+                    or type(pd) is not str:
+                fail(5)
+            if pprev is not None and (type(pprev) is not int
+                                      or not 0 <= pprev <= MAX_COST):
+                fail(5)
+        if saved != manifest:
+            # b/points conflict with the manifest recomputed from B/G.
+            fail(5)
+    sim_history = [list(entry) for entry in history]
+    history_len = len(sim_history)
+    all_segments = []
+    applied = 0
+    prev_e = None
+    chain_o = base
+    selected = nseg
+    for seg_index, (b, log, c) in enumerate(segments):
+        if b != chain_o:
+            fail(5)
+        steps = []
+        prev_o = None
+        prev_n = None
+        prev_a = None
+        seg_all_known = True
+        for item in log:
+            e, r, o, nv, a = item
+            if prev_e is not None and e < prev_e:
+                fail(5)
+            expected_o = b if prev_o is None \
+                else (prev_n if prev_a else prev_o)
+            if o != expected_o or r > o:
+                fail(5)
+            target_t, target_p = sim_history[r][1], sim_history[r][2]
+            if sim_history[o][1] == target_t \
+                    and sim_history[o][2] == target_p:
+                if a or nv != o:
+                    fail(5)
+            elif nv != o + 1:
+                fail(5)
+            s = 0
+            if a:
+                # A commit: a version already in the simulated history
+                # must match the target (it counts toward the prefix
+                # only when it was in PACK.h itself); otherwise mode 1
+                # appends consecutively and anything else is an error.
+                if nv < len(sim_history):
+                    if sim_history[nv][1] != target_t \
+                            or sim_history[nv][2] != target_p:
+                        fail(5)
+                    if nv >= history_len:
+                        seg_all_known = False
+                elif mode == 1 and nv == len(sim_history):
+                    sim_history.append([nv, target_t, target_p])
+                    applied += 1
+                    s = 1
+                    seg_all_known = False
+                else:
+                    fail(5)
+            steps.append([e, r, o, nv, a, s])
+            prev_e, prev_o, prev_n, prev_a = e, o, nv, a
+        end_o = prev_n if prev_a else prev_o
+        if c != end_o:
+            fail(5)
+        chain_o = c
+        if not seg_all_known and selected == nseg:
+            # First segment whose commits are not all already in PACK.h:
+            # the longest matching prefix ends right before it.
+            selected = seg_index
+        all_segments.append([b, c, steps])
+    if mode == 0:
+        try:
+            with open(ckpt_path, "rb") as f:
+                existing = f.read()
+        except FileNotFoundError:
+            existing = None
+        except OSError:
+            fail(3)
+        if existing == _state_payload(manifest):
+            # C already holds the canonical bytes: do not write.
+            return {"op": 13, "mode": 0, "status": 1,
+                    "selected": nseg, "manifest": manifest,
+                    "applied": 0, "segments": [], "config": pack}
+        _write_state_atomic(ckpt_path, manifest)
+        return {"op": 13, "mode": 0, "status": 0,
+                "selected": nseg, "manifest": manifest,
+                "applied": 0, "segments": [], "config": pack}
+    out_segments = all_segments[selected:]
+    if applied == 0:
+        # Every suffix commit verified against h: idempotent, no write.
+        return {"op": 13, "mode": 1, "status": 1,
+                "selected": selected, "manifest": manifest,
+                "applied": 0, "segments": out_segments, "config": pack}
+    new_pack = {"v": v + applied, "t": sim_history[-1][1],
+                "p": sim_history[-1][2], "h": sim_history}
+    _write_state_atomic(pack_path, new_pack)
+    return {"op": 13, "mode": 1, "status": 0,
+            "selected": selected, "manifest": manifest,
+            "applied": applied, "segments": out_segments,
+            "config": new_pack}
+
+
 def _validate_hotload_records(links, events, data, node_set, pair_set, a, b):
     # Stream validation matching slogate's data contract (the record
     # checks inside compute_convstat) without running the windowed gate:
@@ -4586,6 +4760,52 @@ def main():
             ckpt_path = op[5]
             if type(ckpt_path) is not str or len(ckpt_path) == 0:
                 fail(5)
+        elif kind == 13:
+            # [13, m, B, G, C]: multi-checkpoint restore. m is 0
+            # (generate the manifest into C, PACK untouched) or 1
+            # (read C, select the longest prefix whose commits all
+            # exist in PACK.h, replay the remaining suffix); B is a
+            # bounded non-boolean integer (the base version the first
+            # segment's b must equal); G a non-empty list of [b, L, c]
+            # segments shaped exactly like op 11's; C a non-empty
+            # manifest file path. The manifest key-order/type/digest
+            # checks, the longest-prefix selection against PACK.h, and
+            # op 11's segment-chain and per-item checks run after PACK
+            # validation in _config_multi_checkpoint.
+            if len(op) != 5 or type(op[1]) is not int \
+                    or op[1] not in (0, 1) \
+                    or type(op[2]) is not int \
+                    or not 0 <= op[2] <= MAX_COST:
+                fail(5)
+            mode, base = op[1], op[2]
+            segments = op[3]
+            if not isinstance(segments, list) or not segments:
+                fail(5)
+            for segment in segments:
+                if not isinstance(segment, list) or len(segment) != 3:
+                    fail(5)
+                seg_b, seg_log, seg_c = segment
+                if type(seg_b) is not int or type(seg_c) is not int \
+                        or not 0 <= seg_b <= MAX_COST \
+                        or not 0 <= seg_c <= MAX_COST:
+                    fail(5)
+                if not isinstance(seg_log, list) or not seg_log:
+                    fail(5)
+                for item in seg_log:
+                    if not isinstance(item, list) or len(item) != 5:
+                        fail(5)
+                    e, r, o, n, a = item
+                    if type(e) is not int or type(r) is not int \
+                            or type(o) is not int or type(n) is not int \
+                            or not 0 <= e <= MAX_COST \
+                            or not 0 <= r <= MAX_COST \
+                            or not 0 <= o <= MAX_COST \
+                            or not 0 <= n <= MAX_COST \
+                            or type(a) is not bool:
+                        fail(5)
+            ckpt_path = op[4]
+            if type(ckpt_path) is not str or len(ckpt_path) == 0:
+                fail(5)
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -4655,6 +4875,10 @@ def main():
             result = _config_checkpoint(pack_path, pack, v, history,
                                         mode, base, segments, index,
                                         ckpt_path)
+        elif kind == 13:
+            result = _config_multi_checkpoint(pack_path, pack, v,
+                                              history, mode, base,
+                                              segments, ckpt_path)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
