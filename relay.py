@@ -56,7 +56,9 @@ record, a record t/p that is not a valid topology/policy, a BASE absent
 from h, a broken seq/pre chain, a gap or duplicate in the appended
 versions, an h[seq] conflict on a reused version, and a new version
 that would overflow MAX_COST; config op 6 reuses op 4's exact code 5
-checks as a read-only preview that never writes; for config op 5 code 5
+checks as a read-only preview that never writes; config op 7 reuses
+the same checks as a read-only replay diff audit that never writes;
+for config op 5 code 5
 also covers an invalid F/T or OUT path and an F/T interval outside
 0..v.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
@@ -2454,6 +2456,78 @@ def _config_preview(pack, v, history, base, log):
             "config": new_pack}
 
 
+def _config_topo_diff(old_t, new_t):
+    # Structural diff between two valid metric-mode topologies.
+    # Returns (n, l): n is [added nodes, removed nodes] with each list
+    # sorted by Unicode code point; l is [added links, removed links,
+    # changed links], each sorted by the (from, to) endpoint pair in
+    # code point order. Added/removed links carry the full
+    # [from, to, cost, up, bandwidth, latency] row; a changed link is
+    # [from, to, old, new] with old/new the [cost, up, bandwidth,
+    # latency] attribute rows. O(S) in the two topologies' size.
+    old_nodes = set(old_t["nodes"])
+    new_nodes = set(new_t["nodes"])
+    n = [sorted(new_nodes - old_nodes), sorted(old_nodes - new_nodes)]
+    old_links = {}
+    for link in old_t["links"]:
+        old_links[(link["from"], link["to"])] = link
+    new_links = {}
+    for link in new_t["links"]:
+        new_links[(link["from"], link["to"])] = link
+
+    def row(link):
+        return [link["from"], link["to"], link["cost"], link["up"],
+                link["bandwidth"], link["latency"]]
+
+    added = [row(new_links[pair])
+             for pair in sorted(new_links.keys() - old_links.keys())]
+    removed = [row(old_links[pair])
+               for pair in sorted(old_links.keys() - new_links.keys())]
+    changed = []
+    for pair in sorted(old_links.keys() & new_links.keys()):
+        old_attrs = row(old_links[pair])[2:]
+        new_attrs = row(new_links[pair])[2:]
+        if old_attrs != new_attrs:
+            changed.append([pair[0], pair[1], old_attrs, new_attrs])
+    return n, [added, removed, changed]
+
+
+def _config_replay_audit(pack, v, history, base, log):
+    # Read-only replay diff audit (config op 7). Validation and the
+    # in-memory simulation are exactly op 6's via _config_replay_sim —
+    # nothing is created, modified, or written — and on top of the
+    # simulated (applied, steps, new_pack) each LOG record gains the
+    # structural diff between its pre version and the record itself:
+    # steps are [seq, pre, s, n, l, p] in LOG order with s the
+    # reused-0/new-1 flag, n/l the topology diff, and p the six
+    # element-wise policy deltas (new minus old). final compares the
+    # original pack with the simulated result the same way as
+    # [old v, new v, n, l, p]; no differences yield empty arrays and
+    # six zeros. Status 0 when the LOG adds new versions, 1 otherwise.
+    # O(S) time and space with S the total input/output size.
+    applied, steps, new_pack = _config_replay_sim(pack, v, history,
+                                                  base, log)
+    prev_t = history[base][1]
+    prev_p = history[base][2]
+    audit_steps = []
+    for record, step in zip(log, steps):
+        rec_t = record[2]
+        rec_p = record[3]
+        n, l = _config_topo_diff(prev_t, rec_t)
+        p = [rec_p[i] - prev_p[i] for i in range(6)]
+        audit_steps.append([record[0], record[1], step[2], n, l, p])
+        prev_t = rec_t
+        prev_p = rec_p
+    n, l = _config_topo_diff(pack["t"], new_pack["t"])
+    p = [new_pack["p"][i] - pack["p"][i] for i in range(6)]
+    final = [pack["v"], new_pack["v"], n, l, p]
+    if applied == 0:
+        return {"op": 7, "status": 1, "applied": 0, "steps": audit_steps,
+                "final": final}
+    return {"op": 7, "status": 0, "applied": applied, "steps": audit_steps,
+            "final": final}
+
+
 def _config_export_log(out_path, v, history, from_v, to_v):
     # Export the replay log for versions from_v+1..to_v (config op 5).
     # The interval must satisfy 0 <= from_v < to_v <= v. LOG is the
@@ -3879,14 +3953,15 @@ def main():
                         or (s, d) in seen_queries:
                     fail(5)
                 seen_queries.add((s, d))
-        elif kind == 4 or kind == 6:
-            # [4, BASE, LOG] replay / [6, BASE, LOG] read-only preview.
+        elif kind == 4 or kind == 6 or kind == 7:
+            # [4, BASE, LOG] replay / [6, BASE, LOG] read-only preview /
+            # [7, BASE, LOG] read-only replay diff audit.
             # BASE is a bounded non-boolean integer; LOG a non-empty
             # list of [seq, pre, t, p] records whose seq/pre are bounded
             # non-boolean integers. The chain, topology, policy, and
             # history conflicts are checked after PACK validation in
-            # _config_replay_sim. Op 6 validates and simulates exactly
-            # like op 4 but never writes anything.
+            # _config_replay_sim. Ops 6 and 7 validate and simulate
+            # exactly like op 4 but never write anything.
             if len(op) != 3 or type(op[1]) is not int \
                     or not 0 <= op[1] <= MAX_COST:
                 fail(5)
@@ -3955,6 +4030,8 @@ def main():
             result = _config_replay(pack_path, pack, v, history, base, log)
         elif kind == 6:
             result = _config_preview(pack, v, history, base, log)
+        elif kind == 7:
+            result = _config_replay_audit(pack, v, history, base, log)
         elif kind == 5:
             result = _config_export_log(out_path, v, history, from_v, to_v)
     else:
