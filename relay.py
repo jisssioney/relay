@@ -51,7 +51,11 @@ continuity, or last-entry match is invalid, and a BASE that conflicts
 with the current v; for config op 3 code 5 also covers an invalid TS or
 Q, a TS version absent from h, a Q endpoint absent from the current t,
 and a rollback write whose BASE conflicts with v or whose v is already
-MAX_COST.
+MAX_COST; for config op 4 code 5 also covers an invalid LOG shape or
+record, a record t/p that is not a valid topology/policy, a BASE absent
+from h, a broken seq/pre chain, a gap or duplicate in the appended
+versions, an h[seq] conflict on a reused version, and a new version
+that would overflow MAX_COST.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -2362,6 +2366,61 @@ def _config_rollback(pack_path, pack, v, topo, policy, history, base,
             "config": new_pack}
 
 
+def _config_replay(pack_path, pack, v, history, base, log):
+    # Replay a LOG of [seq, pre, t, p] records against the version-zero
+    # continuous history (config op 4). BASE must be a version present
+    # in h; the first record's pre is BASE, every seq is pre + 1, and
+    # each later pre is the previous seq. Records are validated and
+    # simulated entirely in memory before anything is written: a record
+    # at seq <= v must equal h[seq] = [seq, t, p] exactly (reused, s=0),
+    # and the first record past v must be v+1, after which records append
+    # consecutively as [seq, t, p] (s=1), never past MAX_COST. A bad
+    # shape or range, a broken chain, a gap, an h conflict, or overflow
+    # fails with code 5 and leaves PACK untouched. No new records is
+    # status 1 (idempotent, no write); otherwise one atomic replace
+    # yields status 0. O(S) time and space with S the total
+    # input/output size.
+    if base > v:
+        fail(5)
+    new_history = [list(entry) for entry in history]
+    steps = []
+    applied = 0
+    expected_pre = base
+    next_new = v + 1
+    for record in log:
+        if not isinstance(record, list) or len(record) != 4:
+            fail(5)
+        seq, pre, rec_t, rec_p = record
+        if type(seq) is not int or type(pre) is not int \
+                or not 0 <= seq <= MAX_COST or not 0 <= pre <= MAX_COST:
+            fail(5)
+        if pre != expected_pre or seq != pre + 1:
+            fail(5)
+        _validate_topology(rec_t, metrics=True)
+        if not _is_policy(rec_p):
+            fail(5)
+        if seq <= v:
+            if history[seq] != [seq, rec_t, rec_p]:
+                fail(5)
+            steps.append([seq, pre, 0])
+        else:
+            if seq != next_new:
+                fail(5)
+            new_history.append([seq, rec_t, rec_p])
+            next_new = seq + 1
+            applied += 1
+            steps.append([seq, pre, 1])
+        expected_pre = seq
+    if applied == 0:
+        return {"op": 4, "status": 1, "applied": 0, "steps": steps,
+                "config": pack}
+    new_pack = {"v": v + applied, "t": new_history[-1][1],
+                "p": new_history[-1][2], "h": new_history}
+    _write_state_atomic(pack_path, new_pack)
+    return {"op": 4, "status": 0, "applied": applied, "steps": steps,
+            "config": new_pack}
+
+
 def _validate_hotload_records(links, events, data, node_set, pair_set, a, b):
     # Stream validation matching slogate's data contract (the record
     # checks inside compute_convstat) without running the windowed gate:
@@ -3757,6 +3816,27 @@ def main():
                         or (s, d) in seen_queries:
                     fail(5)
                 seen_queries.add((s, d))
+        elif kind == 4:
+            # [4, BASE, LOG]: replay. BASE is a bounded non-boolean
+            # integer; LOG a non-empty list of [seq, pre, t, p] records
+            # whose seq/pre are bounded non-boolean integers. The chain,
+            # topology, policy, and history conflicts are checked after
+            # PACK validation in _config_replay.
+            if len(op) != 3 or type(op[1]) is not int \
+                    or not 0 <= op[1] <= MAX_COST:
+                fail(5)
+            base = op[1]
+            log = op[2]
+            if not isinstance(log, list) or not log:
+                fail(5)
+            for record in log:
+                if not isinstance(record, list) or len(record) != 4:
+                    fail(5)
+                seq, pre = record[0], record[1]
+                if type(seq) is not int or type(pre) is not int \
+                        or not 0 <= seq <= MAX_COST \
+                        or not 0 <= pre <= MAX_COST:
+                    fail(5)
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -3791,9 +3871,11 @@ def main():
                 result = {"op": 1, "status": 0, "config": in_pack}
         elif kind == 2:
             result = {"op": 2, "status": 2, "config": pack}
-        else:
+        elif kind == 3:
             result = _config_rollback(pack_path, pack, v, topo, policy,
                                       history, base, ts_list, q_pairs)
+        elif kind == 4:
+            result = _config_replay(pack_path, pack, v, history, base, log)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
