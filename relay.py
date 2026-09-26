@@ -58,7 +58,10 @@ versions, an h[seq] conflict on a reused version, and a new version
 that would overflow MAX_COST; config op 6 reuses op 4's exact code 5
 checks as a read-only preview that never writes; config op 7 reuses
 the same checks as a read-only diff audit that never writes; for
-config op 5 code 5
+config op 8 code 5 also covers an invalid M/B/E, a T that is not a
+valid topology or a P that is not a valid policy, a B that conflicts
+with the current v when T/P differ from it, and a new version that
+would overflow MAX_COST; for config op 5 code 5
 also covers an invalid F/T or OUT path and an F/T interval outside
 0..v.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
@@ -2517,6 +2520,42 @@ def _config_diff_audit(pack, v, history, base, log):
             "steps": steps, "final": final}
 
 
+def _config_event_clock(pack_path, pack, v, topo, policy, history,
+                        mode, base, event, new_t, new_p):
+    # Event-clock config transaction (config op 8). T must be a valid
+    # metric topology and P a six-integer policy. A T/P equal to the
+    # current configuration is idempotent (status 1): BASE is ignored
+    # and nothing is written. Otherwise BASE must equal v with
+    # v < MAX_COST, and the candidate pack appends [v+1, T, P] to the
+    # untruncated history. Mode 0 is a read-only precheck: the
+    # simulation runs in memory only and no file (PACK, any other
+    # file, or a temp file) is touched. Mode 1 commits the candidate
+    # with one atomic replace (status 0), so repeating the same commit
+    # finds T/P already current and stays idempotent. applied is true
+    # only when mode 1 actually commits. diff is [n, l, p] diffing the
+    # current [t, p] against [T, P] exactly as op 7's rows do. old/new
+    # are the versions before/after. O(S) time and space with S the
+    # total input/output size.
+    _validate_topology(new_t, metrics=True)
+    if not _is_policy(new_p):
+        fail(5)
+    n, l, p_diff = _config_state_diff(topo, new_t, policy, new_p)
+    diff = [n, l, p_diff]
+    if new_t == topo and new_p == policy:
+        return {"op": 8, "mode": mode, "status": 1, "event": event,
+                "old": v, "new": v, "applied": False, "diff": diff,
+                "config": pack}
+    if base != v or v >= MAX_COST:
+        fail(5)
+    new_pack = {"v": v + 1, "t": new_t, "p": new_p,
+                "h": history + [[v + 1, new_t, new_p]]}
+    if mode == 1:
+        _write_state_atomic(pack_path, new_pack)
+    return {"op": 8, "mode": mode, "status": 0, "event": event,
+            "old": v, "new": v + 1, "applied": mode == 1,
+            "diff": diff, "config": new_pack}
+
+
 def _config_export_log(out_path, v, history, from_v, to_v):
     # Export the replay log for versions from_v+1..to_v (config op 5).
     # The interval must satisfy 0 <= from_v < to_v <= v. LOG is the
@@ -3966,6 +4005,22 @@ def main():
                         or not 0 <= seq <= MAX_COST \
                         or not 0 <= pre <= MAX_COST:
                     fail(5)
+        elif kind == 8:
+            # [8, M, B, E, T, P]: event-clock config transaction. M is
+            # the mode (0 read-only precheck, 1 atomic commit); B and
+            # E bounded non-boolean integers (expected version / event
+            # time); T a metric topology and P a six-integer policy,
+            # both validated after PACK validation in
+            # _config_event_clock, along with the BASE/version checks.
+            if len(op) != 6 or type(op[1]) is not int \
+                    or op[1] not in (0, 1) \
+                    or type(op[2]) is not int \
+                    or not 0 <= op[2] <= MAX_COST \
+                    or type(op[3]) is not int \
+                    or not 0 <= op[3] <= MAX_COST:
+                fail(5)
+            mode, base, event = op[1], op[2], op[3]
+            new_t, new_p = op[4], op[5]
         elif kind == 5:
             # [5, F, T, OUT]: export the replay log for versions
             # F+1..T. F and T are bounded non-boolean integers; OUT a
@@ -4021,6 +4076,10 @@ def main():
             result = _config_preview(pack, v, history, base, log)
         elif kind == 7:
             result = _config_diff_audit(pack, v, history, base, log)
+        elif kind == 8:
+            result = _config_event_clock(pack_path, pack, v, topo,
+                                         policy, history, mode, base,
+                                         event, new_t, new_p)
         elif kind == 5:
             result = _config_export_log(out_path, v, history, from_v, to_v)
     else:
