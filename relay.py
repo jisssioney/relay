@@ -70,7 +70,12 @@ out-of-range B/e/r/o/n, a non-boolean a, an O that is not a non-empty
 path (m=0) or not null (m=1), a B absent from h, a decreasing e, a
 broken o chain, an r above o, an n/a pair violating the
 target-equality rule, a commit reference missing from h or
-conflicting with it, and a new version that would overflow MAX_COST.
+conflicting with it, and a new version that would overflow MAX_COST;
+config op 11 code 5 also covers an invalid G shape or segment, an
+out-of-range b/c, a first segment b that is not B, a later segment b
+that is not the previous segment's c, a segment c that is not the
+chained o after its last item, and a decreasing e across segment
+boundaries, plus op 10's per-item checks within every segment.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -2727,6 +2732,109 @@ def _config_rollback_log(pack_path, pack, v, history, mode, base, log,
             "config": new_pack}
 
 
+def _config_segmented_rollback_log(pack_path, pack, v, history, mode,
+                                   base, segments, out_path):
+    # Segmented rollback log export/replay (config op 11):
+    # [11, m, B, G, O]. G is a non-empty list of [b, L, c] segments
+    # whose L is a non-empty list of op-10 [e, r, o, n, a] items and
+    # whose b/c are bounded non-boolean integers. The segments chain
+    # like one flat op-10 log: the first segment's b is B, every later
+    # b is the previous segment's c, each segment's first item carries
+    # o=b, and c is the chained o after the segment's last item (its n
+    # when that item committed, else its o); e is non-decreasing across
+    # segment boundaries too. Every item follows op 10's per-item
+    # checks (r <= o, the target-equality n/a rule, the commit
+    # reference/append rule) against one shared simulated history.
+    # mode 0 (O a non-empty path) only validates the references — a
+    # commit's h[n] must equal the target — and writes G to OUT in the
+    # canonical byte form via one atomic replace, or nothing when OUT
+    # already holds those bytes (status 1); PACK is never touched.
+    # mode 1 (O null) validates the same way, ignores the a=false
+    # items, and for each commit either verifies h[n] against the
+    # target when n is already in h or appends [n, t, p] consecutively
+    # from v+1, replacing PACK atomically once after every segment
+    # validated; replaying the same G again only verifies, so repeated
+    # replays are idempotent (status 1, no write). segments echoes each
+    # segment as [b, c, steps] with steps the op-10 [e, r, o, n, a, s]
+    # items (s=1 for an appended version else 0); applied counts the
+    # appends. O(S) time and space with S the total input/output size.
+    if base > v:
+        fail(5)
+    sim_history = [list(entry) for entry in history]
+    out_segments = []
+    applied = 0
+    prev_e = None
+    chain_o = base
+    for b, log, c in segments:
+        if b != chain_o:
+            fail(5)
+        steps = []
+        prev_o = None
+        prev_n = None
+        prev_a = None
+        for item in log:
+            e, r, o, n, a = item
+            if prev_e is not None and e < prev_e:
+                fail(5)
+            expected_o = b if prev_o is None \
+                else (prev_n if prev_a else prev_o)
+            if o != expected_o or r > o:
+                fail(5)
+            target_t, target_p = sim_history[r][1], sim_history[r][2]
+            if sim_history[o][1] == target_t \
+                    and sim_history[o][2] == target_p:
+                if a or n != o:
+                    fail(5)
+            elif n != o + 1:
+                fail(5)
+            s = 0
+            if a:
+                # A commit: the target must already be h[n] (export
+                # always, replay when n is a known version) or append
+                # consecutively from v+1 (replay only).
+                if n < len(sim_history):
+                    if sim_history[n][1] != target_t \
+                            or sim_history[n][2] != target_p:
+                        fail(5)
+                elif mode == 1 and n == len(sim_history):
+                    sim_history.append([n, target_t, target_p])
+                    applied += 1
+                    s = 1
+                else:
+                    fail(5)
+            steps.append([e, r, o, n, a, s])
+            prev_e, prev_o, prev_n, prev_a = e, o, n, a
+        end_o = prev_n if prev_a else prev_o
+        if c != end_o:
+            fail(5)
+        chain_o = c
+        out_segments.append([b, c, steps])
+    if mode == 0:
+        try:
+            with open(out_path, "rb") as f:
+                existing = f.read()
+        except FileNotFoundError:
+            existing = None
+        except OSError:
+            fail(3)
+        if existing == _state_payload(segments):
+            # OUT already holds the canonical bytes: do not write.
+            return {"op": 11, "status": 1, "applied": 0,
+                    "segments": out_segments, "config": pack}
+        _write_state_atomic(out_path, segments)
+        return {"op": 11, "status": 0, "applied": 0,
+                "segments": out_segments, "config": pack}
+    if applied == 0:
+        # Every commit verified against h: idempotent, no write.
+        return {"op": 11, "status": 1, "applied": 0,
+                "segments": out_segments, "config": pack}
+    new_pack = {"v": v + applied, "t": sim_history[-1][1],
+                "p": sim_history[-1][2], "h": sim_history}
+    _write_state_atomic(pack_path, new_pack)
+    return {"op": 11, "status": 0, "applied": applied,
+            "segments": out_segments, "config": new_pack}
+
+
 def _validate_hotload_records(links, events, data, node_set, pair_set, a, b):
     # Stream validation matching slogate's data contract (the record
     # checks inside compute_convstat) without running the windowed gate:
@@ -4230,6 +4338,55 @@ def main():
                     fail(5)
             elif out_path is not None:
                 fail(5)
+        elif kind == 11:
+            # [11, m, B, G, O]: segmented rollback log export (m=0, O a
+            # non-empty path) / replay (m=1, O null). m is 0 or 1; B is
+            # a bounded non-boolean integer (the base version the first
+            # segment's b must equal); G a non-empty list of [b, L, c]
+            # segments whose b/c are bounded non-boolean integers and
+            # whose L is a non-empty list of [e, r, o, n, a] items
+            # shaped exactly like op 10's. The B-present-in-h check,
+            # the b/c segment chain, the non-decreasing e (across
+            # segments too), the o chain, r <= o, the target-equality
+            # n/a rule, and the commit reference/append checks run
+            # after PACK validation in _config_segmented_rollback_log.
+            if len(op) != 5 or type(op[1]) is not int \
+                    or op[1] not in (0, 1) \
+                    or type(op[2]) is not int \
+                    or not 0 <= op[2] <= MAX_COST:
+                fail(5)
+            mode, base = op[1], op[2]
+            segments = op[3]
+            if not isinstance(segments, list) or not segments:
+                fail(5)
+            for segment in segments:
+                if not isinstance(segment, list) or len(segment) != 3:
+                    fail(5)
+                seg_b, seg_log, seg_c = segment
+                if type(seg_b) is not int or type(seg_c) is not int \
+                        or not 0 <= seg_b <= MAX_COST \
+                        or not 0 <= seg_c <= MAX_COST:
+                    fail(5)
+                if not isinstance(seg_log, list) or not seg_log:
+                    fail(5)
+                for item in seg_log:
+                    if not isinstance(item, list) or len(item) != 5:
+                        fail(5)
+                    e, r, o, n, a = item
+                    if type(e) is not int or type(r) is not int \
+                            or type(o) is not int or type(n) is not int \
+                            or not 0 <= e <= MAX_COST \
+                            or not 0 <= r <= MAX_COST \
+                            or not 0 <= o <= MAX_COST \
+                            or not 0 <= n <= MAX_COST \
+                            or type(a) is not bool:
+                        fail(5)
+            out_path = op[4]
+            if mode == 0:
+                if type(out_path) is not str or len(out_path) == 0:
+                    fail(5)
+            elif out_path is not None:
+                fail(5)
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -4291,6 +4448,10 @@ def main():
         elif kind == 10:
             result = _config_rollback_log(pack_path, pack, v, history,
                                           mode, base, log, out_path)
+        elif kind == 11:
+            result = _config_segmented_rollback_log(pack_path, pack, v,
+                                                    history, mode, base,
+                                                    segments, out_path)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
