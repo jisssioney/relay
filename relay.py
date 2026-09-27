@@ -101,10 +101,13 @@ at or after AT or decreasing, a duplicate checkpoint packet id, a c
 that is not [status-0, status-1, status-2 packet counts, completed
 install events], a DATA item t on the wrong side of AT, and a packet
 id already present in the checkpoint; for branch code 3 also covers a
-DB read/write error and code 5 also covers an invalid OP shape, name,
-parent, AT, or DATA, a DB whose entries fail the parent-chain replay
-or state check, and a same-name commit with a different parent, AT,
-or DATA.
+DB read/write error (for ops 1/2/3, also a missing DB; only op 0 may
+bootstrap an empty one) and code 5 also covers an invalid OP shape,
+name, parent, AT, or DATA, a DB whose entries fail the parent-chain
+replay or state check, a same-name commit with a different parent, AT,
+or DATA, and an op 2 leaf delete whose target still has child branches
+(op 3 deletes the target and every descendant instead; an absent
+delete target is idempotent and rewrites nothing).
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -2777,22 +2780,31 @@ def _copy_engine_state(state):
 
 
 def _load_branch_db(path):
-    # Read and strictly decode the branch DB like _load_state, but a
-    # missing/unreadable file yields None so a write op can bootstrap an
-    # empty DB (a read-only op turns None into code 3).
+    # Read the raw bytes and strictly decode the branch DB. A missing
+    # file returns (None, None) so an OP0 commit can bootstrap an empty
+    # DB; every other open/read failure is fatal code 3 for all ops
+    # (callers also turn None into code 3 for ops 1/2/3). Invalid UTF-8
+    # or JSON (syntax, duplicate keys, non-finite numbers) is code 4.
+    # The exact on-disk bytes come back too so a write op can skip the
+    # atomic replace when nothing changed.
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            text = f.read()
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return None, None
     except OSError:
-        return None
+        fail(3)
+    try:
+        text = raw.decode("utf-8")
     except UnicodeDecodeError:
         fail(4)
     try:
-        return json.loads(text, parse_constant=_reject_constant,
-                          parse_float=_finite_float,
-                          object_pairs_hook=_object_no_dup)
+        db = json.loads(text, parse_constant=_reject_constant,
+                        parse_float=_finite_float,
+                        object_pairs_hook=_object_no_dup)
     except (ValueError, RecursionError):
         fail(4)
+    return db, raw
 
 
 def _validate_branch_db(db, file_bytes, nodes, links, node_set, source,
@@ -5265,9 +5277,9 @@ def main():
         except OSError:
             fail(3)
         # Read/decode the DB before the inline OP (read errors code 3,
-        # strict JSON errors code 4); a missing DB bootstraps empty for
-        # a write op and is code 3 for a read-only op.
-        db = _load_branch_db(db_path)
+        # strict JSON errors code 4); a missing DB bootstraps empty only
+        # for OP0, every other op gets code 3 and never touches it.
+        db, db_raw = _load_branch_db(db_path)
         try:
             op = json.loads(op_text, parse_constant=_reject_constant,
                             parse_float=_finite_float,
@@ -5295,18 +5307,26 @@ def main():
             _, name, data = op
             if type(name) is not str:
                 fail(5)
+        elif kind in (2, 3):
+            # [2, name]: delete a leaf branch. [3, name]: delete the
+            # subtree rooted at name. Both are idempotent when the name
+            # is absent from an existing, fully validated DB.
+            if len(op) != 2:
+                fail(5)
+            _, name = op
+            _check_branch_name(name)
         else:
             fail(5)
         if db is None:
-            if kind == 1:
+            if kind != 0:
                 fail(3)
             db = {"p": []}
         pair_set = {(link["from"], link["to"]) for link in links}
         latency_of = {(link["from"], link["to"]): link["latency"]
                       for link in links}
-        _, by_name = _validate_branch_db(db, file_bytes, nodes, links,
-                                         node_set, source, destination,
-                                         wait)
+        records, by_name = _validate_branch_db(
+            db, file_bytes, nodes, links, node_set, source, destination,
+            wait)
         if kind == 0:
             existing = by_name.get(name)
             if existing is not None:
@@ -5346,15 +5366,10 @@ def main():
             payload = _state_payload(db)
             # Atomic replace, skipped when the file already holds
             # exactly these bytes.
-            try:
-                with open(db_path, "rb") as f:
-                    current = f.read()
-            except OSError:
-                current = None
-            if current != payload:
+            if db_raw != payload:
                 _write_state_atomic(db_path, db)
             result = db
-        else:
+        elif kind == 1:
             # OP 1 leaves the DB untouched; the merged run resumes from
             # the named checkpoint, so its s,d,e,p,x match one compound
             # run over the whole chain's DATA plus this DATA.
@@ -5369,6 +5384,39 @@ def main():
             result, _ = _compound_run(
                 nodes, links, source, destination, wait, items,
                 state=_copy_engine_state(record[4]))
+        else:
+            # OP 2 deletes a single leaf: any child still parented to
+            # name is code 5. OP 3 deletes name and every descendant.
+            # A missing target is idempotent: no rewrite at all.
+            if name not in by_name:
+                result = db
+            else:
+                removed = {name}
+                if kind == 2:
+                    if any(record[1] == name for record in records):
+                        fail(5)
+                else:
+                    # Collect descendants in linear time via a
+                    # parent-to-children adjacency and a DFS stack.
+                    children = {}
+                    for record in records:
+                        rparent = record[1]
+                        if rparent is not None:
+                            children.setdefault(rparent, []).append(
+                                record[0])
+                    stack = [name]
+                    while stack:
+                        cur = stack.pop()
+                        for child in children.get(cur, ()):
+                            if child not in removed:
+                                removed.add(child)
+                                stack.append(child)
+                db["p"] = [[record[0], record[1], record[2], record[3]]
+                           for record in records
+                           if record[0] not in removed]
+                # Exactly one atomic replace for the actual deletion.
+                _write_state_atomic(db_path, db)
+                result = db
     elif argv[1] == "hotload":
         if len(argv) != 11:
             fail(2)
