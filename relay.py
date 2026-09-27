@@ -101,10 +101,12 @@ at or after AT or decreasing, a duplicate checkpoint packet id, a c
 that is not [status-0, status-1, status-2 packet counts, completed
 install events], a DATA item t on the wrong side of AT, and a packet
 id already present in the checkpoint; for branch code 3 also covers a
-DB read/write error and code 5 also covers an invalid OP shape, name,
-parent, AT, or DATA, a DB whose entries fail the parent-chain replay
-or state check, and a same-name commit with a different parent, AT,
-or DATA.
+DB read/write error (a missing DB is code 3 for every op except op 0,
+which bootstraps an empty DB) and code 5 also covers an invalid OP
+shape, name, parent, AT, or DATA, a DB whose entries fail the
+parent-chain replay or state check, a same-name commit with a
+different parent, AT, or DATA, and an op 2 delete whose target still
+has child branches.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -2778,13 +2780,17 @@ def _copy_engine_state(state):
 
 def _load_branch_db(path):
     # Read and strictly decode the branch DB like _load_state, but a
-    # missing/unreadable file yields None so a write op can bootstrap an
-    # empty DB (a read-only op turns None into code 3).
+    # missing file yields None so op 0 can bootstrap an empty DB (a
+    # missing DB is code 3 for every other op). Any other open/read
+    # failure is code 3 for every op: a DB whose bytes could not be
+    # read must never be replaced.
     try:
         with open(path, "r", encoding="utf-8") as f:
             text = f.read()
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError:
+        fail(3)
     except UnicodeDecodeError:
         fail(4)
     try:
@@ -5266,7 +5272,7 @@ def main():
             fail(3)
         # Read/decode the DB before the inline OP (read errors code 3,
         # strict JSON errors code 4); a missing DB bootstraps empty for
-        # a write op and is code 3 for a read-only op.
+        # op 0 and is code 3 for every other op.
         db = _load_branch_db(db_path)
         try:
             op = json.loads(op_text, parse_constant=_reject_constant,
@@ -5295,10 +5301,24 @@ def main():
             _, name, data = op
             if type(name) is not str:
                 fail(5)
+        elif kind == 2:
+            # [2, name]: delete a leaf branch.
+            if len(op) != 2:
+                fail(5)
+            _, name = op
+            _check_branch_name(name)
+        elif kind == 3:
+            # [3, name]: delete the subtree rooted at a named branch.
+            if len(op) != 2:
+                fail(5)
+            _, name = op
+            _check_branch_name(name)
         else:
             fail(5)
         if db is None:
-            if kind == 1:
+            # Only op 0 may bootstrap an empty DB; every other op
+            # treats a missing DB as a read error.
+            if kind != 0:
                 fail(3)
             db = {"p": []}
         pair_set = {(link["from"], link["to"]) for link in links}
@@ -5354,7 +5374,7 @@ def main():
             if current != payload:
                 _write_state_atomic(db_path, db)
             result = db
-        else:
+        elif kind == 1:
             # OP 1 leaves the DB untouched; the merged run resumes from
             # the named checkpoint, so its s,d,e,p,x match one compound
             # run over the whole chain's DATA plus this DATA.
@@ -5369,6 +5389,36 @@ def main():
             result, _ = _compound_run(
                 nodes, links, source, destination, wait, items,
                 state=_copy_engine_state(record[4]))
+        elif kind == 2:
+            # [2, name]: delete a leaf branch. A missing target is an
+            # idempotent success that leaves the DB file untouched; a
+            # target that still has children is code 5. A real delete
+            # rewrites the DB exactly once, atomically.
+            if name in by_name:
+                for entry in db["p"]:
+                    if entry[1] == name:
+                        fail(5)
+                db["p"] = [entry for entry in db["p"]
+                           if entry[0] != name]
+                _write_state_atomic(db_path, db)
+            result = db
+        else:
+            # [3, name]: delete the subtree rooted at name. Parents
+            # always precede their children in p, so one ordered pass
+            # collects the target and every descendant; a missing
+            # target is an idempotent success with no write, and a real
+            # delete is a single atomic replace.
+            if name in by_name:
+                doomed = {name}
+                kept = []
+                for entry in db["p"]:
+                    if entry[0] in doomed or entry[1] in doomed:
+                        doomed.add(entry[0])
+                    else:
+                        kept.append(entry)
+                db["p"] = kept
+                _write_state_atomic(db_path, db)
+            result = db
     elif argv[1] == "hotload":
         if len(argv) != 11:
             fail(2)
