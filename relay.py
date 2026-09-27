@@ -28,6 +28,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py lfail FILE S D W DATA
        python relay.py impair FILE S D DATA
        python relay.py compound FILE S D W DATA
+       python relay.py compoundcp FILE S D W AT M STATE DATA
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE),
 4 JSON syntax
@@ -38,7 +39,8 @@ compound/audit those in DATA, for drill/multidrill/convstat/slosum
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
 those in OLD/NEW/EVENTS/DATA, for slogate those in
 CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA, for
-snapshot those in STATE/OP/IN, for config those in PACK/OP/IN),
+compoundcp those in STATE/DATA, for snapshot those in STATE/OP/IN,
+for config those in PACK/OP/IN),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
 P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
 unknown-node/overflow/re-failure error; for hotload code 5 also covers
@@ -90,10 +92,18 @@ b/points values conflict with B/G, a selected point whose prefix
 commit is missing from PACK.h or conflicts with it, and op 11's
 segment-chain and per-item checks over the whole G; for config op 13
 code 3 also covers a C read/write error and code 4 a C with invalid
-UTF-8/JSON syntax, duplicate keys, or non-finite numbers.
+UTF-8/JSON syntax, duplicate keys, or non-finite numbers; for
+compoundcp code 5 also covers an M outside 0/1 and a STATE whose
+b/n/l/r/g/e/p/c/h key order, structure, or content is invalid, whose
+h does not match FILE plus the state payload, or whose b conflicts
+with S/D/W/AT.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
+compoundcp M=0 runs the t<AT items, writes the snapshot STATE
+atomically (an identical STATE is not rewritten), and prints it; M=1
+resumes read-only from STATE and prints exactly what compound would
+print for the whole DATA.
 """
 
 import hashlib
@@ -2166,7 +2176,8 @@ def compute_impair(nodes, links, source, destination, items):
             "packets": packets, "stats": stats}
 
 
-def compute_compound(nodes, links, source, destination, wait, items):
+def _compound_run(nodes, links, source, destination, wait, items,
+                  cutoff=None, resume=None):
     # Fault's debounced recompute-and-install driven by a mixed stream
     # of topology/impairment batches and packets. The installed route
     # starts as the lowest-cost path in the initial up-graph (every node
@@ -2186,24 +2197,53 @@ def compute_compound(nodes, links, source, destination, wait, items):
     # keep advancing. A packet walks the installed route when every node
     # and link on it is currently up, edge by edge with impair's
     # count/latency/drop rules; otherwise it is a no-route loss.
-    up_links = [link for link in links if link["up"]]
-    cost_of, path_of = shortest_paths(nodes, up_links, source)
-    initial_path = path_of[destination]
-    installed = ((cost_of[destination], initial_path)
-                 if initial_path is not None else None)
-
-    node_up = {n: True for n in nodes}
-    link_up = {(link["from"], link["to"]): link["up"] for link in links}
+    #
+    # compoundcp hooks: with cutoff set, a timer due at or after cutoff
+    # never expires here and stays pending in the returned snapshot;
+    # with resume set, the simulation state initializes from such a
+    # snapshot instead of the FILE state. Returns the compound result
+    # together with a snapshot of the full simulation state.
+    if resume is None:
+        up_links = [link for link in links if link["up"]]
+        cost_of, path_of = shortest_paths(nodes, up_links, source)
+        initial_path = path_of[destination]
+        installed = ((cost_of[destination], initial_path)
+                     if initial_path is not None else None)
+        node_up = {n: True for n in nodes}
+        link_up = {(link["from"], link["to"]): link["up"]
+                   for link in links}
+        n_of = {}
+        j_of = {}
+        count_of = {}
+        for link in links:
+            pair = (link["from"], link["to"])
+            n_of[pair] = 0
+            j_of[pair] = 0
+            count_of[pair] = 0
+        timer_start = None
+        timer_at = None
+        timer_target = None
+        events = []
+        packets = []
+        delivered = 0
+        lost = 0
+        unreachable = 0
+        reroutes = 0
+    else:
+        installed = resume["installed"]
+        node_up = resume["node_up"]
+        link_up = resume["link_up"]
+        n_of = resume["n_of"]
+        j_of = resume["j_of"]
+        count_of = resume["count_of"]
+        timer_start, timer_at, timer_target = resume["timer"]
+        events = resume["events"]
+        packets = resume["packets"]
+        delivered, lost, unreachable, reroutes = resume["counters"]
     latency_of = {}
-    n_of = {}
-    j_of = {}
-    count_of = {}
     for link in links:
         pair = (link["from"], link["to"])
         latency_of[pair] = link["latency"]
-        n_of[pair] = 0
-        j_of[pair] = 0
-        count_of[pair] = 0
 
     def recompute():
         # Lowest-cost path over up nodes and up links joining them.
@@ -2224,22 +2264,17 @@ def compute_compound(nodes, links, source, destination, wait, items):
     def route_of(target):
         return [target[0], target[1]] if target is not None else [None, []]
 
-    timer_start = None
-    timer_at = None
-    timer_target = None
-    events = []
-    packets = []
-    delivered = 0
-    lost = 0
-    unreachable = 0
-    reroutes = 0
     i = 0
     n = len(items)
-    while i < n or timer_at is not None:
+    # With a cutoff, a timer due at or after it never expires here: it
+    # stays pending for the snapshot (compoundcp M=0 keeps the AT-tick
+    # expiry for the continuation).
+    while i < n or (timer_at is not None
+                    and (cutoff is None or timer_at < cutoff)):
         wakes = []
         if i < n:
             wakes.append(items[i][0])
-        if timer_at is not None:
+        if timer_at is not None and (cutoff is None or timer_at < cutoff):
             wakes.append(timer_at)
         now = min(wakes)
         # Items at this tick run in input order before a timer expiring
@@ -2337,8 +2372,203 @@ def compute_compound(nodes, links, source, destination, wait, items):
     stats = [delivered, lost, unreachable, reroutes,
              _format_peak(lost, delivered + lost)
              if delivered + lost else "0.000000"]
-    return {"s": source, "d": destination, "e": events, "p": packets,
-            "x": stats}
+    result = {"s": source, "d": destination, "e": events, "p": packets,
+              "x": stats}
+    snapshot = {"installed": installed, "node_up": node_up,
+                "link_up": link_up, "n_of": n_of, "j_of": j_of,
+                "count_of": count_of,
+                "timer": ((timer_start, timer_at, timer_target)
+                          if timer_at is not None else None),
+                "events": events, "packets": packets,
+                "counters": [delivered, lost, unreachable, reroutes]}
+    return result, snapshot
+
+
+def compute_compound(nodes, links, source, destination, wait, items):
+    result, _ = _compound_run(nodes, links, source, destination, wait,
+                              items)
+    return result
+
+
+def _parse_compound_items(data, node_set, pair_set, latency_of):
+    # Compound's DATA contract: a list of [t, kind, payload] items with
+    # non-decreasing bounded integer t; kind 0 is a non-empty batch of
+    # node/link up-state and impairment changes (each node and each link
+    # at most once per batch), kind 1 a packet id unique across DATA.
+    items = []
+    seen_ids = set()
+    previous_time = None
+    for item in data:
+        if not isinstance(item, list) or len(item) != 3:
+            fail(5)
+        t, kind, payload = item
+        if type(t) is not int or not 0 <= t <= MAX_COST:
+            fail(5)
+        if previous_time is not None and t < previous_time:
+            fail(5)
+        previous_time = t
+        if type(kind) is not int or kind not in (0, 1):
+            fail(5)
+        if kind == 0:
+            if not isinstance(payload, list) or not payload:
+                fail(5)
+            seen_nodes = set()
+            seen_pairs = set()
+            batch = []
+            for change in payload:
+                if (not isinstance(change, list)
+                        or len(change) not in (3, 4, 5)):
+                    fail(5)
+                ckind = change[0]
+                if type(ckind) is not int or ckind not in (0, 1, 2):
+                    fail(5)
+                if ckind == 0:
+                    if len(change) != 3:
+                        fail(5)
+                    _, node, up = change
+                    if type(node) is not str or node not in node_set:
+                        fail(5)
+                    if type(up) is not bool:
+                        fail(5)
+                    if node in seen_nodes:
+                        fail(5)
+                    seen_nodes.add(node)
+                    batch.append((0, node, up))
+                elif ckind == 1:
+                    if len(change) != 4:
+                        fail(5)
+                    _, u, v, up = change
+                    if (type(u) is not str or type(v) is not str
+                            or (u, v) not in pair_set):
+                        fail(5)
+                    if type(up) is not bool:
+                        fail(5)
+                    if (u, v) in seen_pairs:
+                        fail(5)
+                    seen_pairs.add((u, v))
+                    batch.append((1, u, v, up))
+                else:
+                    if len(change) != 5:
+                        fail(5)
+                    _, u, v, k, j = change
+                    if (type(u) is not str or type(v) is not str
+                            or (u, v) not in pair_set):
+                        fail(5)
+                    if type(k) is not int or not 0 <= k <= MAX_COST:
+                        fail(5)
+                    if (type(j) is not int
+                            or not 0 <= latency_of[(u, v)] + j
+                            <= MAX_COST):
+                        fail(5)
+                    if (u, v) in seen_pairs:
+                        fail(5)
+                    seen_pairs.add((u, v))
+                    batch.append((2, u, v, k, j))
+            items.append((t, 0, batch))
+        else:
+            pid = payload
+            if type(pid) is not str or not 1 <= len(pid) <= 64:
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if pid in seen_ids:
+                fail(5)
+            seen_ids.add(pid)
+            items.append((t, 1, pid))
+    return items
+
+
+def _validate_compoundcp_route(route, node_set):
+    # The r-format route: [cost, path] with cost a bounded integer and
+    # path a non-empty list of known nodes, or [null, []] for no route.
+    if not isinstance(route, list) or len(route) != 2:
+        fail(5)
+    cost, path = route
+    if cost is None:
+        if path != []:
+            fail(5)
+        return
+    if type(cost) is not int or not 0 <= cost <= MAX_TIME:
+        fail(5)
+    if not isinstance(path, list) or not path:
+        fail(5)
+    for node in path:
+        if type(node) is not str or node not in node_set:
+            fail(5)
+
+
+def _validate_compoundcp_state(data, nodes, links, node_set, latency_of):
+    # A compoundcp STATE is {"b","n","l","r","g","e","p","c","h"} with
+    # keys in that order: b the [S,D,W,AT] run parameters, n the node
+    # up flags in FILE node order, l one [up,k,j,count] per FILE link,
+    # r the installed route, g the pending timer or null, e/p the
+    # compound event/packet arrays so far, c the four counters, and h
+    # the integrity hash (verified by the caller, which owns the FILE
+    # bytes). Returns the nine values in key order, aliasing the
+    # decoded JSON so the caller's hash payload is byte-faithful.
+    if not isinstance(data, dict) or list(data.keys()) != ["b", "n", "l",
+                                                          "r", "g", "e",
+                                                          "p", "c", "h"]:
+        fail(5)
+    b = data["b"]
+    if not isinstance(b, list) or len(b) != 4:
+        fail(5)
+    if type(b[0]) is not str or type(b[1]) is not str:
+        fail(5)
+    if type(b[2]) is not int or not 0 <= b[2] <= MAX_COST:
+        fail(5)
+    if type(b[3]) is not int or not 0 <= b[3] <= MAX_COST:
+        fail(5)
+    n = data["n"]
+    if not isinstance(n, list) or len(n) != len(nodes):
+        fail(5)
+    for up in n:
+        if type(up) is not bool:
+            fail(5)
+    l = data["l"]
+    if not isinstance(l, list) or len(l) != len(links):
+        fail(5)
+    for link, entry in zip(links, l):
+        if not isinstance(entry, list) or len(entry) != 4:
+            fail(5)
+        up, k, j, count = entry
+        if type(up) is not bool:
+            fail(5)
+        if type(k) is not int or not 0 <= k <= MAX_COST:
+            fail(5)
+        pair = (link["from"], link["to"])
+        if (type(j) is not int
+                or not 0 <= latency_of[pair] + j <= MAX_COST):
+            fail(5)
+        if type(count) is not int or count < 0:
+            fail(5)
+    r = data["r"]
+    _validate_compoundcp_route(r, node_set)
+    g = data["g"]
+    if g is not None:
+        if not isinstance(g, list) or len(g) != 3:
+            fail(5)
+        start, due, target = g
+        if type(start) is not int or type(due) is not int \
+                or not 0 <= start <= due <= MAX_TIME:
+            fail(5)
+        _validate_compoundcp_route(target, node_set)
+    e = data["e"]
+    p = data["p"]
+    if not isinstance(e, list) or not isinstance(p, list):
+        fail(5)
+    c = data["c"]
+    if not isinstance(c, list) or len(c) != 4:
+        fail(5)
+    for count in c:
+        if type(count) is not int or count < 0:
+            fail(5)
+    h = data["h"]
+    if type(h) is not str:
+        fail(5)
+    return b, n, l, r, g, e, p, c, h
 
 
 def _parse_drill_events(raw_events, up_pairs, node_set, a, b):
@@ -4654,90 +4884,135 @@ def main():
         pair_set = {(link["from"], link["to"]) for link in links}
         latency_of = {(link["from"], link["to"]): link["latency"]
                       for link in links}
-        items = []
-        seen_ids = set()
-        previous_time = None
-        for item in data:
-            if not isinstance(item, list) or len(item) != 3:
-                fail(5)
-            t, kind, payload = item
-            if type(t) is not int or not 0 <= t <= MAX_COST:
-                fail(5)
-            if previous_time is not None and t < previous_time:
-                fail(5)
-            previous_time = t
-            if type(kind) is not int or kind not in (0, 1):
-                fail(5)
-            if kind == 0:
-                if not isinstance(payload, list) or not payload:
-                    fail(5)
-                seen_nodes = set()
-                seen_pairs = set()
-                batch = []
-                for change in payload:
-                    if (not isinstance(change, list)
-                            or len(change) not in (3, 4, 5)):
-                        fail(5)
-                    ckind = change[0]
-                    if type(ckind) is not int or ckind not in (0, 1, 2):
-                        fail(5)
-                    if ckind == 0:
-                        if len(change) != 3:
-                            fail(5)
-                        _, node, up = change
-                        if type(node) is not str or node not in node_set:
-                            fail(5)
-                        if type(up) is not bool:
-                            fail(5)
-                        if node in seen_nodes:
-                            fail(5)
-                        seen_nodes.add(node)
-                        batch.append((0, node, up))
-                    elif ckind == 1:
-                        if len(change) != 4:
-                            fail(5)
-                        _, u, v, up = change
-                        if (type(u) is not str or type(v) is not str
-                                or (u, v) not in pair_set):
-                            fail(5)
-                        if type(up) is not bool:
-                            fail(5)
-                        if (u, v) in seen_pairs:
-                            fail(5)
-                        seen_pairs.add((u, v))
-                        batch.append((1, u, v, up))
-                    else:
-                        if len(change) != 5:
-                            fail(5)
-                        _, u, v, k, j = change
-                        if (type(u) is not str or type(v) is not str
-                                or (u, v) not in pair_set):
-                            fail(5)
-                        if type(k) is not int or not 0 <= k <= MAX_COST:
-                            fail(5)
-                        if (type(j) is not int
-                                or not 0 <= latency_of[(u, v)] + j
-                                <= MAX_COST):
-                            fail(5)
-                        if (u, v) in seen_pairs:
-                            fail(5)
-                        seen_pairs.add((u, v))
-                        batch.append((2, u, v, k, j))
-                items.append((t, 0, batch))
-            else:
-                pid = payload
-                if type(pid) is not str or not 1 <= len(pid) <= 64:
-                    fail(5)
-                try:
-                    pid.encode("utf-8")
-                except UnicodeEncodeError:
-                    fail(5)
-                if pid in seen_ids:
-                    fail(5)
-                seen_ids.add(pid)
-                items.append((t, 1, pid))
+        items = _parse_compound_items(data, node_set, pair_set, latency_of)
         result = compute_compound(nodes, links, source, destination,
                                   wait, items)
+    elif argv[1] == "compoundcp":
+        if len(argv) != 10:
+            fail(2)
+        file_path, source, destination = argv[2], argv[3], argv[4]
+        wait_text, at_text, m_text = argv[5], argv[6], argv[7]
+        state_path, data_text = argv[8], argv[9]
+        # FILE's raw bytes feed the state hash; load_network re-reads
+        # and validates the topology. Both report read errors as code 3
+        # exactly like compound.
+        try:
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
+        except OSError:
+            fail(3)
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        if (source not in node_set or destination not in node_set
+                or source == destination):
+            fail(5)
+        wait = _bounded_int_arg(wait_text)
+        at = _bounded_int_arg(at_text)
+        mode = _bounded_int_arg(m_text)
+        if mode not in (0, 1):
+            fail(5)
+        if mode == 1:
+            raw_state = _load_state(state_path)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        # Unlike compound, an empty DATA is allowed: M=0 then snapshots
+        # the initial state and M=1 just settles any restored timer.
+        if not isinstance(data, list):
+            fail(5)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        latency_of = {(link["from"], link["to"]): link["latency"]
+                      for link in links}
+        if mode == 1:
+            b, n_list, l_list, r, g, e_list, p_list, c_list, h = \
+                _validate_compoundcp_state(raw_state, nodes, links,
+                                           node_set, latency_of)
+            payload = json.dumps([b, n_list, l_list, r, g, e_list, p_list,
+                                  c_list], ensure_ascii=False,
+                                 separators=(",", ":")).encode("utf-8")
+            if h != hashlib.sha256(file_bytes + payload).hexdigest():
+                fail(5)
+            if b != [source, destination, wait, at]:
+                fail(5)
+        items = _parse_compound_items(data, node_set, pair_set, latency_of)
+        if mode == 0:
+            # Only the t<AT items run; a timer due at or after AT stays
+            # pending in the snapshot (the AT-tick expiry is kept for
+            # the continuation, whose AT-tick inputs run before it).
+            items = [item for item in items if item[0] < at]
+            _, snap = _compound_run(nodes, links, source, destination,
+                                    wait, items, cutoff=at)
+            b = [source, destination, wait, at]
+            n_list = [snap["node_up"][name] for name in nodes]
+            l_list = []
+            for link in links:
+                pair = (link["from"], link["to"])
+                l_list.append([snap["link_up"][pair], snap["n_of"][pair],
+                               snap["j_of"][pair], snap["count_of"][pair]])
+            installed = snap["installed"]
+            r = ([installed[0], installed[1]]
+                 if installed is not None else [None, []])
+            timer = snap["timer"]
+            if timer is None:
+                g = None
+            else:
+                target = timer[2]
+                g = [timer[0], timer[1],
+                     [target[0], target[1]]
+                     if target is not None else [None, []]]
+            e_list = snap["events"]
+            p_list = snap["packets"]
+            c_list = snap["counters"]
+            payload = json.dumps([b, n_list, l_list, r, g, e_list, p_list,
+                                  c_list], ensure_ascii=False,
+                                 separators=(",", ":")).encode("utf-8")
+            h = hashlib.sha256(file_bytes + payload).hexdigest()
+            state = {"b": b, "n": n_list, "l": l_list, "r": r, "g": g,
+                     "e": e_list, "p": p_list, "c": c_list, "h": h}
+            try:
+                with open(state_path, "rb") as f:
+                    existing = f.read()
+            except FileNotFoundError:
+                existing = None
+            except OSError:
+                fail(3)
+            if existing != _state_payload(state):
+                _write_state_atomic(state_path, state)
+            # STATE already holding the canonical bytes is not rewritten.
+            result = state
+        else:
+            # Resume from the snapshot and run only the t>=AT items; an
+            # empty remainder still advances and settles a restored
+            # timer. The printed result covers the whole run, exactly
+            # what compound would print for the merged DATA.
+            items = [item for item in items if item[0] >= at]
+            node_up = {name: up for name, up in zip(nodes, n_list)}
+            link_up = {}
+            n_of = {}
+            j_of = {}
+            count_of = {}
+            for link, entry in zip(links, l_list):
+                pair = (link["from"], link["to"])
+                link_up[pair] = entry[0]
+                n_of[pair] = entry[1]
+                j_of[pair] = entry[2]
+                count_of[pair] = entry[3]
+            installed = (r[0], r[1]) if r[0] is not None else None
+            if g is None:
+                timer = (None, None, None)
+            else:
+                target = ((g[2][0], g[2][1])
+                          if g[2][0] is not None else None)
+                timer = (g[0], g[1], target)
+            resume = {"installed": installed, "node_up": node_up,
+                      "link_up": link_up, "n_of": n_of, "j_of": j_of,
+                      "count_of": count_of, "timer": timer,
+                      "events": e_list, "packets": p_list,
+                      "counters": c_list}
+            result, _ = _compound_run(nodes, links, source, destination,
+                                      wait, items, resume=resume)
     elif argv[1] == "hotload":
         if len(argv) != 11:
             fail(2)
