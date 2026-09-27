@@ -32,7 +32,8 @@ Usage: python relay.py route FILE SOURCE
        python relay.py compoundcp FILE S D W AT M STATE DATA
        python relay.py branch FILE S D W DB OP
 
-Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE),
+Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE,
+and for policytx op 4 also OUT),
 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance also those in
@@ -117,13 +118,24 @@ ending exactly at [v, r], an R that is not a valid rule set (every
 rule is [n,s,d,a,b,c,path] with n in 0..MAX_COST and
 0 <= a <= b <= 65535; s/d/path validation matches the policy
 subcommand), a load or rollback whose BASE differs from the current v
-or whose v is already MAX_COST, a rollback T absent from h, and the
+or whose v is already MAX_COST, a rollback T absent from h, an op 3
+audit T that is not a non-boolean integer in 0..MAX_COST or is absent
+from h, an op 4 OUT that is not a non-empty path or that names FILE or
+STATE, and the
 policy-subcommand S/D/P/C checks on a query; the legacy {"v","r"}
 STATE is accepted as h=[[v,r]] and is read-only, never rewritten by
 an idempotent op and migrated to v,r,h only by a successful op 0/2
-write; on commit STATE is atomically replaced with key order v,r,h in
+write; op 3 is a read-only history audit and op 4 exports the
+normalized {v,r,h} history to OUT without modifying STATE or FILE (a
+legacy STATE is exported with h=[[v,r]]); on commit STATE is
+atomically replaced with key order v,r,h in
 the same compact format and a write failure leaves its bytes
-untouched and removes only the staging temp file.
+untouched and removes only the staging temp file; an op 4 export
+writes OUT via the same exclusive-sibling-staging atomic replace in
+the canonical compact UTF-8 form with one trailing LF (directly
+usable as a STATE), skips the replace when OUT already holds those
+exact bytes, and on failure leaves STATE and OUT's bytes untouched and
+removes only its own staging temp file.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -3221,6 +3233,104 @@ def _validate_policytx_state(data, node_set, pair_set):
     return v, rules, history
 
 
+def _policytx_export_object(v, rules, history):
+    # Normalized history export (policytx op 4): an object with key
+    # order v, r, h; h keeps the version and rule-set order, and a
+    # legacy state is exported as h=[[v, r]]. Rules are copied back to
+    # plain 7-item arrays in array order.
+    return {"v": v, "r": [list(rule) for rule in rules],
+            "h": [[hv, [list(rule) for rule in hr]]
+                  for hv, hr in history]}
+
+
+def _write_distinct_atomic(dst_path, blocked_paths, payload):
+    # Atomically write payload to dst_path via an exclusively created
+    # sibling temp file, but only when dst does not already hold those
+    # bytes (same bytes rewrite nothing, status 1). Every path in
+    # blocked_paths must name a different file than dst_path (both as
+    # normalized strings and, when both exist on disk, by
+    # os.path.samefile); dst_path itself must be a non-empty path. A
+    # blocked/empty path is code 5; any existing dst read problem other
+    # than absence and any write problem is code 3. The blocked paths
+    # were themselves read successfully earlier, so they exist. On
+    # failure the destination keeps its bytes and only this call's temp
+    # file is removed.
+    if type(dst_path) is not str or dst_path == "":
+        fail(5)
+    if "\x00" in dst_path:
+        # A path with an embedded NUL can never name a file.
+        fail(5)
+    try:
+        dst_norm = os.path.abspath(dst_path)
+    except (OSError, ValueError):
+        fail(5)
+    blocked_norms = []
+    for blocked in blocked_paths:
+        if type(blocked) is not str or blocked == "" or "\x00" in blocked:
+            fail(5)
+        try:
+            blocked_norm = os.path.abspath(blocked)
+        except (OSError, ValueError):
+            fail(5)
+        if blocked_norm == dst_norm:
+            fail(5)
+        blocked_norms.append(blocked_norm)
+    try:
+        with open(dst_norm, "rb") as f:
+            existing = f.read()
+    except FileNotFoundError:
+        existing = None
+    except OSError:
+        fail(3)
+    for blocked_norm in blocked_norms:
+        try:
+            if os.path.samefile(dst_norm, blocked_norm):
+                fail(5)
+        except FileNotFoundError:
+            # dst absent (blocked exists): distinct files.
+            pass
+        except OSError:
+            fail(3)
+    if existing == payload:
+        return 1
+    directory = os.path.dirname(dst_norm)
+    suffix = 0
+    while True:
+        tmp_path = os.path.join(directory,
+                                os.path.basename(dst_norm)
+                                + ".tmp." + str(suffix))
+        try:
+            fd = os.open(tmp_path,
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            suffix += 1
+            continue
+        except OSError:
+            fail(3)
+        break
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, dst_norm)
+        try:
+            dir_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    except OSError:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        fail(3)
+    return 0
+
+
 def _state_payload(state):
     # Canonical on-disk form: top-level key order v,p,h, compact
     # separators, non-ASCII UTF-8, integers in decimal, one trailing LF.
@@ -4576,6 +4686,53 @@ def main():
             result = {"op": 2, "status": status, "version": version,
                       "rules": [list(rule) for rule in emit_rules],
                       "result": [target, v, version]}
+        elif kind == 3:
+            # [3, T]: read-only history audit. T is a non-boolean
+            # integer in 0..MAX_COST that must be a version recorded in
+            # h; a legacy {v, r} STATE's history only contains v, so it
+            # can only audit that version. Nothing is written; result
+            # is [T, target rule set].
+            if len(op) != 2:
+                fail(5)
+            target = op[1]
+            if type(target) is not int or type(target) is bool \
+                    or not 0 <= target <= MAX_COST:
+                fail(5)
+            v, rules, history = _validate_policytx_state(
+                raw_state, node_set, pair_set)
+            target_rules = None
+            for hv, hr in history:
+                if hv == target:
+                    target_rules = hr
+                    break
+            if target_rules is None:
+                fail(5)
+            result = {"op": 3, "status": 2, "version": v,
+                      "rules": [list(rule) for rule in rules],
+                      "result": [target,
+                                 [list(rule) for rule in target_rules]]}
+        elif kind == 4:
+            # [4, OUT]: export the normalized history to OUT. The export
+            # object has key order v, r, h with h keeping the version and
+            # rule-set order (a legacy {v, r} STATE is exported as
+            # h=[[v, r]]); OUT receives the canonical compact UTF-8 bytes
+            # with a single trailing LF and is directly usable as a
+            # policytx STATE. OUT must be a non-empty path distinct from
+            # FILE and STATE; identical bytes rewrite nothing (status 1),
+            # otherwise one atomic replace writes them (status 0). STATE
+            # and FILE are never modified.
+            if len(op) != 2 or type(op[1]) is not str or len(op[1]) == 0:
+                fail(5)
+            out_path = op[1]
+            v, rules, history = _validate_policytx_state(
+                raw_state, node_set, pair_set)
+            export = _policytx_export_object(v, rules, history)
+            payload = _state_payload(export)
+            status = _write_distinct_atomic(
+                out_path, [file_path, state_path], payload)
+            result = {"op": 4, "status": status, "version": v,
+                      "rules": [list(rule) for rule in rules],
+                      "result": export}
         else:
             fail(5)
     elif argv[1] == "reserve":
