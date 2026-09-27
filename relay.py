@@ -118,12 +118,20 @@ rule is [n,s,d,a,b,c,path] with n in 0..MAX_COST and
 0 <= a <= b <= 65535; s/d/path validation matches the policy
 subcommand), a load or rollback whose BASE differs from the current v
 or whose v is already MAX_COST, a rollback T absent from h, and the
-policy-subcommand S/D/P/C checks on a query; the legacy {"v","r"}
+policy-subcommand S/D/P/C checks on a query; op 3 code 5 also covers
+an op 3 whose T is not a bounded non-boolean integer or is absent
+from h (the legacy STATE exposes only v there), and op 4 code 5 also
+covers an OUT that is not a non-empty path or names FILE or STATE;
+op 3 is read-only and returns [T, target rule set]; op 4 never
+changes STATE and writes the normalized {v, r, h} history (a legacy
+STATE exports h=[[v, r]]) to OUT in the canonical compact v,r,h
+bytes, status 1 when OUT already holds them byte-for-byte, so OUT is
+itself a usable policytx STATE; the legacy {"v","r"}
 STATE is accepted as h=[[v,r]] and is read-only, never rewritten by
-an idempotent op and migrated to v,r,h only by a successful op 0/2
-write; on commit STATE is atomically replaced with key order v,r,h in
-the same compact format and a write failure leaves its bytes
-untouched and removes only the staging temp file.
+an idempotent op and migrated to v,r,h on disk only by a successful
+op 0/2 write; on commit STATE is atomically replaced with key order
+v,r,h in the same compact format and a write failure leaves its bytes
+(and OUT's) untouched and removes only the staging temp file.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -3229,6 +3237,18 @@ def _state_payload(state):
     return text.encode("utf-8")
 
 
+def _same_path(a, b):
+    # True when two path strings name the same file. os.samefile
+    # resolves symlinks and equivalent spellings when both endpoints
+    # exist; the absolute-path fallback still catches the case where
+    # one side does not (e.g. an OUT that would be created) but the
+    # strings spell the same file.
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.abspath(a) == os.path.abspath(b)
+
+
 def _write_state_atomic(path, state):
     # Replace the state file atomically: serialize, then exclusively
     # create a unique sibling temp file with an incrementing suffix (a
@@ -4576,6 +4596,70 @@ def main():
             result = {"op": 2, "status": status, "version": version,
                       "rules": [list(rule) for rule in emit_rules],
                       "result": [target, v, version]}
+        elif kind == 3:
+            # [3, T]: read-only history audit. T is a non-boolean
+            # integer in 0..MAX_COST that must appear as a version in
+            # h; the legacy {v, r} STATE has only h=[[v, r]], so only
+            # v is auditable there. Nothing is written. result is
+            # [T, target rule set].
+            if len(op) != 2 or type(op[1]) is not int \
+                    or not 0 <= op[1] <= MAX_COST:
+                fail(5)
+            target = op[1]
+            v, rules, history = _validate_policytx_state(
+                raw_state, node_set, pair_set)
+            target_rules = None
+            for hv, hr in history:
+                if hv == target:
+                    target_rules = hr
+                    break
+            if target_rules is None:
+                fail(5)
+            result = {"op": 3, "status": 2, "version": v,
+                      "rules": [list(rule) for rule in rules],
+                      "result": [target,
+                                 [list(rule) for rule in target_rules]]}
+        elif kind == 4:
+            # [4, OUT]: export the normalized history {v, r, h} to OUT.
+            # h keeps the on-disk version/rule order; a legacy {v, r}
+            # STATE is exported as h=[[v, r]]. OUT is a non-empty path
+            # distinct from FILE and STATE, written atomically from an
+            # exclusive sibling staging file; identical bytes are not
+            # rewritten (status 1). STATE never changes. The exported
+            # bytes are exactly the compact, non-ASCII-unescaped UTF-8
+            # JSON of the object plus one LF, so OUT is directly usable
+            # as a policytx STATE.
+            if len(op) != 2 or type(op[1]) is not str or len(op[1]) == 0:
+                fail(5)
+            out_path = op[1]
+            if _same_path(out_path, file_path) \
+                    or _same_path(out_path, state_path):
+                fail(5)
+            v, rules, history = _validate_policytx_state(
+                raw_state, node_set, pair_set)
+            export = {
+                "v": v,
+                "r": [list(rule) for rule in rules],
+                "h": [[hv, [list(rule) for rule in hr]]
+                      for hv, hr in history],
+            }
+            payload = _state_payload(export)
+            try:
+                with open(out_path, "rb") as f:
+                    existing = f.read()
+            except FileNotFoundError:
+                existing = None
+            except OSError:
+                fail(3)
+            if existing == payload:
+                # OUT already holds the canonical bytes: do not write.
+                status = 1
+            else:
+                _write_state_atomic(out_path, export)
+                status = 0
+            result = {"op": 4, "status": status, "version": v,
+                      "rules": [list(rule) for rule in rules],
+                      "result": export}
         else:
             fail(5)
     elif argv[1] == "reserve":
