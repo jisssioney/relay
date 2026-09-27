@@ -27,13 +27,15 @@ Usage: python relay.py route FILE SOURCE
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
        python relay.py impair FILE S D DATA
+       python relay.py compound FILE S D W DATA
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE),
 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance also those in
 FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/audit
-those in DATA, for drill/multidrill/convstat/slosum those in
+those in DATA, for compound those in DATA or a walk-time overflow,
+for drill/multidrill/convstat/slosum those in
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
 those in OLD/NEW/EVENTS/DATA, for slogate those in
 CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA, for
@@ -2163,6 +2165,166 @@ def compute_impair(nodes, links, source, destination, items):
              if delivered else "0.000000"]
     return {"source": source, "destination": destination,
             "packets": packets, "stats": stats}
+
+
+def compute_compound(nodes, links, source, destination, wait, entries):
+    # Combined failure drill and impairment replay. The installed route
+    # starts as the lowest-cost path in the initial up-graph (every node
+    # starts up, links take their FILE state), ties going to the node
+    # sequence smallest in Unicode code point order (exactly the
+    # shortest_paths tie-break). Config entries apply atomically at their
+    # tick: node/link up-state settings drive the debounced
+    # recompute-and-install timer exactly like fault (a batch with at
+    # least one real topology change cancels the pending timer,
+    # recomputes the lowest-cost target, and arms an install at t+W when
+    # it differs from the installed route), while drop-modulus/jitter
+    # settings never flip states and never touch the timer — repeated
+    # identical settings of either kind are idempotent, and impairment
+    # settings never clear traversal counters. Packet entries route over
+    # the currently installed route when one exists, else status 2; the
+    # walk counts and times edge by edge like impair, stopping at the
+    # first edge whose positive k divides the fresh counter. At one tick
+    # all entries run in input order before a timer expiring on it.
+    up_links = [link for link in links if link["up"]]
+    cost_of, path_of = shortest_paths(nodes, up_links, source)
+    initial_path = path_of[destination]
+    installed = ((cost_of[destination], initial_path)
+                 if initial_path is not None else None)
+
+    node_up = {n: True for n in nodes}
+    link_up = {(link["from"], link["to"]): link["up"] for link in links}
+    latency_of = {(link["from"], link["to"]): link["latency"]
+                  for link in links}
+    k_of = {}
+    j_of = {}
+    count_of = {}
+    for link in links:
+        pair = (link["from"], link["to"])
+        k_of[pair] = 0
+        j_of[pair] = 0
+        count_of[pair] = 0
+
+    def recompute():
+        # Lowest-cost path over up nodes and up links joining them.
+        if not (node_up[source] and node_up[destination]):
+            return None
+        live_nodes = [n for n in nodes if node_up[n]]
+        live_links = [{"from": link["from"], "to": link["to"],
+                       "cost": link["cost"], "up": True}
+                      for link in links
+                      if link_up[(link["from"], link["to"])]
+                      and node_up[link["from"]] and node_up[link["to"]]]
+        live_cost_of, live_path_of = shortest_paths(live_nodes,
+                                                    live_links, source)
+        path = live_path_of[destination]
+        return ((live_cost_of[destination], path)
+                if path is not None else None)
+
+    def route_of(target):
+        return [target[0], target[1]] if target is not None else [None, []]
+
+    timer_start = None
+    timer_at = None
+    timer_target = None
+    events = []
+    packets = []
+    delivered = 0
+    lost = 0
+    unreachable = 0
+    reroutes = 0
+    i = 0
+    n = len(entries)
+    while i < n or timer_at is not None:
+        wakes = []
+        if i < n:
+            wakes.append(entries[i][0])
+        if timer_at is not None:
+            wakes.append(timer_at)
+        now = min(wakes)
+        # All entries at this tick run in input order before a timer
+        # expiring on it; a timer due before the next entry's tick
+        # expires first.
+        while i < n and entries[i][0] == now:
+            _, kind, payload = entries[i]
+            i += 1
+            if kind == 0:
+                topo_real = 0
+                impair_real = 0
+                for change in payload:
+                    if change[0] == 0:
+                        _, node, up = change
+                        if node_up[node] != up:
+                            node_up[node] = up
+                            topo_real += 1
+                    elif change[0] == 1:
+                        _, u, v, up = change
+                        pair = (u, v)
+                        if link_up[pair] != up:
+                            link_up[pair] = up
+                            topo_real += 1
+                    else:
+                        _, u, v, kk, jj = change
+                        pair = (u, v)
+                        if k_of[pair] != kk or j_of[pair] != jj:
+                            k_of[pair] = kk
+                            j_of[pair] = jj
+                            impair_real += 1
+                if topo_real:
+                    # Cancel the old timer and re-target on the new graph;
+                    # impairment-only settings leave the timer alone.
+                    timer_start = timer_at = timer_target = None
+                    target = recompute()
+                    if target != installed:
+                        # Arm the install timer at t+W.
+                        timer_start = now
+                        timer_at = now + wait
+                        timer_target = target
+                events.append([now, 0, topo_real, impair_real,
+                               route_of(installed),
+                               route_of(timer_target if timer_at is not None
+                                        else installed),
+                               timer_at])
+            else:
+                pid = payload
+                if installed is None:
+                    unreachable += 1
+                    packets.append([pid, now, 2, None, None, []])
+                    continue
+                path = installed[1]
+                delay = 0
+                status = 0
+                used = path
+                for h in range(len(path) - 1):
+                    pair = (path[h], path[h + 1])
+                    count_of[pair] += 1
+                    delay += latency_of[pair] + j_of[pair]
+                    if now + delay > MAX_TIME:
+                        fail(5)
+                    kk = k_of[pair]
+                    if kk and count_of[pair] % kk == 0:
+                        # The packet is lost on this edge; later edges are
+                        # neither counted nor timed.
+                        status = 1
+                        used = path[:h + 2]
+                        break
+                if status == 0:
+                    delivered += 1
+                else:
+                    lost += 1
+                packets.append([pid, now, status, now + delay, delay, used])
+        if timer_at is not None and timer_at == now:
+            old = installed
+            installed = timer_target
+            events.append([now, 1, route_of(old), route_of(installed),
+                           now - timer_start])
+            reroutes += 1
+            timer_start = timer_at = timer_target = None
+
+    total = delivered + lost
+    stats = [delivered, lost, unreachable, reroutes,
+             _format_peak(lost, total) if total else "0.000000"]
+    return {"s": source, "d": destination,
+            "e": events, "p": packets, "x": stats}
 
 
 def _parse_drill_events(raw_events, up_pairs, node_set, a, b):
@@ -4457,6 +4619,119 @@ def main():
                 seen_ids.add(pid)
                 items.append((1, t, pid))
         result = compute_impair(nodes, links, source, destination, items)
+    elif argv[1] == "compound":
+        if len(argv) != 7:
+            fail(2)
+        file_path, source, destination = argv[2], argv[3], argv[4]
+        wait_text, data_text = argv[5], argv[6]
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        if (source not in node_set or destination not in node_set
+                or source == destination):
+            fail(5)
+        wait = _bounded_int_arg(wait_text)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list) or not data:
+            fail(5)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        latency_of = {(link["from"], link["to"]): link["latency"]
+                      for link in links}
+        entries = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) < 2:
+                fail(5)
+            t = item[0]
+            kind = item[1]
+            if type(t) is not int or not 0 <= t <= MAX_COST:
+                fail(5)
+            if previous_time is not None and t < previous_time:
+                fail(5)
+            previous_time = t
+            if type(kind) is not int or kind not in (0, 1):
+                fail(5)
+            if kind == 0:
+                if len(item) != 3:
+                    fail(5)
+                changes = item[2]
+                if not isinstance(changes, list) or not changes:
+                    fail(5)
+                # Within one batch no node and no directed edge object
+                # may appear twice, across the three change kinds.
+                seen_nodes = set()
+                seen_pairs = set()
+                batch = []
+                for change in changes:
+                    if not isinstance(change, list) \
+                            or len(change) not in (3, 4, 5):
+                        fail(5)
+                    ckind = change[0]
+                    if type(ckind) is not int or ckind not in (0, 1, 2):
+                        fail(5)
+                    if ckind == 0:
+                        if len(change) != 3:
+                            fail(5)
+                        _, node, up = change
+                        if type(node) is not str or node not in node_set:
+                            fail(5)
+                        if type(up) is not bool:
+                            fail(5)
+                        if node in seen_nodes:
+                            fail(5)
+                        seen_nodes.add(node)
+                        batch.append((0, node, up))
+                    elif ckind == 1:
+                        if len(change) != 4:
+                            fail(5)
+                        _, u, v, up = change
+                        if (type(u) is not str or type(v) is not str
+                                or (u, v) not in pair_set):
+                            fail(5)
+                        if type(up) is not bool:
+                            fail(5)
+                        if (u, v) in seen_pairs:
+                            fail(5)
+                        seen_pairs.add((u, v))
+                        batch.append((1, u, v, up))
+                    else:
+                        if len(change) != 5:
+                            fail(5)
+                        _, u, v, kk, jj = change
+                        if (type(u) is not str or type(v) is not str
+                                or (u, v) not in pair_set):
+                            fail(5)
+                        if (u, v) in seen_pairs:
+                            fail(5)
+                        seen_pairs.add((u, v))
+                        if type(kk) is not int or not 0 <= kk <= MAX_COST:
+                            fail(5)
+                        if (type(jj) is not int
+                                or not 0 <= latency_of[(u, v)] + jj
+                                <= MAX_COST):
+                            fail(5)
+                        batch.append((2, u, v, kk, jj))
+                entries.append((t, 0, batch))
+            else:
+                if len(item) != 3:
+                    fail(5)
+                _, _, pid = item
+                if type(pid) is not str or not 1 <= len(pid) <= 64:
+                    fail(5)
+                try:
+                    pid.encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(5)
+                if pid in seen_ids:
+                    fail(5)
+                seen_ids.add(pid)
+                entries.append((t, 1, pid))
+        result = compute_compound(nodes, links, source, destination,
+                                  wait, entries)
     elif argv[1] == "hotload":
         if len(argv) != 11:
             fail(2)
