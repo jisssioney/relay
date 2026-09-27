@@ -111,14 +111,17 @@ or DATA, and an op 2 leaf delete whose target still has child branches
 (op 3 deletes the target and every descendant instead; an absent
 delete target is idempotent and rewrites nothing).
 For policytx code 5 also covers an invalid OP shape, a STATE whose v/r
-structure, key order, or version range is invalid, an R that is not a
-valid rule set (every rule is [n,s,d,a,b,c,path] with n in 0..MAX_COST
+structure, key order, version range, history, or last-entry match is
+invalid, an R that is not a valid rule set (every rule is
+[n,s,d,a,b,c,path] with n in 0..MAX_COST
 and 0 <= a <= b <= 65535; s/d/path validation matches the policy
-subcommand), a load whose BASE differs from the current v or whose v is
-already MAX_COST, and the policy-subcommand S/D/P/C checks on a query;
-on load STATE is atomically replaced with the same format STATE uses and
-a write failure leaves its bytes untouched and removes only the staging
-temp file.
+subcommand), a load/rollback whose BASE differs from the current v or
+whose v is already MAX_COST, a rollback T absent from h, and the
+policy-subcommand S/D/P/C checks on a query;
+on a committing write STATE is atomically replaced with key order
+v,r,h (a legacy v,r STATE, read-only and never migrated on its own,
+gains h on the next write) and a write failure leaves its bytes
+untouched and removes only the staging temp file.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -3168,17 +3171,59 @@ def _validate_policytx_rules(rule_items, node_set, pair_set):
 
 
 def _validate_policytx_state(data, node_set, pair_set):
-    # A policytx STATE is {"v": v, "r": r} with exactly those keys in
-    # that order: v is the current version in the priority n range
-    # 0..MAX_COST, and r the current rule set (see
-    # _validate_policytx_rules). Returns the normalized (v, rules).
-    if not isinstance(data, dict) or list(data.keys()) != ["v", "r"]:
+    # A policytx STATE is {"v": v, "r": r} (legacy: treated as a history
+    # of just [[v, r]], read-only and migrated to h only on a write) or
+    # {"v": v, "r": r, "h": h}: v is the current version in
+    # 0..MAX_COST, r the current rule set (see _validate_policytx_rules),
+    # and h a non-empty array of [version, rules] pairs whose versions
+    # are consecutive (a suffix of 0..v) and whose last entry is exactly
+    # [v, r]. Returns normalized (v, rules, history, has_h); history is
+    # a list of (version, rules) tuples in array order.
+    if not isinstance(data, dict):
+        fail(5)
+    keys = list(data.keys())
+    if keys == ["v", "r"]:
+        has_h = False
+    elif keys == ["v", "r", "h"]:
+        has_h = True
+    else:
         fail(5)
     v = data["v"]
     if type(v) is not int or not 0 <= v <= MAX_COST:
         fail(5)
     rules = _validate_policytx_rules(data["r"], node_set, pair_set)
-    return v, rules
+    if not has_h:
+        return v, rules, [(v, rules)], False
+    raw_history = data["h"]
+    if not isinstance(raw_history, list) or not raw_history:
+        fail(5)
+    first_version = v - len(raw_history) + 1
+    if first_version < 0:
+        fail(5)
+    history = []
+    expected_version = first_version
+    for entry in raw_history:
+        if not isinstance(entry, list) or len(entry) != 2:
+            fail(5)
+        hv, hr = entry
+        if type(hv) is not int or hv != expected_version:
+            fail(5)
+        history_rules = _validate_policytx_rules(hr, node_set, pair_set)
+        history.append((hv, history_rules))
+        expected_version += 1
+    if history[-1][0] != v or history[-1][1] != rules:
+        fail(5)
+    return v, rules, history, True
+
+
+def _policytx_state(v, rules, history):
+    # Canonical written form: top-level key order v,r,h, each history
+    # entry [version, rules]. Serialization (compact UTF-8 plus one LF)
+    # is handled by _state_payload via _write_state_atomic.
+    return {"v": v,
+            "r": [list(rule) for rule in rules],
+            "h": [[hv, [list(rule) for rule in hr]]
+                  for hv, hr in history]}
 
 
 def _state_payload(state):
@@ -4427,12 +4472,13 @@ def main():
             # BASE. R equal to the current rules is idempotent (no base
             # check, no write); otherwise BASE must equal the current v
             # and v must be below MAX_COST, and STATE atomically becomes
-            # {v+1, R}. A failed write leaves STATE's bytes untouched.
+            # {v+1, R} with [v+1, R] appended to h (history is never
+            # truncated). A failed write leaves STATE's bytes untouched.
             if len(op) != 3 or type(op[1]) is not int:
                 fail(5)
             base = op[1]
-            v, rules = _validate_policytx_state(raw_state, node_set,
-                                                pair_set)
+            v, rules, history, _has_h = _validate_policytx_state(
+                raw_state, node_set, pair_set)
             new_rules = _validate_policytx_rules(op[2], node_set,
                                                  pair_set)
             if not 0 <= base <= MAX_COST:
@@ -4445,9 +4491,10 @@ def main():
             else:
                 if base != v or v >= MAX_COST:
                     fail(5)
-                new_state = {"v": v + 1, "r": [list(rule) for rule
-                                               in new_rules]}
-                _write_state_atomic(state_path, new_state)
+                history = history + [(v + 1, new_rules)]
+                _write_state_atomic(
+                    state_path,
+                    _policytx_state(v + 1, new_rules, history))
                 status = 0
                 version = v + 1
             result = {"op": 0, "status": status, "version": version,
@@ -4473,13 +4520,56 @@ def main():
                 klass.encode("utf-8")
             except UnicodeEncodeError:
                 fail(5)
-            v, rules = _validate_policytx_state(raw_state, node_set,
-                                                pair_set)
+            v, rules, _history, _has_h = _validate_policytx_state(
+                raw_state, node_set, pair_set)
             query = compute_policytx(nodes, links, source, destination,
                                      port, klass, rules)
             result = {"op": 1, "status": 2, "version": v,
                       "rules": [list(rule) for rule in rules],
                       "result": query}
+        elif kind == 2:
+            # [2, BASE, T]: rollback to the rule set of version T, which
+            # must be present in h. Target rules equal to the current
+            # ones are idempotent (no BASE check, no write); otherwise
+            # BASE must equal the current v and v must be below
+            # MAX_COST, and STATE atomically becomes {v+1, target rules}
+            # with [v+1, target rules] appended to h without truncating
+            # the history. result is [T, old v, new v].
+            if len(op) != 3 or type(op[1]) is not int:
+                fail(5)
+            base = op[1]
+            target = op[2]
+            if type(target) is not int or not 0 <= target <= MAX_COST:
+                fail(5)
+            v, rules, history, _has_h = _validate_policytx_state(
+                raw_state, node_set, pair_set)
+            if not 0 <= base <= MAX_COST:
+                fail(5)
+            target_rules = None
+            for hv, hr in history:
+                if hv == target:
+                    target_rules = hr
+                    break
+            if target_rules is None:
+                fail(5)
+            old_v = v
+            if target_rules == rules:
+                # Rolling back to the rule set already current is
+                # idempotent: BASE is ignored, STATE is not rewritten.
+                status = 1
+                version = v
+            else:
+                if base != v or v >= MAX_COST:
+                    fail(5)
+                history = history + [(v + 1, target_rules)]
+                _write_state_atomic(
+                    state_path,
+                    _policytx_state(v + 1, target_rules, history))
+                status = 0
+                version = v + 1
+            result = {"op": 2, "status": status, "version": version,
+                      "rules": [list(rule) for rule in target_rules],
+                      "result": [target, old_v, version]}
         else:
             fail(5)
     elif argv[1] == "reserve":
