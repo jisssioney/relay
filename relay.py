@@ -26,13 +26,14 @@ Usage: python relay.py route FILE SOURCE
        python relay.py config PACK OP
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
+       python relay.py fault FILE S D W DATA
        python relay.py impair FILE S D DATA
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE),
 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance also those in
-FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/audit
+FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/fault/impair/audit
 those in DATA, for drill/multidrill/convstat/slosum those in
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
 those in OLD/NEW/EVENTS/DATA, for slogate those in
@@ -1985,6 +1986,110 @@ def compute_lfail(nodes, links, source, destination, wait, items):
             else [None, []],
             "s": switches,
             "p": packets}
+
+
+def compute_fault(nodes, links, source, destination, wait, batches):
+    # Node/link-failure drill with a debounced recompute-and-install
+    # delay. Nodes start up and every link takes FILE's up flag; each
+    # batch flips its objects atomically (repeated setting is idempotent
+    # and never moves a timer). The installed route starts as lfail's
+    # primary: the lowest-cost path in the initial up-graph, ties going
+    # to the node sequence smallest in Unicode code point order (exactly
+    # the shortest_paths tie-break). A batch with at least one real
+    # change cancels any pending timer and recomputes the lowest-cost
+    # target over the current graph (up nodes and up links whose
+    # endpoints are both up, so a down endpoint means no route at all);
+    # a target differing from the installed route is installed
+    # atomically at t+W, otherwise no timer runs. A batch at a tick runs
+    # before a timer due on it, and the clock keeps advancing after the
+    # last batch to fire a pending timer.
+    up_links = [link for link in links if link["up"]]
+    cost_of, path_of = shortest_paths(nodes, up_links, source)
+    initial = ((cost_of[destination], path_of[destination])
+               if path_of[destination] is not None else None)
+    installed = initial
+
+    node_up = {n: True for n in nodes}
+    link_up = {(link["from"], link["to"]): link["up"] for link in links}
+
+    def lowest_target():
+        if not (node_up[source] and node_up[destination]):
+            return None
+        live_nodes = [n for n in nodes if node_up[n]]
+        live_links = [link for link in links
+                      if link_up[(link["from"], link["to"])]
+                      and node_up[link["from"]] and node_up[link["to"]]]
+        cost_of, path_of = shortest_paths(live_nodes, live_links, source)
+        if path_of[destination] is None:
+            return None
+        return (cost_of[destination], path_of[destination])
+
+    def route(pair):
+        return [pair[0], pair[1]] if pair is not None else [None, []]
+
+    timeline = []
+    done = 0
+    timer_start = None
+    timer_at = None
+    timer_target = None
+    i = 0
+    n = len(batches)
+    while i < n or timer_at is not None:
+        wakes = []
+        if i < n:
+            wakes.append(batches[i][0])
+        if timer_at is not None:
+            wakes.append(timer_at)
+        now = min(wakes)
+        # A batch at this tick runs before a timer completing on it; a
+        # timer due before the next batch's tick completes first.
+        if i < n and batches[i][0] == now:
+            _, changes = batches[i]
+            i += 1
+            old = installed
+            real = 0
+            for change in changes:
+                if change[0] == 0:
+                    _, node, up = change
+                    if node_up[node] != up:
+                        node_up[node] = up
+                        real += 1
+                else:
+                    _, u, v, up = change
+                    pair = (u, v)
+                    if link_up[pair] != up:
+                        link_up[pair] = up
+                        real += 1
+            if real:
+                # Every real change cancels the pending timer and
+                # recomputes the target over the current graph.
+                timer_start = timer_at = timer_target = None
+                target = lowest_target()
+                if target != installed:
+                    # (Re)arm the install timer at t+W.
+                    timer_start = now
+                    timer_at = now + wait
+                    timer_target = target
+                    due = timer_at
+                else:
+                    # The installed route is already the target.
+                    due = None
+            else:
+                # An idempotent batch neither recomputes nor times.
+                target = installed
+                due = None
+            timeline.append([now, 0, real, route(old), route(target),
+                             due])
+        if timer_at is not None and timer_at == now:
+            old = installed
+            installed = timer_target
+            timeline.append([now, 1, route(old), route(installed),
+                             now - timer_start])
+            done += 1
+            timer_start = timer_at = timer_target = None
+
+    return {"s": source, "d": destination, "i": route(initial),
+            "e": timeline, "r": done}
 
 
 def compute_impair(nodes, links, source, destination, items):
@@ -4223,6 +4328,72 @@ def main():
                 items.append((t, pid))
         result = compute_lfail(nodes, links, source, destination,
                                wait, items)
+    elif argv[1] == "fault":
+        if len(argv) != 7:
+            fail(2)
+        file_path, source, destination = argv[2], argv[3], argv[4]
+        wait_text, data_text = argv[5], argv[6]
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        if (source not in node_set or destination not in node_set
+                or source == destination):
+            fail(5)
+        wait = _bounded_int_arg(wait_text)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list) or not data:
+            fail(5)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        batches = []
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 2:
+                fail(5)
+            t, changes = item
+            if type(t) is not int or not 0 <= t <= MAX_COST:
+                fail(5)
+            if previous_time is not None and t <= previous_time:
+                fail(5)
+            previous_time = t
+            if not isinstance(changes, list) or not changes:
+                fail(5)
+            seen_nodes = set()
+            seen_pairs = set()
+            batch = []
+            for change in changes:
+                if not isinstance(change, list) or len(change) not in (3, 4):
+                    fail(5)
+                kind = change[0]
+                if type(kind) is not int or kind not in (0, 1):
+                    fail(5)
+                if kind == 0:
+                    if len(change) != 3:
+                        fail(5)
+                    _, node, up = change
+                    if type(node) is not str or node not in node_set:
+                        fail(5)
+                    if node in seen_nodes:
+                        fail(5)
+                    seen_nodes.add(node)
+                else:
+                    if len(change) != 4:
+                        fail(5)
+                    _, u, v, up = change
+                    if (type(u) is not str or type(v) is not str
+                            or (u, v) not in pair_set):
+                        fail(5)
+                    if (u, v) in seen_pairs:
+                        fail(5)
+                    seen_pairs.add((u, v))
+                if type(up) is not bool:
+                    fail(5)
+                batch.append(change)
+            batches.append((t, batch))
+        result = compute_fault(nodes, links, source, destination,
+                               wait, batches)
     elif argv[1] == "impair":
         if len(argv) != 6:
             fail(2)
