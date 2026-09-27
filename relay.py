@@ -29,14 +29,15 @@ Usage: python relay.py route FILE SOURCE
        python relay.py impair FILE S D DATA
        python relay.py compound FILE S D W DATA
        python relay.py compoundcp FILE S D W AT M STATE DATA
+       python relay.py branch FILE S D W DB OP
 
-Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE),
-4 JSON syntax
+Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE, STATE, or
+DB), 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance also those in
 FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/
 compound/audit those in DATA, for compoundcp those in STATE/DATA, for
-drill/multidrill/convstat/slosum
+branch those in DB/OP, for drill/multidrill/convstat/slosum
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
 those in OLD/NEW/EVENTS/DATA, for slogate those in
 CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA, for
@@ -94,9 +95,20 @@ segment-chain and per-item checks over the whole G; for config op 13
 code 3 also covers a C read/write error and code 4 a C with invalid
 UTF-8/JSON syntax, duplicate keys, or non-finite numbers; for
 compoundcp code 3 also covers a STATE read/write error and code 5
-also covers a STATE whose key order, content, or h digest is invalid,
-a DATA item t on the wrong side of AT, and a packet id already present
-in the checkpoint.
+also covers a STATE whose key order, content, or h digest is invalid
+(including per-item e/p checks: shapes, kinds, r-style routes and
+used-paths, times bounded below AT and non-decreasing, unique packet
+ids, and c counting the p statuses and the kind-1 e entries), a DATA
+item t on the wrong side of AT, and a packet id already present in the
+checkpoint; for branch code 3 also covers a DB read/write error and
+code 5 also covers an invalid OP shape, name, parent, AT, or DATA
+interval, a DB that is not an insertion-ordered object of
+[name,parent,data,state] records with null-or-earlier parents and
+valid compoundcp states, a stored state or parent chain that
+disagrees with the replay, a duplicate name whose parent/AT/DATA
+differ, and a packet id already present on the chain; branch op 0
+prints the updated DB (written atomically, skipped when unchanged)
+and op 1 is read-only and prints the merged compound run.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -2545,11 +2557,13 @@ def _check_cp_route(route, node_set, pair_set, cost_of_pair, source,
 
 
 def _validate_compoundcp_state(data, file_bytes, nodes, links, node_set,
-                               source, destination, wait, at):
+                               source, destination, wait, at=None):
     # Validate a compoundcp checkpoint and return the engine state tuple
     # for _compound_run. The key order and the h digest over FILE's raw
     # bytes plus the compact UTF-8 JSON of [b,n,l,r,g,e,p,c] are checked
-    # first (a mismatch is code 5), then the content itself.
+    # first (a mismatch is code 5), then the content itself. With at
+    # None the checkpoint's own b[3] supplies AT (branch records carry
+    # their AT inside the state); otherwise b[3] must equal it.
     keys = ["b", "n", "l", "r", "g", "e", "p", "c", "h"]
     if not isinstance(data, dict) or list(data.keys()) != keys:
         fail(5)
@@ -2574,8 +2588,10 @@ def _validate_compoundcp_state(data, file_bytes, nodes, links, node_set,
     if (not isinstance(b, list) or len(b) != 4
             or b[0] != source or b[1] != destination
             or type(b[2]) is not int or b[2] != wait
-            or type(b[3]) is not int or b[3] != at):
+            or type(b[3]) is not int or not 0 <= b[3] <= MAX_COST
+            or (at is not None and b[3] != at)):
         fail(5)
+    at = b[3]
     if not isinstance(n_arr, list) or len(n_arr) != len(nodes):
         fail(5)
     for up in n_arr:
@@ -2615,18 +2631,109 @@ def _validate_compoundcp_state(data, file_bytes, nodes, links, node_set,
                         source, destination)
     if not isinstance(e, list) or not isinstance(p, list):
         fail(5)
+    # Every event/packet carries a time strictly before AT (a wake at
+    # or after AT belongs to the resumed run), times are non-decreasing
+    # within each list, and packet ids are unique.
+    reroutes = 0
+    previous_time = None
     for entry in e:
-        if not isinstance(entry, list):
+        if not isinstance(entry, list) or len(entry) not in (5, 7):
             fail(5)
+        t = entry[0]
+        kind = entry[1]
+        if type(t) is not int or not 0 <= t < at:
+            fail(5)
+        if previous_time is not None and t < previous_time:
+            fail(5)
+        previous_time = t
+        if type(kind) is not int or kind not in (0, 1):
+            fail(5)
+        if kind == 0:
+            if len(entry) != 7:
+                fail(5)
+            _, _, real_topo, real_impair, inst, pend, timer = entry
+            if (type(real_topo) is not int
+                    or not 0 <= real_topo <= MAX_COST):
+                fail(5)
+            if (type(real_impair) is not int
+                    or not 0 <= real_impair <= MAX_COST):
+                fail(5)
+            _check_cp_route(inst, node_set, pair_set, cost_of_pair,
+                            source, destination)
+            _check_cp_route(pend, node_set, pair_set, cost_of_pair,
+                            source, destination)
+            if timer is not None and (type(timer) is not int
+                                      or not 0 <= timer <= MAX_TIME):
+                fail(5)
+        else:
+            if len(entry) != 5:
+                fail(5)
+            _, _, old, new, duration = entry
+            _check_cp_route(old, node_set, pair_set, cost_of_pair,
+                            source, destination)
+            _check_cp_route(new, node_set, pair_set, cost_of_pair,
+                            source, destination)
+            if (type(duration) is not int
+                    or not 0 <= duration <= MAX_TIME):
+                fail(5)
+            reroutes += 1
+    status_of = [0, 0, 0]
+    previous_time = None
+    seen_ids = set()
     for entry in p:
-        if (not isinstance(entry, list) or len(entry) != 6
-                or type(entry[0]) is not str):
+        if not isinstance(entry, list) or len(entry) != 6:
             fail(5)
+        pid, t, status, arrive, delay, used = entry
+        if type(pid) is not str or not 1 <= len(pid) <= 64:
+            fail(5)
+        try:
+            pid.encode("utf-8")
+        except UnicodeEncodeError:
+            fail(5)
+        if pid in seen_ids:
+            fail(5)
+        seen_ids.add(pid)
+        if type(t) is not int or not 0 <= t < at:
+            fail(5)
+        if previous_time is not None and t < previous_time:
+            fail(5)
+        previous_time = t
+        if type(status) is not int or status not in (0, 1, 2):
+            fail(5)
+        if status == 2:
+            if arrive is not None or delay is not None or used != []:
+                fail(5)
+        else:
+            if (type(arrive) is not int
+                    or not 0 <= arrive <= MAX_TIME):
+                fail(5)
+            if type(delay) is not int or not 0 <= delay <= MAX_TIME:
+                fail(5)
+            if arrive != t + delay:
+                fail(5)
+            if (not isinstance(used, list) or len(used) < 2
+                    or used[0] != source):
+                fail(5)
+            for node in used:
+                if type(node) is not str or node not in node_set:
+                    fail(5)
+            if len(set(used)) != len(used):
+                fail(5)
+            for x, y in zip(used, used[1:]):
+                if (x, y) not in pair_set:
+                    fail(5)
+            if status == 0 and used[-1] != destination:
+                fail(5)
+        status_of[status] += 1
     if not isinstance(c, list) or len(c) != 4:
         fail(5)
     for x in c:
         if type(x) is not int or not 0 <= x <= MAX_TIME:
             fail(5)
+    # c counts the packets by status and the reroute (kind 1) events.
+    if (c[0] != status_of[0] or c[1] != status_of[1]
+            or c[2] != status_of[2] or c[3] != reroutes):
+        fail(5)
 
     installed = None if r[0] is None else (r[0], r[1])
     node_up = dict(zip(nodes, n_arr))
@@ -2650,6 +2757,117 @@ def _validate_compoundcp_state(data, file_bytes, nodes, links, node_set,
     counters = (c[0], c[1], c[2], c[3])
     return (installed, node_up, link_up, n_of, j_of, count_of,
             timer_start, timer_at, timer_target, e, p, counters)
+
+
+def _valid_name(value):
+    # A branch record name follows the packet-id rule: a string of 1 to
+    # 64 characters encodable as UTF-8.
+    if type(value) is not str or not 1 <= len(value) <= 64:
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _load_db(path):
+    # Read and strictly decode the branch DB. A missing file is an
+    # empty database; other read/UTF-8 problems are code 3 and JSON
+    # syntax errors, duplicate keys, or non-finite numbers are code 4.
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        fail(3)
+    except UnicodeDecodeError:
+        fail(4)
+    try:
+        return json.loads(text, parse_constant=_reject_constant,
+                          parse_float=_finite_float,
+                          object_pairs_hook=_object_no_dup)
+    except (ValueError, RecursionError):
+        fail(4)
+
+
+def _validate_branch_db(db, file_bytes, nodes, links, node_set, source,
+                        destination, wait):
+    # Structurally validate the branch DB: a JSON object mapping each
+    # record name to [name, parent, data, state], where name echoes the
+    # key, parent is null (a root) or an earlier key in insertion order
+    # (which also rules out cycles), data is the record's DATA array,
+    # and state is a valid compoundcp checkpoint for this invocation's
+    # FILE/S/D/W whose b[3] carries the record's AT. Parent-chain
+    # replay consistency is checked separately by _replay_branch, only
+    # for the chain the operation touches.
+    if not isinstance(db, dict):
+        fail(5)
+    entries = {}
+    for key, value in db.items():
+        if not _valid_name(key):
+            fail(5)
+        if not isinstance(value, list) or len(value) != 4:
+            fail(5)
+        name, parent, data, state = value
+        if name != key:
+            fail(5)
+        if parent is not None and (type(parent) is not str
+                                   or parent not in entries):
+            fail(5)
+        if not isinstance(data, list):
+            fail(5)
+        _validate_compoundcp_state(state, file_bytes, nodes, links,
+                                   node_set, source, destination, wait)
+        # A child's clock never runs backwards: its AT is at least the
+        # parent record's AT (its DATA occupies [parent AT, own AT)).
+        if parent is not None and state["b"][3] < entries[parent][3]["b"][3]:
+            fail(5)
+        entries[key] = value
+    return entries
+
+
+def _branch_chain(entries, name):
+    # The record names from the root down to name, following parents.
+    # Load-time validation guarantees every parent is an earlier key,
+    # so the walk always terminates at a root.
+    chain = []
+    while name is not None:
+        chain.append(name)
+        name = entries[name][1]
+    chain.reverse()
+    return chain
+
+
+def _replay_branch(entries, chain, file_bytes, nodes, links, node_set,
+                   pair_set, latency_of, source, destination, wait):
+    # Replay a root-to-target chain of branch records, running each
+    # record's DATA from its parent's checkpoint up to (not including)
+    # its own AT, exactly as a compoundcp M=0 cut. Every recomputed
+    # checkpoint must equal the stored state byte-for-byte (a mismatch
+    # of state or parent chain is code 5). Returns the target's engine
+    # state tuple, or None for an empty chain.
+    checkpoint = None
+    previous_at = 0
+    seen_ids = set()
+    for name in chain:
+        entry = entries[name]
+        state = entry[3]
+        at = state["b"][3]
+        items = _parse_compound_items(entry[2], node_set, pair_set,
+                                      latency_of, allow_empty=True,
+                                      min_t=previous_at, max_t=at - 1,
+                                      seen_ids=seen_ids)
+        _, checkpoint = _compound_run(nodes, links, source, destination,
+                                      wait, items, state=checkpoint,
+                                      cutoff=at)
+        computed = _compoundcp_state(file_bytes, nodes, links, source,
+                                     destination, wait, at, checkpoint)
+        if computed != state:
+            fail(5)
+        previous_at = at
+    return checkpoint
 
 
 
@@ -5036,6 +5254,129 @@ def main():
                                           min_t=at, seen_ids=seen_ids)
             result, _ = _compound_run(nodes, links, source, destination,
                                       wait, items, state=engine_state)
+    elif argv[1] == "branch":
+        if len(argv) != 8:
+            fail(2)
+        file_path, source, destination = argv[2], argv[3], argv[4]
+        wait_text, db_path, op_text = argv[5], argv[6], argv[7]
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        if (source not in node_set or destination not in node_set
+                or source == destination):
+            fail(5)
+        wait = _bounded_int_arg(wait_text)
+        try:
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
+        except OSError:
+            fail(3)
+        db = _load_db(db_path)
+        try:
+            op = json.loads(op_text, parse_constant=_reject_constant,
+                            parse_float=_finite_float,
+                            object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        latency_of = {(link["from"], link["to"]): link["latency"]
+                      for link in links}
+        entries = _validate_branch_db(db, file_bytes, nodes, links,
+                                      node_set, source, destination,
+                                      wait)
+        if (not isinstance(op, list) or not op
+                or type(op[0]) is not int or op[0] not in (0, 1)):
+            fail(5)
+        if op[0] == 0:
+            # OP=[0,name,parent,AT,DATA]: append a checkpoint record.
+            # A root (parent null) takes only items with t < AT; a
+            # child takes items with parent AT <= t < AT and runs from
+            # the parent's checkpoint. Re-submitting the same name with
+            # the same parent, AT, and DATA is idempotent.
+            if len(op) != 5:
+                fail(5)
+            _, name, parent, at, data = op
+            if not _valid_name(name):
+                fail(5)
+            if type(at) is not int or not 0 <= at <= MAX_COST:
+                fail(5)
+            if parent is not None and (type(parent) is not str
+                                       or parent not in entries):
+                fail(5)
+            if parent is not None and at < entries[parent][3]["b"][3]:
+                fail(5)
+            if name in entries:
+                entry = entries[name]
+                if (entry[1] != parent or entry[3]["b"][3] != at
+                        or json.dumps(entry[2], ensure_ascii=False,
+                                      separators=(",", ":"))
+                        != json.dumps(data, ensure_ascii=False,
+                                      separators=(",", ":"))):
+                    fail(5)
+                # Idempotent: nothing is appended, but the stored chain
+                # is still replayed so a corrupt record is code 5 here
+                # rather than silently echoed back.
+                _replay_branch(entries, _branch_chain(entries, name),
+                               file_bytes, nodes, links, node_set,
+                               pair_set, latency_of, source, destination,
+                               wait)
+            else:
+                if parent is None:
+                    parent_at = 0
+                    parent_ids = set()
+                    chain = []
+                else:
+                    parent_state = entries[parent][3]
+                    parent_at = parent_state["b"][3]
+                    parent_ids = {pkt[0] for pkt in parent_state["p"]}
+                    chain = _branch_chain(entries, parent)
+                items = _parse_compound_items(
+                    data, node_set, pair_set, latency_of,
+                    allow_empty=True, min_t=parent_at, max_t=at - 1,
+                    seen_ids=parent_ids)
+                checkpoint = _replay_branch(
+                    entries, chain, file_bytes, nodes, links, node_set,
+                    pair_set, latency_of, source, destination, wait)
+                _, checkpoint = _compound_run(
+                    nodes, links, source, destination, wait, items,
+                    state=checkpoint, cutoff=at)
+                new_state = _compoundcp_state(file_bytes, nodes, links,
+                                              source, destination, wait,
+                                              at, checkpoint)
+                db[name] = [name, parent, data, new_state]
+                entries[name] = db[name]
+            payload = _state_payload(db)
+            # Atomic replace, skipped when the file already holds
+            # exactly these bytes.
+            try:
+                with open(db_path, "rb") as f:
+                    current = f.read()
+            except OSError:
+                current = None
+            if current != payload:
+                _write_state_atomic(db_path, db)
+            result = db
+        else:
+            # OP=[1,name,DATA]: read-only resume from the named record,
+            # reporting the merged run exactly as compound would over
+            # the chain's DATA followed by DATA (items at AT run before
+            # a timer expiring at AT).
+            if len(op) != 3:
+                fail(5)
+            _, name, data = op
+            if type(name) is not str or name not in entries:
+                fail(5)
+            chain = _branch_chain(entries, name)
+            checkpoint = _replay_branch(entries, chain, file_bytes,
+                                        nodes, links, node_set, pair_set,
+                                        latency_of, source, destination,
+                                        wait)
+            name_at = entries[name][3]["b"][3]
+            seen_ids = {pkt[0] for pkt in checkpoint[10]}
+            items = _parse_compound_items(data, node_set, pair_set,
+                                          latency_of, allow_empty=True,
+                                          min_t=name_at,
+                                          seen_ids=seen_ids)
+            result, _ = _compound_run(nodes, links, source, destination,
+                                      wait, items, state=checkpoint)
     elif argv[1] == "hotload":
         if len(argv) != 11:
             fail(2)
