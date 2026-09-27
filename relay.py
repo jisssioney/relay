@@ -9,6 +9,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py reorder FILE FROM TO BASE WINDOW DATA
        python relay.py converge FILE SRC DST D R EVENTS
        python relay.py policy FILE S D P C RULES
+       python relay.py policytx FILE STATE OP
        python relay.py reserve FILE DATA
        python relay.py rebalance FILE DATA LIMIT
        python relay.py quality FILE A B DATA
@@ -37,7 +38,8 @@ Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE),
 for queue/reorder/converge/policy/reserve/rebalance also those in
 FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/
 compound/audit those in DATA, for compoundcp those in STATE/DATA, for
-branch those in DB/OP, for drill/multidrill/convstat/slosum
+branch those in DB/OP, for policytx those in FILE/STATE/OP, for
+drill/multidrill/convstat/slosum
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
 those in OLD/NEW/EVENTS/DATA, for slogate those in
 CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA, for
@@ -46,7 +48,10 @@ snapshot those in STATE/OP/IN, for config those in PACK/OP/IN),
 P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
 unknown-node/overflow/re-failure error; for hotload code 5 also covers
 a STATE whose v/p/h structure, version continuity, or version conflict
-is invalid; for snapshot code 5 also covers an invalid OP shape, path,
+is invalid; for policytx code 5 also covers an invalid OP shape,
+BASE/s/d/p/c, or R, a STATE whose v/r structure or key order is
+invalid, a BASE that conflicts with the current v, and a new version
+that would overflow MAX_COST; for snapshot code 5 also covers an invalid OP shape, path,
 or BASE, a STATE/IN whose v/p/h structure, key order, or version
 continuity is invalid, and a BASE that conflicts with the current v;
 for config code 5 also covers an invalid OP shape, path, or BASE, a
@@ -730,6 +735,103 @@ def compute_policy(nodes, links, source, destination, port, klass, rules):
     return {"source": source, "destination": destination,
             "port": port, "class": klass, "rule": None,
             "cost": cost, "path": path if path is not None else []}
+
+
+def compute_policytx(nodes, links, source, destination, port, klass,
+                     rules):
+    # Transactional policy lookup, sharing policy's ordering and
+    # fallback semantics. Rules are considered by ascending priority n
+    # (ties keep array order via _priority_order); a rule matches when
+    # its s/d equal the request, a <= port <= b (the rule carries the
+    # range instead of a nullable port), its null class is a wildcard,
+    # and every edge of its path exists and is up. The first matching
+    # rule returns [index, cost, path]; with none usable the route
+    # falls back to the lowest-cost path over up links as
+    # [null, cost, path], or [null, null, []] when unreachable.
+    up_of = {}
+    cost_of_link = {}
+    for link in links:
+        pair = (link["from"], link["to"])
+        up_of[pair] = link["up"]
+        cost_of_link[pair] = link["cost"]
+
+    for i in _priority_order(rules):
+        _, s, d, a, b, c, path = rules[i]
+        if s != source or d != destination:
+            continue
+        if not a <= port <= b:
+            continue
+        if c is not None and c != klass:
+            continue
+        pairs = list(zip(path, path[1:]))
+        if not all(up_of[pair] for pair in pairs):
+            # Paths with a down edge are skipped, not fallen back from.
+            continue
+        return [i, sum(cost_of_link[pair] for pair in pairs), path]
+
+    cost_of, path_of = shortest_paths(nodes, links, source)
+    cost = cost_of[destination]
+    path = path_of[destination]
+    if cost is None:
+        return [None, None, []]
+    return [None, cost, path]
+
+
+def _validate_policytx_rules(rule_items, node_set, pair_set):
+    # Structural validation shared by the policytx command's load and
+    # query paths. Each rule is [n, s, d, a, b, c, path]: n follows the
+    # priority range of policy's rules, s/d/path follow policy exactly,
+    # and the nullable port becomes an inclusive [a, b] range with
+    # 0 <= a <= b <= 65535. Returns the normalized rule tuples.
+    if not isinstance(rule_items, list):
+        fail(5)
+    rules = []
+    for item in rule_items:
+        if not isinstance(item, list) or len(item) != 7:
+            fail(5)
+        n, s, d, a, b, c, path = item
+        if type(n) is not int or not 0 <= n <= MAX_COST:
+            fail(5)
+        if (type(s) is not str or type(d) is not str
+                or s not in node_set or d not in node_set):
+            fail(5)
+        if (type(a) is not int or type(b) is not int
+                or not 0 <= a <= b <= 65535):
+            fail(5)
+        if c is not None:
+            if type(c) is not str or not 1 <= len(c) <= 32:
+                fail(5)
+            try:
+                c.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+        if (not isinstance(path, list) or not path
+                or path[0] != s or path[-1] != d):
+            fail(5)
+        for node in path:
+            if type(node) is not str or node not in node_set:
+                fail(5)
+        if len(set(path)) != len(path):
+            fail(5)
+        for u, v in zip(path, path[1:]):
+            if (u, v) not in pair_set:
+                fail(5)
+        rules.append((n, s, d, a, b, c, path))
+    return rules
+
+
+def _validate_policytx_state(data, node_set, pair_set):
+    # A policytx state is {"v": v, "r": r} with keys in that order: v is
+    # the current version in the same integer range as a rule priority,
+    # and r the current rule list, validated exactly like a loaded R.
+    # Returns the normalized (v, rules).
+    if not isinstance(data, dict) or list(data.keys()) != ["v", "r"]:
+        fail(5)
+    v = data["v"]
+    if type(v) is not int or not 0 <= v <= MAX_COST:
+        fail(5)
+    rules = _validate_policytx_rules(data["r"], node_set, pair_set)
+    return v, rules
 
 
 def compute_reserve(nodes, links, requests):
@@ -4298,6 +4400,74 @@ def main():
             rules.append((n, s, d, p, c, path))
         result = compute_policy(nodes, links, source, destination,
                                 port, klass, rules)
+    elif argv[1] == "policytx":
+        if len(argv) != 5:
+            fail(2)
+        file_path, state_path, op_text = argv[2], argv[3], argv[4]
+        # FILE and STATE are read/decoded before the inline OP, matching
+        # hotload/snapshot ordering: read errors code 3, strict JSON
+        # errors code 4, shapes code 5.
+        nodes, links, node_set = load_network(file_path, strict=True)
+        raw_state = _load_state(state_path)
+        try:
+            op = json.loads(op_text, parse_constant=_reject_constant,
+                            parse_float=_finite_float,
+                            object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(op, list) or len(op) == 0 \
+                or type(op[0]) is not int or op[0] not in (0, 1):
+            fail(5)
+        kind = op[0]
+        pair_set = {(link["from"], link["to"]) for link in links}
+        v, rules = _validate_policytx_state(raw_state, node_set, pair_set)
+        if kind == 0:
+            # [0, BASE, R]: R is always validated (a bad R is code 5
+            # even on an otherwise idempotent load). R equal to the
+            # stored r is idempotent (status 1, BASE ignored and STATE
+            # untouched); otherwise BASE must equal v with v below
+            # MAX_COST, and STATE is atomically replaced by
+            # {"v": v+1, "r": R} via a same-directory exclusive temp
+            # file (failure leaves the old bytes and clears the temp).
+            if (len(op) != 3 or type(op[1]) is not int
+                    or not 0 <= op[1] <= MAX_COST):
+                fail(5)
+            base = op[1]
+            new_rules = _validate_policytx_rules(op[2], node_set,
+                                                 pair_set)
+            if new_rules == rules:
+                status = 1
+            else:
+                if base != v or v >= MAX_COST:
+                    fail(5)
+                v += 1
+                rules = new_rules
+                _write_state_atomic(state_path, {"v": v, "r": rules})
+                status = 0
+            query_result = None
+        else:
+            # [1, s, d, p, c]: read-only policy lookup with the route
+            # lowest-cost fallback; STATE is never written.
+            if len(op) != 5:
+                fail(5)
+            _, source, destination, port, klass = op
+            if (type(source) is not str or type(destination) is not str
+                    or source not in node_set
+                    or destination not in node_set):
+                fail(5)
+            if type(port) is not int or not 0 <= port <= 65535:
+                fail(5)
+            if type(klass) is not str or not 1 <= len(klass) <= 32:
+                fail(5)
+            try:
+                klass.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            status = 2
+            query_result = compute_policytx(
+                nodes, links, source, destination, port, klass, rules)
+        result = {"op": kind, "status": status, "version": v,
+                  "rules": rules, "result": query_result}
     elif argv[1] == "reserve":
         if len(argv) != 4:
             fail(2)
