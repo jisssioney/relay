@@ -13,6 +13,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py policyreplay PACK STATE TV PV DATA
        python relay.py reserve FILE DATA
        python relay.py rebalance FILE DATA LIMIT
+       python relay.py retune FILE LIMIT DATA
        python relay.py quality FILE A B DATA
        python relay.py replay FILE A B DATA
        python relay.py audit FILE A B DATA
@@ -37,7 +38,7 @@ Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE,
 for policyreplay PACK or STATE, and for policytx op 4 also OUT),
 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/reorder/converge/policy/reserve/rebalance also those in
+for queue/reorder/converge/policy/reserve/rebalance/retune also those in
 FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/
 compound/audit those in DATA, for compoundcp those in STATE/DATA, for
 branch those in DB/OP, for drill/multidrill/convstat/slosum
@@ -1063,6 +1064,168 @@ def compute_rebalance(nodes, links, demands, limit):
             "moved": moved_out,
             "flows": [[demands[i][0], demands[i][4], new_paths[i]]
                       for i in range(count)],
+            "links": [[link["from"], link["to"], capacity[i],
+                       final_used[i]]
+                      for i, link in enumerate(links)]}
+
+
+def compute_retune(nodes, links, current, target, original_paths, limit):
+    # Joint path selection for a changed flow set, following the same
+    # enumeration and ranking as compute_rebalance. `current` is C in C
+    # order and defines the before placement (it already fits every link);
+    # `target` is the desired flow set — C flows kept in C order followed
+    # by G's additions in G order — and `original_paths` runs parallel to
+    # it, holding a kept flow's C path or None for an addition. Only kept
+    # flows can count as rerouted; additions take any path for free. An
+    # assignment is feasible when no link carries more than its bandwidth
+    # and at most `limit` kept flows leave their C path. Feasible
+    # assignments rank by peak used/bandwidth (exact fraction cross-
+    # multiplication, never floats), then reroutes, then the target-order
+    # vector of paths in Unicode code point order. Unlike rebalance, any
+    # feasible best is committed; with no feasible assignment C is kept.
+    # O((V!)^K (KV+E)) time, O(KV+E) space, K the target flow count.
+    adj = {n: [] for n in nodes}
+    index_of = {}
+    for index, link in enumerate(links):
+        index_of[(link["from"], link["to"])] = index
+        if link["up"]:
+            adj[link["from"]].append((link["to"], index))
+    capacity = [link["bandwidth"] for link in links]
+
+    initial_used = [0] * len(links)
+    for _, _, _, b, path in current:
+        for a, c in zip(path, path[1:]):
+            initial_used[index_of[(a, c)]] += b
+    for index, used_here in enumerate(initial_used):
+        if used_here > capacity[index]:
+            fail(5)
+
+    def peak_of(used):
+        num, den = 0, 1
+        for u, c in zip(used, capacity):
+            if u * den > num * c:
+                num, den = u, c
+        return num, den
+
+    init_num, init_den = peak_of(initial_used)
+
+    def enum_paths(source, destination):
+        path = [source]
+        edges = []
+        visited = {source}
+        iters = [iter(adj[source])]
+        while iters:
+            try:
+                to, index = next(iters[-1])
+            except StopIteration:
+                iters.pop()
+                if iters:
+                    visited.remove(path.pop())
+                    edges.pop()
+                continue
+            if to in visited:
+                continue
+            visited.add(to)
+            path.append(to)
+            edges.append(index)
+            if to == destination:
+                yield list(path), list(edges)
+                visited.remove(path.pop())
+                edges.pop()
+            else:
+                iters.append(iter(adj[to]))
+
+    best_num = best_den = best_moved = None
+    best_paths = best_used = None
+    count = len(target)
+    if count == 0:
+        # The empty placement is the unique feasible assignment; it is
+        # committed even though nothing flows, so an all-delete G takes
+        # effect and both peaks render as 0.000000.
+        best_num, best_den, best_moved = 0, 1, 0
+        best_paths = []
+        best_used = [0] * len(links)
+    if count:
+        used = [0] * len(links)
+        current_paths = [None] * count
+        current_edges = [None] * count
+        generators = [None] * count
+        moved = 0
+        depth = 0
+        generators[0] = enum_paths(target[0][1], target[0][2])
+        while depth >= 0:
+            item = next(generators[depth], None)
+            if item is None:
+                generators[depth] = None
+                depth -= 1
+                if depth >= 0:
+                    b = target[depth][3]
+                    for index in current_edges[depth]:
+                        used[index] -= b
+                    if (original_paths[depth] is not None
+                            and current_paths[depth] != original_paths[depth]):
+                        moved -= 1
+                    current_paths[depth] = None
+                    current_edges[depth] = None
+                continue
+            path, edges = item
+            b = target[depth][3]
+            if any(used[index] + b > capacity[index] for index in edges):
+                continue
+            original = original_paths[depth]
+            delta = 1 if original is not None and path != original else 0
+            if moved + delta > limit:
+                continue
+            for index in edges:
+                used[index] += b
+            current_paths[depth] = path
+            current_edges[depth] = edges
+            moved += delta
+            if depth + 1 < count:
+                depth += 1
+                generators[depth] = enum_paths(target[depth][1],
+                                               target[depth][2])
+            else:
+                num, den = peak_of(used)
+                if (best_paths is None
+                        or num * best_den < best_num * den
+                        or (num * best_den == best_num * den
+                            and (moved < best_moved
+                                 or (moved == best_moved
+                                     and current_paths < best_paths)))):
+                    best_num, best_den = num, den
+                    best_moved = moved
+                    best_paths = list(current_paths)
+                    best_used = list(used)
+                for index in edges:
+                    used[index] -= b
+                moved -= delta
+                current_paths[depth] = None
+                current_edges[depth] = None
+
+    if best_paths is not None:
+        status = 1
+        final_flows = target
+        final_used = best_used
+        new_paths = best_paths
+        moved_out = best_moved
+        out_num, out_den = best_num, best_den
+    else:
+        status = 0
+        final_flows = current
+        final_used = initial_used
+        new_paths = [path for _, _, _, _, path in current]
+        moved_out = 0
+        out_num, out_den = init_num, init_den
+
+    return {"status": status,
+            "peak": [_format_peak(init_num, init_den),
+                     _format_peak(out_num, out_den)],
+            "moved": moved_out,
+            "flows": [[final_flows[i][0], final_flows[i][1],
+                       final_flows[i][2], final_flows[i][3],
+                       new_paths[i]]
+                      for i in range(len(final_flows))],
             "links": [[link["from"], link["to"], capacity[i],
                        final_used[i]]
                       for i, link in enumerate(links)]}
@@ -5023,6 +5186,127 @@ def main():
             demands.append((rid, s, d, b, path))
         limit = _bounded_int_arg(limit_text)
         result = compute_rebalance(nodes, links, demands, limit)
+    elif argv[1] == "retune":
+        if len(argv) != 5:
+            fail(2)
+        file_path, limit_text, data_text = argv[2], argv[3], argv[4]
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        # DATA is exactly [C, G]: C is rebalance's flow list and G is a
+        # list of [0, id] deletions and [1, id, s, d, b] additions.
+        if not isinstance(data, list) or len(data) != 2:
+            fail(5)
+        raw_current, changes = data
+        if not isinstance(raw_current, list) or not isinstance(changes,
+                                                               list):
+            fail(5)
+        up_of = {}
+        for link in links:
+            up_of[(link["from"], link["to"])] = link["up"]
+
+        def valid_fields(rid, s, d, b):
+            # The [id, s, d, b] checks rebalance applies to every flow,
+            # shared here for C items and G's added flows.
+            if type(rid) is not str or not 1 <= len(rid) <= 64:
+                fail(5)
+            try:
+                rid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if (type(s) is not str or type(d) is not str
+                    or s not in node_set or d not in node_set or s == d):
+                fail(5)
+            if type(b) is not int or not 1 <= b <= MAX_COST:
+                fail(5)
+
+        def valid_path(s, d, path):
+            # A C flow's path is a non-empty simple node array walking up
+            # directed edges from s to d.
+            if (not isinstance(path, list) or not path
+                    or path[0] != s or path[-1] != d):
+                fail(5)
+            for node in path:
+                if type(node) is not str or node not in node_set:
+                    fail(5)
+            if len(set(path)) != len(path):
+                fail(5)
+            for a, c in zip(path, path[1:]):
+                pair = (a, c)
+                if pair not in up_of or not up_of[pair]:
+                    fail(5)
+
+        current = []
+        current_map = {}
+        for item in raw_current:
+            if not isinstance(item, list) or len(item) != 5:
+                fail(5)
+            rid, s, d, b, path = item
+            valid_fields(rid, s, d, b)
+            if rid in current_map:
+                fail(5)
+            valid_path(s, d, path)
+            entry = (rid, s, d, b, path)
+            current_map[rid] = entry
+            current.append(entry)
+
+        deleted = set()
+        additions = []
+        change_ids = set()
+        for item in changes:
+            if not isinstance(item, list) or len(item) not in (2, 5):
+                fail(5)
+            tag = item[0]
+            if type(tag) is not int or tag not in (0, 1):
+                fail(5)
+            gid = item[1]
+            if type(gid) is not str or not 1 <= len(gid) <= 64:
+                fail(5)
+            try:
+                gid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if gid in change_ids:
+                fail(5)
+            change_ids.add(gid)
+            if tag == 0:
+                if len(item) != 2:
+                    fail(5)
+                # A deletion must name a flow present in C.
+                if gid not in current_map:
+                    fail(5)
+                deleted.add(gid)
+            else:
+                if len(item) != 5:
+                    fail(5)
+                _, _, s, d, b = item
+                valid_fields(gid, s, d, b)
+                # An added id must not occur in C at all, even one G also
+                # deletes: deletions and additions stay disjoint.
+                if gid in current_map:
+                    fail(5)
+                additions.append((gid, s, d, b))
+
+        # Target flows: C survivors in C order, then G additions in G
+        # order, each paired with its C path (None for an addition).
+        target = []
+        original_paths = []
+        for entry in current:
+            if entry[0] not in deleted:
+                target.append(entry)
+                original_paths.append(entry[4])
+        for rid, s, d, b in additions:
+            target.append((rid, s, d, b, None))
+            original_paths.append(None)
+
+        limit = _bounded_int_arg(limit_text)
+        result = compute_retune(nodes, links, current, target,
+                                original_paths, limit)
     elif argv[1] == "quality":
         if len(argv) != 6:
             fail(2)
