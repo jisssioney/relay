@@ -206,30 +206,41 @@ lists each flow's path in FLOWS order after the event. links follows
 FILE order as [from,to,bandwidth,used] in the final state. An invalid
 EVENTS or FLOWS shape is code 5.
 flowshift takes FILE, LIMIT, and FLOWS exactly like loadshift, but its
-non-empty EVENTS array mixes four kinds in t order (t as in loadshift,
+non-empty EVENTS array mixes six kinds in t order (t as in loadshift,
 non-decreasing with equal t kept in input order): [t,0,u,v,b] changes
 edge u->v's bandwidth exactly like a loadshift event; [t,1,id,s,d,b]
 adds a flow (id/s/d/b validated as in reserve/rebalance) and is appended
 after every current flow; [t,2,id] deletes the flow with that id;
-[t,3,id,b] changes that flow's demand. The flow order is FLOWS order
-with every addition placed at the tail. A bandwidth or demand equal to
-the current value, a deletion of an absent id, and a repeated addition
-whose id already carries the same s/d/b are all idempotent (status 1);
+[t,3,id,b] changes that flow's demand; [t,4,n,up] sets node n's state;
+[t,5,u,v,up] sets the directed edge u->v's state. Every kind-4/5
+reference must name an existing node or edge and up must be a boolean.
+Nodes start up and edges take FILE's up flag; at the same t events keep
+input order, and a repeated setting is idempotent. The flow order is
+FLOWS order with every addition placed at the tail. A bandwidth or
+demand equal to the current value, a deletion of an absent id, a
+repeated addition whose id already carries the same s/d/b, and a node
+or edge set to its current state are all idempotent (status 1);
 re-adding an existing id with different s/d/b, or changing the demand
-of an absent id, is code 5. Every real change jointly assigns the
-resulting flow set one up simple path each with loadshift's capacity
-and ranking rules; LIMIT counts only original FLOWS leaving their
-current path -- an added flow never counts, on the event that adds it
-or any later one (the same rule as retune). A feasible assignment
-commits atomically (status 0) and no feasible assignment rejects
-(status 2) leaving bandwidths, the flow set, paths, and loads exactly
-as they were. Result key order is events,links. Each events item is
-[t,k,status,peak,moved,flows]: peak is the post-processing peak as the
-same six-decimal fixed-point string, moved is 0 for idempotent and
-rejected events, and flows lists [id,s,d,b,path] for every current
-flow in the current order. links follows FILE order as
-[from,to,bandwidth,used] in the final state. An invalid EVENTS or
-FLOWS shape is code 5.
+of an absent id, is code 5. Paths only traverse up nodes and up edges;
+every real change jointly assigns the resulting flow set one up simple
+path each with loadshift's capacity and ranking rules. LIMIT counts
+only instances born in the original FLOWS leaving their current path
+-- an added instance never counts, and deleting an id and rebuilding
+it with the same id is also permanently exempt (the same rule as
+retune). The ranking reroute tally instead counts every pre-existing
+instance: an instance added by an event enters the tally on later
+events, and a real node/edge event charges no reroute on its own tick
+(moved 0) while its committed paths baseline later events; the same
+later-event tally entry applies to the original four kinds. A feasible
+assignment commits atomically (status 0) and no feasible assignment
+rejects (status 2) leaving bandwidths, node and edge states, the flow
+set, paths, and loads exactly as they were. Result key order is
+events,links. Each events item is [t,k,status,peak,moved,flows]: peak
+is the post-processing peak as the same six-decimal fixed-point
+string, moved is 0 for idempotent and rejected events, and flows lists
+[id,s,d,b,path] for every current flow in the current order. links
+follows FILE order as [from,to,bandwidth,used] in the final state. An
+invalid EVENTS or FLOWS shape is code 5.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -1837,24 +1848,32 @@ def compute_loadshift(nodes, links, flows, limit, events):
 
 
 def compute_flowshift(nodes, links, flows, limit, events):
-    # Explicit-clock replay of mixed bandwidth/flow-set events, combining
-    # compute_loadshift's bandwidth replay with compute_retune's flow
-    # additions. State is a live flow list in FLOWS order with additions
-    # appended at the tail; each flow is [id, s, d, b, path]. Validated
-    # events are (kind, t, ...): (0, t, u, v, b) bandwidth change,
+    # Explicit-clock replay of mixed bandwidth/flow-set/topology events.
+    # State is a live flow list in FLOWS order with additions appended at
+    # the tail; each flow is [id, s, d, b, path]. Validated events are
+    # (kind, t, ...): (0, t, u, v, b) bandwidth change,
     # (1, t, id, s, d, b) addition, (2, t, id) deletion,
-    # (3, t, id, b) demand change. A bandwidth/demand equal to the
-    # current value, a deletion of an absent id, and a re-addition whose
-    # id already has the same s/d/b are idempotent (status 1); a
-    # conflicting addition or a demand change of an absent id fails.
-    # Every real change jointly assigns the resulting flow set one up
-    # simple path each with compute_loadshift's capacity and ranking
-    # rules; only original flows leaving their current path count toward
-    # `limit` (an addition never does). A feasible assignment commits
-    # atomically (status 0); no feasible assignment rejects (status 2)
-    # and leaves the state exactly as before. Per-event enumeration is
-    # O((V!)^K (KV+E)); across Q events and output P the whole replay is
-    # O(Q (V!)^K (KV+E) + P) time, O(KV+E+Q+P) space.
+    # (3, t, id, b) demand change, (4, t, n, up) node up/down,
+    # (5, t, u, v, up) directed-edge up/down. Nodes start up and edges
+    # take FILE's up flag; an equal setting changes nothing (status 1),
+    # events with equal t keep input order, and every repeated setting is
+    # idempotent. Every real change jointly assigns the resulting flow
+    # set one up simple path each (paths only traverse up nodes and up
+    # directed edges) with compute_loadshift's capacity and ranking
+    # rules. Two reroute tallies are kept distinct: only instances of the
+    # original FLOWS leaving their current path count against `limit` --
+    # an event-added instance never does, even after deletion of an
+    # original id followed by a same-id rebuild (the rebuilt instance is
+    # permanently exempt, the same rule as retune) -- whereas the ranking
+    # moved tally counts every pre-existing instance, so a flow added by
+    # an earlier event enters the ranking on later events (its addition
+    # tick itself never counts). A real topology event (kind 4/5) charges
+    # no reroute on its own tick. A feasible assignment commits
+    # atomically (status 0) and baselines the new paths; no feasible
+    # assignment rejects (status 2) and leaves bandwidths, up flags, the
+    # flow set, paths, and loads exactly as they were. Per-event
+    # enumeration is O((V!)^K (KV+E)); across Q events and output P the
+    # whole replay is O(Q (V!)^K (KV+E) + P) time, O(KV+E+Q+P) space.
     index_of = {(link["from"], link["to"]): i
                 for i, link in enumerate(links)}
     capacity = [link["bandwidth"] for link in links]
@@ -1870,17 +1889,26 @@ def compute_flowshift(nodes, links, flows, limit, events):
             # As in loadshift, the committed placement must already fit.
             fail(5)
 
-    # Only the original FLOWS count against LIMIT when they leave their
-    # current path; a flow born of an addition event never counts on any
-    # later event (the same rule as in compute_retune).
-    original_ids = {rid for rid, _, _, _, _ in flows}
+    # Only instances born in the original FLOWS count against LIMIT when
+    # they leave their current path. Deleting an id removes it from this
+    # set permanently, so a same-id rebuild is a new instance permanently
+    # exempt from LIMIT, the same rule as in compute_retune.
+    limited_ids = {rid for rid, _, _, _, _ in flows}
 
-    # Link up/down state never changes during the replay, so the up
-    # adjacency is built once.
-    adj = {n: [] for n in nodes}
-    for index, link in enumerate(links):
-        if link["up"]:
-            adj[link["from"]].append((link["to"], index))
+    # Mutable up state: nodes start up, directed edges take FILE.
+    node_up = {n: True for n in nodes}
+    edge_up = [bool(link["up"]) for link in links]
+
+    def build_adj():
+        # Directed adjacency over up links whose endpoints are both up.
+        table = {n: [] for n in nodes}
+        for index, link in enumerate(links):
+            if (edge_up[index] and node_up[link["from"]]
+                    and node_up[link["to"]]):
+                table[link["from"]].append((link["to"], index))
+        return table
+
+    adj = build_adj()
 
     def peak_of(counts):
         # max(counts[i]/capacity[i]) as an exact fraction.
@@ -1919,14 +1947,20 @@ def compute_flowshift(nodes, links, flows, limit, events):
             else:
                 stack.append(iter(adj[to]))
 
-    def search(specs, base_paths):
+    def search(specs, base_paths, limited_flags, limit_cap):
         # Cartesian-product search over the candidate flow set with an
         # explicit stack, exactly as in compute_loadshift. specs holds
-        # (s, d, b) per candidate; base_paths[i] is the flow's committed
-        # path, or None for a newly added flow, which never counts as
-        # moved. Returns (num, den, moved, new_paths, new_used) for the
-        # best feasible assignment, or None when no assignment satisfies
-        # capacity and the reroute limit.
+        # (s, d, b) per candidate; base_paths[i] is the instance's
+        # committed path, or None for a newly born instance on its
+        # addition tick; limited_flags[i] marks instances whose moves
+        # count against LIMIT; limit_cap is None for a free reroute
+        # (topology events) or the LIMIT value. Returns
+        # (num, den, moved, new_paths, new_used) for the best feasible
+        # assignment, or None when no assignment satisfies capacity and
+        # the reroute limit. Two tallies run independently: the ranking
+        # moved count covers every pre-existing instance leaving its
+        # base path, while moved_limited covers only limited instances
+        # and is gated by limit_cap.
         count = len(specs)
         best_num = best_den = best_moved = None
         best_paths = best_used = None
@@ -1934,7 +1968,8 @@ def compute_flowshift(nodes, links, flows, limit, events):
         cur_paths = [None] * count
         cur_edges = [None] * count
         gens = [None] * count
-        moved = 0
+        moved = 0           # ranking tally: every base-leaving instance
+        moved_limited = 0   # LIMIT tally: only limited instances
         depth = 0
         if count:
             gens[0] = enum_paths(specs[0][0], specs[0][1])
@@ -1955,6 +1990,8 @@ def compute_flowshift(nodes, links, flows, limit, events):
                     base = base_paths[depth]
                     if base is not None and cur_paths[depth] != base:
                         moved -= 1
+                        if limited_flags[depth]:
+                            moved_limited -= 1
                     cur_paths[depth] = None
                     cur_edges[depth] = None
                 continue
@@ -1964,14 +2001,18 @@ def compute_flowshift(nodes, links, flows, limit, events):
                    for eindex in edges):
                 continue
             base = base_paths[depth]
-            delta = 1 if base is not None and path != base else 0
-            if moved + delta > limit:
+            left_base = base is not None and path != base
+            delta = 1 if left_base else 0
+            delta_limited = delta if limited_flags[depth] else 0
+            if (limit_cap is not None
+                    and moved_limited + delta_limited > limit_cap):
                 continue
             for eindex in edges:
                 trial[eindex] += b
             cur_paths[depth] = path
             cur_edges[depth] = edges
             moved += delta
+            moved_limited += delta_limited
             if depth + 1 < count:
                 depth += 1
                 gens[depth] = enum_paths(specs[depth][0],
@@ -1991,19 +2032,37 @@ def compute_flowshift(nodes, links, flows, limit, events):
                 for eindex in edges:
                     trial[eindex] -= b
                 moved -= delta
+                moved_limited -= delta_limited
                 cur_paths[depth] = None
                 cur_edges[depth] = None
         if best_paths is None:
             return None
         return best_num, best_den, best_moved, best_paths, best_used
 
+    def assignment_bases(flow_rows):
+        # Per-instance base paths, limited flags for LIMIT, and the cap:
+        # ordinary events count only original-FLOWS instances against
+        # LIMIT while every pre-existing instance enters the ranking
+        # moved tally.
+        bases = [f[4] for f in flow_rows]
+        limited = [f[0] in limited_ids for f in flow_rows]
+        return bases, limited, limit
+
     def snapshot_flows():
-        return [[rid, s, d, b, list(path)]
-                for rid, s, d, b, path in live]
+        return [[rid, s, d, b, list(p)]
+                for rid, s, d, b, p in live]
 
     def row(t, kind, status, num, den, moved_count):
         return [t, kind, status, _format_peak(num, den), moved_count,
                 snapshot_flows()]
+
+    def idle_row(t, kind):
+        num, den = peak_of(used)
+        return row(t, kind, 1, num, den, 0)
+
+    def reject_row(t, kind):
+        num, den = peak_of(used)
+        return row(t, kind, 2, num, den, 0)
 
     results = []
     for event in events:
@@ -2015,20 +2074,18 @@ def compute_flowshift(nodes, links, flows, limit, events):
             eindex = index_of[(u, v)]
             if nb == capacity[eindex]:
                 # Idempotent: the bandwidth already equals the request.
-                num, den = peak_of(used)
-                results.append(row(t, kind, 1, num, den, 0))
+                results.append(idle_row(t, kind))
                 continue
             old_bw = capacity[eindex]
             capacity[eindex] = nb
             specs = [(f[1], f[2], f[3]) for f in live]
-            bases = [f[4] if f[0] in original_ids else None for f in live]
-            found = search(specs, bases)
+            bases, limited, cap = assignment_bases(live)
+            found = search(specs, bases, limited, cap)
             if found is None:
                 # Reject: restore the prior bandwidth; paths and loads
                 # were never mutated by the trial search.
                 capacity[eindex] = old_bw
-                num, den = peak_of(used)
-                results.append(row(t, kind, 2, num, den, 0))
+                results.append(reject_row(t, kind))
             else:
                 # Atomic commit keeping the temporary bandwidth.
                 num, den, moved_count, new_paths, new_used = found
@@ -2045,18 +2102,21 @@ def compute_flowshift(nodes, links, flows, limit, events):
                     # s/d/b while it still exists.
                     fail(5)
                 # Idempotent re-addition with identical content.
-                num, den = peak_of(used)
-                results.append(row(t, kind, 1, num, den, 0))
+                results.append(idle_row(t, kind))
                 continue
             specs = [(f[1], f[2], f[3]) for f in live]
             specs.append((s, d, nb))
-            bases = [f[4] if f[0] in original_ids else None for f in live]
+            bases, limited, cap = assignment_bases(live)
+            # The new instance has no committed path: it never counts as
+            # moved on its addition tick, and an id absent from the
+            # original FLOWS (or a same-id rebuild) never counts against
+            # LIMIT on any later event.
             bases.append(None)
-            found = search(specs, bases)
+            limited.append(nid in limited_ids)
+            found = search(specs, bases, limited, cap)
             if found is None:
                 # Reject: the candidate flow was never appended.
-                num, den = peak_of(used)
-                results.append(row(t, kind, 2, num, den, 0))
+                results.append(reject_row(t, kind))
             else:
                 num, den, moved_count, new_paths, new_used = found
                 used = new_used
@@ -2068,29 +2128,30 @@ def compute_flowshift(nodes, links, flows, limit, events):
             _, _, nid = event
             if nid not in position:
                 # Deleting an absent id is idempotent.
-                num, den = peak_of(used)
-                results.append(row(t, kind, 1, num, den, 0))
+                results.append(idle_row(t, kind))
                 continue
             drop = position[nid]
             survivors = live[:drop] + live[drop + 1:]
             specs = [(f[1], f[2], f[3]) for f in survivors]
-            bases = [f[4] if f[0] in original_ids else None
-                     for f in survivors]
-            found = search(specs, bases)
+            bases, limited, cap = assignment_bases(survivors)
+            found = search(specs, bases, limited, cap)
             if found is None:
                 # The survivors' committed paths stay feasible after a
                 # deletion, so this is defensive: reject without
                 # touching the live set.
-                num, den = peak_of(used)
-                results.append(row(t, kind, 2, num, den, 0))
+                results.append(reject_row(t, kind))
             else:
                 num, den, moved_count, new_paths, new_used = found
                 used = new_used
                 for i, path in enumerate(new_paths):
                     survivors[i][4] = path
                 live = survivors
+                # Commit makes the deletion permanent: the id leaves the
+                # LIMIT-counted set, so a later same-id rebuild is a new
+                # instance permanently exempt from LIMIT.
+                limited_ids.discard(nid)
                 results.append(row(t, kind, 0, num, den, moved_count))
-        else:
+        elif kind == 3:
             _, _, nid, nb = event
             if nid not in position:
                 # A demand change must name a flow that exists.
@@ -2098,26 +2159,78 @@ def compute_flowshift(nodes, links, flows, limit, events):
             target = live[position[nid]]
             if nb == target[3]:
                 # Idempotent: the demand already equals the request.
-                num, den = peak_of(used)
-                results.append(row(t, kind, 1, num, den, 0))
+                results.append(idle_row(t, kind))
                 continue
             old_b = target[3]
             target[3] = nb
             specs = [(f[1], f[2], f[3]) for f in live]
-            bases = [f[4] if f[0] in original_ids else None for f in live]
-            found = search(specs, bases)
+            bases, limited, cap = assignment_bases(live)
+            found = search(specs, bases, limited, cap)
             if found is None:
                 # Reject: restore the old demand; paths and loads were
                 # never mutated by the trial search.
                 target[3] = old_b
-                num, den = peak_of(used)
-                results.append(row(t, kind, 2, num, den, 0))
+                results.append(reject_row(t, kind))
             else:
                 num, den, moved_count, new_paths, new_used = found
                 used = new_used
                 for i, path in enumerate(new_paths):
                     live[i][4] = path
                 results.append(row(t, kind, 0, num, den, moved_count))
+        elif kind == 4:
+            _, _, node, want_up = event
+            if node_up[node] == want_up:
+                # A repeated setting is idempotent and changes nothing.
+                results.append(idle_row(t, kind))
+                continue
+            old_up = node_up[node]
+            node_up[node] = want_up
+            adj = build_adj()
+            specs = [(f[1], f[2], f[3]) for f in live]
+            # A real topology change charges no reroute on its own tick:
+            # no flow is "moved" for either LIMIT or the ranking, so peak
+            # ties fall straight through to the flow-order path vector.
+            # The committed paths baseline later events.
+            found = search(specs, [None] * len(live),
+                           [False] * len(live), None)
+            if found is None:
+                # Atomic rollback of the node flag and adjacency.
+                node_up[node] = old_up
+                adj = build_adj()
+                results.append(reject_row(t, kind))
+            else:
+                num, den, _, new_paths, new_used = found
+                used = new_used
+                for i, path in enumerate(new_paths):
+                    live[i][4] = path
+                results.append(row(t, kind, 0, num, den, 0))
+        else:
+            _, _, u, v, want_up = event
+            eindex = index_of[(u, v)]
+            if edge_up[eindex] == want_up:
+                # A repeated setting is idempotent and changes nothing.
+                results.append(idle_row(t, kind))
+                continue
+            old_up = edge_up[eindex]
+            edge_up[eindex] = want_up
+            adj = build_adj()
+            specs = [(f[1], f[2], f[3]) for f in live]
+            # A real topology change charges no reroute on its own tick:
+            # no flow is "moved" for either LIMIT or the ranking, so peak
+            # ties fall straight through to the flow-order path vector.
+            found = search(specs, [None] * len(live),
+                           [False] * len(live), None)
+            if found is None:
+                # Atomic rollback of the edge flag and adjacency.
+                edge_up[eindex] = old_up
+                adj = build_adj()
+                results.append(reject_row(t, kind))
+            else:
+                num, den, _, new_paths, new_used = found
+                used = new_used
+                for i, path in enumerate(new_paths):
+                    live[i][4] = path
+                results.append(row(t, kind, 0, num, den, 0))
 
     return {"events": results,
             "links": [[link["from"], link["to"], capacity[i], used[i]]
@@ -6431,15 +6544,16 @@ def main():
             flows.append((rid, s, d, b, path))
         limit = _bounded_int_arg(limit_text)
         # EVENTS is a non-empty array whose items are
-        # [t,0,u,v,b], [t,1,id,s,d,b], [t,2,id], or [t,3,id,b]: t is a
-        # non-boolean integer in 0..MAX_COST and non-decreasing, equal t
-        # keeps input order, b is a non-boolean integer in 1..MAX_COST,
-        # u->v must name an edge in FILE, and id/s/d are validated as in
-        # reserve/loadshift (id 1..64 codepoints, s/d existing distinct
-        # nodes). Cross-event id semantics (re-addition conflicts,
-        # changes of absent ids) are enforced during the replay and are
-        # also code 5. Syntax failures are code 4, every shape or value
-        # failure here is code 5.
+        # [t,0,u,v,b], [t,1,id,s,d,b], [t,2,id], [t,3,id,b],
+        # [t,4,n,up], or [t,5,u,v,up]: t is a non-boolean integer in
+        # 0..MAX_COST and non-decreasing, equal t keeps input order, b is
+        # a non-boolean integer in 1..MAX_COST, u->v must name an edge in
+        # FILE, n an existing node, up a strict boolean, and id/s/d are
+        # validated as in reserve/loadshift (id 1..64 codepoints, s/d
+        # existing distinct nodes). Cross-event id semantics (re-addition
+        # conflicts, changes of absent ids) are enforced during the
+        # replay and are also code 5. Syntax failures are code 4, every
+        # shape or value failure here is code 5.
         if not isinstance(raw_events, list) or not raw_events:
             fail(5)
         pair_set = {(link["from"], link["to"]) for link in links}
@@ -6463,7 +6577,7 @@ def main():
                 fail(5)
             if previous_time is not None and t < previous_time:
                 fail(5)
-            if type(kind) is not int or kind not in (0, 1, 2, 3):
+            if type(kind) is not int or kind not in (0, 1, 2, 3, 4, 5):
                 fail(5)
             if kind == 0:
                 if len(item) != 5:
@@ -6495,7 +6609,7 @@ def main():
                 if not valid_id(nid):
                     fail(5)
                 events.append((2, t, nid))
-            else:
+            elif kind == 3:
                 if len(item) != 4:
                     fail(5)
                 _, _, nid, b = item
@@ -6504,6 +6618,25 @@ def main():
                 if type(b) is not int or not 1 <= b <= MAX_COST:
                     fail(5)
                 events.append((3, t, nid, b))
+            elif kind == 4:
+                if len(item) != 4:
+                    fail(5)
+                _, _, node, up = item
+                if type(node) is not str or node not in node_set:
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                events.append((4, t, node, up))
+            else:
+                if len(item) != 5:
+                    fail(5)
+                _, _, u, v, up = item
+                if type(u) is not str or type(v) is not str \
+                        or (u, v) not in pair_set:
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                events.append((5, t, u, v, up))
             previous_time = t
         result = compute_flowshift(nodes, links, flows, limit, events)
     elif argv[1] == "retune":
