@@ -10,6 +10,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py converge FILE SRC DST D R EVENTS
        python relay.py policy FILE S D P C RULES
        python relay.py policytx FILE STATE OP
+       python relay.py policyreplay PACK STATE TV PV DATA
        python relay.py reserve FILE DATA
        python relay.py rebalance FILE DATA LIMIT
        python relay.py quality FILE A B DATA
@@ -33,7 +34,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py branch FILE S D W DB OP
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE,
-and for policytx op 4 also OUT),
+for policyreplay PACK or STATE, and for policytx op 4 also OUT),
 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance also those in
@@ -44,7 +45,7 @@ EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
 those in OLD/NEW/EVENTS/DATA, for slogate those in
 CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA, for
 snapshot those in STATE/OP/IN, for config those in PACK/OP/IN, for
-policytx those in STATE/OP),
+policytx those in STATE/OP, for policyreplay those in PACK/STATE/DATA),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
 P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
 unknown-node/overflow/re-failure error; for hotload code 5 also covers
@@ -136,6 +137,22 @@ the canonical compact UTF-8 form with one trailing LF (directly
 usable as a STATE), skips the replace when OUT already holds those
 exact bytes, and on failure leaves STATE and OUT's bytes untouched and
 removes only its own staging temp file.
+policyreplay is read-only and never writes PACK, STATE, or any other
+file: it replays the pack topology version TV against the policytx
+rule-set version PV. TV/PV are non-boolean integers in 0..MAX_COST; TV
+must name a topology in PACK.h and PV a rule-set version in STATE's h
+(a legacy STATE's h holds only its v), and the selected rule set must be
+legal for the selected topology (every endpoint/path node and path edge
+exists there). DATA is a JSON array, possibly empty, of [s, d, p, c]
+items that may repeat and keep their order: s/d name selected-topology
+nodes (they may be equal), p is a non-boolean integer in 0..65535, and
+c is a 1..32 codepoint UTF-8 string. Each query follows policytx
+matching (rules by ascending n with ties in array order, endpoint,
+port interval, and class match, skipping rules whose path holds a down
+edge) with the route lowest-cost path as fallback. The result has key
+order topologyVersion, policyVersion, results; each result item is
+[s, d, p, c, rule, cost, path] with rule the matched rule's array index
+(null on fallback) and null, null, [] when no route exists.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -3233,6 +3250,104 @@ def _validate_policytx_state(data, node_set, pair_set):
     return v, rules, history
 
 
+def _policytx_rule_shape(item):
+    # Topology-independent shape/range check for one policytx rule
+    # [n, s, d, a, b, c, path]: n in 0..MAX_COST, s/d are strings (node
+    # membership is checked against the selected replay topology),
+    # 0 <= a <= b <= 65535, c is null or a 1..32 UTF-8 codepoint string,
+    # and path is a non-empty list of strings starting at s and ending
+    # at d with no repeated node. Edge membership (and therefore whether
+    # the rule is legal for the topology) is checked by the caller via
+    # _validate_policytx_rules against the selected topology's pair set.
+    if not isinstance(item, list) or len(item) != 7:
+        fail(5)
+    n, s, d, a, b, c, path = item
+    if type(n) is not int or not 0 <= n <= MAX_COST:
+        fail(5)
+    if type(s) is not str or type(d) is not str:
+        fail(5)
+    if (type(a) is not int or type(b) is not int
+            or not 0 <= a <= b <= 65535):
+        fail(5)
+    if c is not None:
+        if type(c) is not str or not 1 <= len(c) <= 32:
+            fail(5)
+        try:
+            c.encode("utf-8")
+        except UnicodeEncodeError:
+            fail(5)
+    if (not isinstance(path, list) or not path
+            or path[0] != s or path[-1] != d):
+        fail(5)
+    for node in path:
+        if type(node) is not str:
+            fail(5)
+    if len(set(path)) != len(path):
+        fail(5)
+    return item
+
+
+def _policytx_state_shape(data):
+    # Topology-independent structural validation of a policytx STATE,
+    # used by the read-only policyreplay entry point where a single STATE
+    # may hold rule sets for several different pack topologies and so no
+    # single node/pair set can validate every history entry up front.
+    # Accepts the legacy {"v", "r"} form (history h=[[v, r]]) and the
+    # {"v", "r", "h"} form with exactly those keys in that order. v is in
+    # 0..MAX_COST, r is a rule set (shape only), and h is a non-empty
+    # array of [version, rules] pairs whose versions are continuous from
+    # the first entry's version through v and whose last entry is exactly
+    # [v, r]. Returns the normalized (v, history) with each rule set only
+    # shape-checked; binding to the selected topology happens after PV is
+    # chosen. The raw rule arrays (not tuples) are kept so equality of
+    # the last entry against [v, r] mirrors _validate_policytx_state.
+    if not isinstance(data, dict):
+        fail(5)
+    keys = list(data.keys())
+    if keys == ["v", "r"]:
+        legacy = True
+    elif keys == ["v", "r", "h"]:
+        legacy = False
+    else:
+        fail(5)
+    v = data["v"]
+    if type(v) is not int or not 0 <= v <= MAX_COST:
+        fail(5)
+    current = data["r"]
+    if not isinstance(current, list):
+        fail(5)
+    for item in current:
+        _policytx_rule_shape(item)
+    if legacy:
+        return v, [[v, [list(rule) for rule in current]]]
+    history_raw = data["h"]
+    if not isinstance(history_raw, list) or len(history_raw) == 0:
+        fail(5)
+    first_entry = history_raw[0]
+    if (not isinstance(first_entry, list) or len(first_entry) != 2
+            or type(first_entry[0]) is not int
+            or first_entry[0] < 0):
+        fail(5)
+    history = []
+    expected_version = first_entry[0]
+    for entry in history_raw:
+        if not isinstance(entry, list) or len(entry) != 2:
+            fail(5)
+        hv, hr = entry
+        if type(hv) is not int or hv != expected_version:
+            fail(5)
+        if not isinstance(hr, list):
+            fail(5)
+        for item in hr:
+            _policytx_rule_shape(item)
+        history.append([hv, [list(rule) for rule in hr]])
+        expected_version += 1
+    if history[-1][0] != v or history[-1][1] != \
+            [list(rule) for rule in current]:
+        fail(5)
+    return v, history
+
+
 def _policytx_export_object(v, rules, history):
     # Normalized history export (policytx op 4): an object with key
     # order v, r, h; h keeps the version and rule-set order, and a
@@ -4735,6 +4850,91 @@ def main():
                       "result": export}
         else:
             fail(5)
+    elif argv[1] == "policyreplay":
+        if len(argv) != 7:
+            fail(2)
+        pack_path, state_path = argv[2], argv[3]
+        tv_text, pv_text, data_text = argv[4], argv[5], argv[6]
+        # Read-only replay of a pack topology version against a
+        # policytx rule-set version. Read/decode PACK and STATE first
+        # (read errors code 3, strict JSON errors code 4), then the
+        # inline DATA, then all shape/range checks (code 5).
+        raw_pack = _load_state(pack_path)
+        raw_state = _load_state(state_path)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        tv = _bounded_int_arg(tv_text)
+        pv = _bounded_int_arg(pv_text)
+        _pack_v, _pack_t, _pack_policy, pack_history = \
+            _validate_config_pack(raw_pack)
+        if tv > _pack_v:
+            # The pack history is continuous over 0..v, so tv > v is
+            # the only way TV can be absent from its h.
+            fail(5)
+        _state_v, state_history = _policytx_state_shape(raw_state)
+        selected_rules_raw = None
+        for hv, hr in state_history:
+            if hv == pv:
+                selected_rules_raw = hr
+                break
+        if selected_rules_raw is None:
+            fail(5)
+        selected_t = None
+        for entry in pack_history:
+            if entry[0] == tv:
+                selected_t = entry[1]
+                break
+        nodes, links, node_set = _validate_topology(selected_t,
+                                                    metrics=True)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        # The selected rule set must be legal for the selected topology:
+        # every s/d and path node names one of its nodes and every path
+        # edge one of its links.
+        rules = _validate_policytx_rules(selected_rules_raw, node_set,
+                                         pair_set)
+        if not isinstance(data, list):
+            fail(5)
+        # Validate and answer each item in one pass, keeping DATA's order
+        # (duplicates included). A failure lands before the shared output
+        # tail, so stdout stays empty; only the ordered results survive.
+        # Per-query scratch (the rule priority order, link maps, and the
+        # Dijkstra tables) is released each iteration, so beyond the
+        # parsed input and the emitted results the working memory stays
+        # O(V^2 + E + L).
+        results = []
+        for item in data:
+            # Each DATA item is exactly [s, d, p, c]; items may repeat
+            # and keep their order, and the array may be empty. s/d may
+            # name the same node.
+            if not isinstance(item, list) or len(item) != 4:
+                fail(5)
+            source, destination, port, klass = item
+            if (type(source) is not str or type(destination) is not str
+                    or source not in node_set
+                    or destination not in node_set):
+                fail(5)
+            if type(port) is not int or not 0 <= port <= 65535:
+                fail(5)
+            if type(klass) is not str or not 1 <= len(klass) <= 32:
+                fail(5)
+            try:
+                klass.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            # Matching follows policytx exactly: ascending n with ties in
+            # array order, endpoint/port-interval/class match, rules whose
+            # path holds a down edge are skipped, and with no match the
+            # route lowest-cost path is the fallback.
+            rule, cost, path = compute_policytx(
+                nodes, links, source, destination, port, klass, rules)
+            results.append([source, destination, port, klass,
+                            rule, cost, path])
+        result = {"topologyVersion": tv, "policyVersion": pv,
+                  "results": results}
     elif argv[1] == "reserve":
         if len(argv) != 4:
             fail(2)
