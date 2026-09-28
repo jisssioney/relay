@@ -21,6 +21,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py loadshift FILE LIMIT FLOWS EVENTS
        python relay.py flowshift FILE LIMIT FLOWS EVENTS
        python relay.py pshift FILE LIMIT FLOWS RULES EVENTS
+       python relay.py pshiftcp FILE LIMIT FLOWS RULES EVENTS I M STATE
        python relay.py retune FILE LIMIT DATA
        python relay.py quality FILE A B DATA
        python relay.py replay FILE A B DATA
@@ -48,7 +49,8 @@ for policyreplay PACK or STATE, and for policytx op 4 also OUT),
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance/retune also those in
 FILE/DATA/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
-pshift also those in FILE/FLOWS/RULES/EVENTS, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/impair/
+pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
+those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/impair/
 compound/audit those in DATA, for compoundcp those in STATE/DATA, for
 branch those in DB/OP, for wm/wmecmp those in FILE/W, for drill/multidrill/convstat/slosum
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
@@ -114,7 +116,12 @@ an e/p entry that is not item-by-item what compound emits, e/p times
 at or after AT or decreasing, a duplicate checkpoint packet id, a c
 that is not [status-0, status-1, status-2 packet counts, completed
 install events], a DATA item t on the wrong side of AT, and a packet
-id already present in the checkpoint; for branch code 3 also covers a
+id already present in the checkpoint; pshiftcp code 3 covers a STATE
+read error (M=1) or write error (M=0), code 4 a STATE with invalid
+UTF-8/JSON syntax, duplicate keys, or non-finite numbers, and code 5
+a bad I or M or a STATE whose i,r,f,n,l,e key order, recomputed
+content, or h digest (FILE bytes plus the compact JSON prefix
+envelope) does not match this invocation; for branch code 3 also covers a
 DB read/write error (for ops 1/2/3, also a missing DB; only op 0 may
 bootstrap an empty one) and code 5 also covers an invalid OP shape,
 name, parent, AT, or DATA, a DB whose entries fail the parent-chain
@@ -284,6 +291,28 @@ rule the array index of the rule that constrained its committed path
 order as [from,to,bandwidth,used] in the final state. The matching pass
 adds O(KR) per event (K live flows, R rules) and O(R) space; an invalid
 FLOWS, RULES, or EVENTS shape is code 5.
+pshiftcp takes FILE LIMIT FLOWS RULES EVENTS exactly like pshift plus
+I, M, STATE: I is a non-boolean decimal integer in 0..the number of
+events and M is 0 or 1. M=0 runs only the first I events, then writes
+the checkpoint STATE; M=1 reads it read-only and replays the remaining
+events. The checkpoint is a JSON object with key order
+i,r,f,n,l,e,h: i is I; r is the current rule set; f follows live flow
+order as [id,s,d,b,p,c,initial-instance-boolean,rule,path] (the boolean
+marks an original FLOWS instance); n follows FILE node order as
+[node,up]; l follows FILE link order as [from,to,up,bandwidth,used]; e
+is the prefix's output event rows; h is the lowercase hex SHA-256 of
+FILE's raw bytes followed by the compact non-ASCII UTF-8 JSON of
+[LIMIT,FLOWS,RULES,EVENTS-prefix,i,r,f,n,l,e]. On resume every field is
+recomputed from this invocation's inputs and must match, including the
+digest; any mismatch is code 5. M=0 writes STATE atomically in that
+key order, compact separators, non-ASCII UTF-8, with one trailing LF
+and stdout identical to those bytes, rewriting nothing when STATE
+already holds them; M=1 never writes and its stdout must be byte-for-
+byte identical to a full pshift run over all events. STATE read/write
+errors are code 3; STATE JSON syntax errors, duplicate keys, and
+non-finite numbers are code 4; a bad I/M, STATE key order or content,
+or digest mismatch is code 5. On failure stdout stays empty and no
+file is changed.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -2274,7 +2303,7 @@ def compute_flowshift(nodes, links, flows, limit, events):
                       for i, link in enumerate(links)]}
 
 
-def compute_pshift(nodes, links, flows, limit, rules, events):
+class _PShiftEngine:
     # Policy-aware variant of compute_flowshift. A live flow is
     # [id, s, d, b, p, c, path] with rules_of[i] holding the array index
     # (in the current rule set) of the rule that constrained its
@@ -2298,54 +2327,63 @@ def compute_pshift(nodes, links, flows, limit, rules, events):
     # the true moved tally still ranks assignments and counts against
     # LIMIT. Beyond compute_flowshift's bounds matching costs O(KR) per
     # event (K live flows, R rules) with O(R) additional space for the
-    # priority order.
-    index_of = {(link["from"], link["to"]): i
-                for i, link in enumerate(links)}
-    capacity = [link["bandwidth"] for link in links]
-    link_up = [link["up"] for link in links]
-    node_up = {n: True for n in nodes}
+    # priority order. The engine is resumable for pshiftcp: events may
+    # be fed to run() in two slices and checkpoint_state() snapshots
+    # the exact mid-run state.
 
-    used = [0] * len(links)
-    live = []
-    marked = []
-    rules_of = []
-    for rid, s, d, b, p, c, path in flows:
-        live.append([rid, s, d, b, p, c, list(path)])
-        marked.append(True)
-        # Initial instances carry no rule binding even when their given
-        # path happens to equal a current rule's path.
-        rules_of.append(None)
-        for a, q in zip(path, path[1:]):
-            used[index_of[(a, q)]] += b
-    for index, used_here in enumerate(used):
-        if used_here > capacity[index]:
-            # As in flowshift, the committed placement must already fit.
-            fail(5)
+    def __init__(self, nodes, links, flows, limit, rules):
+        self.nodes = nodes
+        self.links = links
+        self.limit = limit
+        self.index_of = {(link["from"], link["to"]): i
+                         for i, link in enumerate(links)}
+        self.capacity = [link["bandwidth"] for link in links]
+        self.link_up = [link["up"] for link in links]
+        self.node_up = {n: True for n in nodes}
 
-    current_rules = [list(rule) for rule in rules]
+        self.used = [0] * len(links)
+        self.live = []
+        self.marked = []
+        self.rules_of = []
+        for rid, s, d, b, p, c, path in flows:
+            self.live.append([rid, s, d, b, p, c, list(path)])
+            self.marked.append(True)
+            # Initial instances carry no rule binding even when their
+            # given path happens to equal a current rule's path.
+            self.rules_of.append(None)
+            for a, q in zip(path, path[1:]):
+                self.used[self.index_of[(a, q)]] += b
+        for index, used_here in enumerate(self.used):
+            if used_here > self.capacity[index]:
+                # As in flowshift, the committed placement must already
+                # fit.
+                fail(5)
 
-    def build_adj():
-        current = {n: [] for n in nodes}
-        for index, link in enumerate(links):
-            if (link_up[index] and node_up[link["from"]]
-                    and node_up[link["to"]]):
+        self.current_rules = [list(rule) for rule in rules]
+        self.adj = self.build_adj()
+        self.results = []
+
+    def build_adj(self):
+        current = {n: [] for n in self.nodes}
+        for index, link in enumerate(self.links):
+            if (self.link_up[index]
+                    and self.node_up[link["from"]]
+                    and self.node_up[link["to"]]):
                 current[link["from"]].append((link["to"], index))
         return current
 
-    adj = build_adj()
-
-    def peak_of(counts):
+    def peak_of(self, counts):
         num, den = 0, 1
-        for u, cap in zip(counts, capacity):
+        for u, cap in zip(counts, self.capacity):
             if u * den > num * cap:
                 num, den = u, cap
         return num, den
 
-    def enum_paths(source, destination):
+    def enum_paths(self, source, destination):
         path = [source]
         edges = []
         visited = {source}
-        stack = [iter(adj[source])]
+        stack = [iter(self.adj[source])]
         while stack:
             try:
                 to, eindex = next(stack[-1])
@@ -2365,29 +2403,29 @@ def compute_pshift(nodes, links, flows, limit, rules, events):
                 visited.remove(path.pop())
                 edges.pop()
             else:
-                stack.append(iter(adj[to]))
+                stack.append(iter(self.adj[to]))
 
-    def match_for(s, d, p, c, order):
+    def match_for(self, s, d, p, c, order):
         # First usable policytx match for one flow against the current
         # rule set, or None. Returns (rule index, path, edge indices).
         for i in order:
-            _, rs, rd, ra, rb, rc, rpath = current_rules[i]
+            _, rs, rd, ra, rb, rc, rpath = self.current_rules[i]
             if rs != s or rd != d:
                 continue
             if not ra <= p <= rb:
                 continue
             if rc is not None and rc != c:
                 continue
-            edge_ids = [index_of[(x, y)]
+            edge_ids = [self.index_of[(x, y)]
                         for x, y in zip(rpath, rpath[1:])]
-            if all(link_up[e]
-                   and node_up[links[e]["from"]]
-                   and node_up[links[e]["to"]]
+            if all(self.link_up[e]
+                   and self.node_up[self.links[e]["from"]]
+                   and self.node_up[self.links[e]["to"]]
                    for e in edge_ids):
                 return i, rpath, edge_ids
         return None
 
-    def prepare(rows, flags, extra):
+    def prepare(self, rows, flags, extra):
         # Build the search inputs for rows (live-style entries, their
         # paths are the committed bases) plus event-born extra tuples
         # (id, s, d, b, p, c) with base None. A spec's force entry is
@@ -2395,14 +2433,14 @@ def compute_pshift(nodes, links, flows, limit, rules, events):
         # (path, edges) forced by the first usable matching rule.
         # rule_idx parallels the specs and records the binding the
         # assignment commits.
-        order = _priority_order(current_rules)
+        order = _priority_order(self.current_rules)
         specs = []
         bases = []
         out_flags = []
         rule_idx = []
 
         def add(s, d, b, p, c, base, flag):
-            match = match_for(s, d, p, c, order)
+            match = self.match_for(s, d, p, c, order)
             if match is None:
                 force = None
                 binding = None
@@ -2421,14 +2459,15 @@ def compute_pshift(nodes, links, flows, limit, rules, events):
             add(s, d, b, p, c, None, False)
         return specs, out_flags, bases, rule_idx
 
-    def search(specs, count_flags, base_paths):
+    def search(self, specs, count_flags, base_paths):
         # Same Cartesian-product search as compute_flowshift, except a
         # spec draws its one forced (path, edges) pair when a rule
         # matched instead of enumerating simple paths.
+        capacity = self.capacity
         count = len(specs)
         best_num = best_den = best_moved = None
         best_paths = best_used = None
-        trial = [0] * len(links)
+        trial = [0] * len(self.links)
         cur_paths = [None] * count
         cur_edges = [None] * count
         gens = [None] * count
@@ -2436,7 +2475,7 @@ def compute_pshift(nodes, links, flows, limit, rules, events):
         moved = 0
         depth = 0
         if count:
-            gens[0] = enum_paths(specs[0][0], specs[0][1]) \
+            gens[0] = self.enum_paths(specs[0][0], specs[0][1]) \
                 if specs[0][3] is None else iter((specs[0][3],))
         while depth >= 0:
             if count == 0:
@@ -2468,7 +2507,7 @@ def compute_pshift(nodes, links, flows, limit, rules, events):
                 delta_limit = 1 if count_flags[depth] else 0
             else:
                 delta_limit = 0
-            if limited + delta_limit > limit:
+            if limited + delta_limit > self.limit:
                 if base is not None and path != base:
                     moved -= 1
                 continue
@@ -2479,12 +2518,12 @@ def compute_pshift(nodes, links, flows, limit, rules, events):
             limited += delta_limit
             if depth + 1 < count:
                 depth += 1
-                gens[depth] = enum_paths(specs[depth][0],
-                                         specs[depth][1]) \
+                gens[depth] = self.enum_paths(specs[depth][0],
+                                              specs[depth][1]) \
                     if specs[depth][3] is None \
                     else iter((specs[depth][3],))
             else:
-                num, den = peak_of(trial)
+                num, den = self.peak_of(trial)
                 if (best_paths is None
                         or num * best_den < best_num * den
                         or (num * best_den == best_num * den
@@ -2506,180 +2545,261 @@ def compute_pshift(nodes, links, flows, limit, rules, events):
             return None
         return best_num, best_den, best_moved, best_paths, best_used
 
-    def snapshot_flows():
-        return [[rid, s, d, b, p, c, rules_of[i], list(path)]
-                for i, (rid, s, d, b, p, c, path) in enumerate(live)]
+    def snapshot_flows(self):
+        return [[rid, s, d, b, p, c, self.rules_of[i], list(path)]
+                for i, (rid, s, d, b, p, c, path)
+                in enumerate(self.live)]
 
-    def row(t, kind, status, num, den, moved_count):
+    def row(self, t, kind, status, num, den, moved_count):
         return [t, kind, status, _format_peak(num, den), moved_count,
-                snapshot_flows()]
+                self.snapshot_flows()]
 
-    def reject_row(t, kind):
-        num, den = peak_of(used)
-        return row(t, kind, 2, num, den, 0)
+    def reject_row(self, t, kind):
+        num, den = self.peak_of(self.used)
+        return self.row(t, kind, 2, num, den, 0)
 
-    def idempotent_row(t, kind):
-        num, den = peak_of(used)
-        return row(t, kind, 1, num, den, 0)
+    def idempotent_row(self, t, kind):
+        num, den = self.peak_of(self.used)
+        return self.row(t, kind, 1, num, den, 0)
 
-    def reroute(t, kind, additions=None, report_zero=False):
+    def reroute(self, t, kind, additions=None, report_zero=False):
         # Jointly assign the current flow set plus optional event-born
         # tuples appended at the tail. On success commit live/marked/
         # rules_of/used and return the row; on failure change nothing
         # and return None. report_zero emits moved=0 (kind 4/5) while
         # the ranking's moved tally is unaffected.
-        nonlocal adj, used
-        adj = build_adj()
-        specs, flags, bases, match_idx = prepare(
-            live, marked, additions or [])
-        found = search(specs, flags, bases)
+        self.adj = self.build_adj()
+        specs, flags, bases, match_idx = self.prepare(
+            self.live, self.marked, additions or [])
+        found = self.search(specs, flags, bases)
         if found is None:
             return None
         num, den, moved_count, new_paths, new_used = found
-        used = new_used
-        old_count = len(live)
+        self.used = new_used
+        old_count = len(self.live)
         for i in range(old_count):
-            live[i][6] = new_paths[i]
-            rules_of[i] = match_idx[i]
+            self.live[i][6] = new_paths[i]
+            self.rules_of[i] = match_idx[i]
         if additions:
             for j, (nid, s, d, b, p, c) in enumerate(additions):
-                live.append([nid, s, d, b, p, c,
-                             new_paths[old_count + j]])
-                rules_of.append(match_idx[old_count + j])
-            marked.extend(False for _ in additions)
+                self.live.append([nid, s, d, b, p, c,
+                                  new_paths[old_count + j]])
+                self.rules_of.append(match_idx[old_count + j])
+            self.marked.extend(False for _ in additions)
         reported_moved = 0 if report_zero else moved_count
-        return row(t, kind, 0, num, den, reported_moved)
+        return self.row(t, kind, 0, num, den, reported_moved)
 
-    results = []
-    for event in events:
+    def process_event(self, event):
         kind = event[0]
         t = event[1]
-        position = {flow[0]: i for i, flow in enumerate(live)}
+        position = {flow[0]: i for i, flow in enumerate(self.live)}
         if kind == 0:
             _, _, u, v, nb = event
-            eindex = index_of[(u, v)]
-            if nb == capacity[eindex]:
-                results.append(idempotent_row(t, kind))
-                continue
-            old_bw = capacity[eindex]
-            capacity[eindex] = nb
-            outcome = reroute(t, kind)
+            eindex = self.index_of[(u, v)]
+            if nb == self.capacity[eindex]:
+                self.results.append(self.idempotent_row(t, kind))
+                return
+            old_bw = self.capacity[eindex]
+            self.capacity[eindex] = nb
+            outcome = self.reroute(t, kind)
             if outcome is None:
-                capacity[eindex] = old_bw
-                results.append(reject_row(t, kind))
+                self.capacity[eindex] = old_bw
+                self.results.append(self.reject_row(t, kind))
             else:
-                results.append(outcome)
+                self.results.append(outcome)
         elif kind == 1:
             _, _, nid, s, d, nb, p, c = event
             if nid in position:
-                flow = live[position[nid]]
+                flow = self.live[position[nid]]
                 if (flow[1], flow[2], flow[3], flow[4], flow[5]) \
                         != (s, d, nb, p, c):
                     # Re-adding a live id is idempotent only when
                     # s/d/b/p/c are all identical.
                     fail(5)
-                results.append(idempotent_row(t, kind))
-                continue
-            outcome = reroute(
+                self.results.append(self.idempotent_row(t, kind))
+                return
+            outcome = self.reroute(
                 t, kind, additions=[(nid, s, d, nb, p, c)])
             if outcome is None:
-                results.append(reject_row(t, kind))
+                self.results.append(self.reject_row(t, kind))
             else:
-                results.append(outcome)
+                self.results.append(outcome)
         elif kind == 2:
             _, _, nid = event
             if nid not in position:
-                results.append(idempotent_row(t, kind))
-                continue
+                self.results.append(self.idempotent_row(t, kind))
+                return
             drop = position[nid]
-            survivors = live[:drop] + live[drop + 1:]
-            surviving_flags = marked[:drop] + marked[drop + 1:]
-            surviving_bindings = rules_of[:drop] + rules_of[drop + 1:]
-            adj = build_adj()
-            specs, flags, bases, match_idx = prepare(
+            survivors = self.live[:drop] + self.live[drop + 1:]
+            surviving_flags = self.marked[:drop] + self.marked[drop + 1:]
+            surviving_bindings = (self.rules_of[:drop]
+                                  + self.rules_of[drop + 1:])
+            self.adj = self.build_adj()
+            specs, flags, bases, match_idx = self.prepare(
                 survivors, surviving_flags, [])
-            found = search(specs, flags, bases)
+            found = self.search(specs, flags, bases)
             if found is None:
                 # Defensive, as in flowshift: the survivors' committed
                 # paths stay feasible after a deletion.
-                results.append(reject_row(t, kind))
+                self.results.append(self.reject_row(t, kind))
             else:
                 num, den, moved_count, new_paths, new_used = found
-                used = new_used
+                self.used = new_used
                 for i, path in enumerate(new_paths):
                     survivors[i][6] = path
                     surviving_bindings[i] = match_idx[i]
-                live = survivors
-                marked = surviving_flags
-                rules_of = surviving_bindings
-                results.append(
-                    row(t, kind, 0, num, den, moved_count))
+                self.live = survivors
+                self.marked = surviving_flags
+                self.rules_of = surviving_bindings
+                self.results.append(
+                    self.row(t, kind, 0, num, den, moved_count))
         elif kind == 3:
             _, _, nid, nb = event
             if nid not in position:
                 fail(5)
-            target = live[position[nid]]
+            target = self.live[position[nid]]
             if nb == target[3]:
-                results.append(idempotent_row(t, kind))
-                continue
+                self.results.append(self.idempotent_row(t, kind))
+                return
             old_b = target[3]
             target[3] = nb
-            outcome = reroute(t, kind)
+            outcome = self.reroute(t, kind)
             if outcome is None:
                 target[3] = old_b
-                results.append(reject_row(t, kind))
+                self.results.append(self.reject_row(t, kind))
             else:
-                results.append(outcome)
+                self.results.append(outcome)
         elif kind == 4:
             _, _, n, bring_up = event
-            if node_up[n] == bring_up:
-                results.append(idempotent_row(t, kind))
-                continue
-            old_up = node_up[n]
-            node_up[n] = bring_up
-            outcome = reroute(t, kind, report_zero=True)
+            if self.node_up[n] == bring_up:
+                self.results.append(self.idempotent_row(t, kind))
+                return
+            old_up = self.node_up[n]
+            self.node_up[n] = bring_up
+            outcome = self.reroute(t, kind, report_zero=True)
             if outcome is None:
-                node_up[n] = old_up
-                adj = build_adj()
-                results.append(reject_row(t, kind))
+                self.node_up[n] = old_up
+                self.adj = self.build_adj()
+                self.results.append(self.reject_row(t, kind))
             else:
-                results.append(outcome)
+                self.results.append(outcome)
         elif kind == 5:
             _, _, u, v, bring_up = event
-            eindex = index_of[(u, v)]
-            if link_up[eindex] == bring_up:
-                results.append(idempotent_row(t, kind))
-                continue
-            old_up = link_up[eindex]
-            link_up[eindex] = bring_up
-            outcome = reroute(t, kind, report_zero=True)
+            eindex = self.index_of[(u, v)]
+            if self.link_up[eindex] == bring_up:
+                self.results.append(self.idempotent_row(t, kind))
+                return
+            old_up = self.link_up[eindex]
+            self.link_up[eindex] = bring_up
+            outcome = self.reroute(t, kind, report_zero=True)
             if outcome is None:
-                link_up[eindex] = old_up
-                adj = build_adj()
-                results.append(reject_row(t, kind))
+                self.link_up[eindex] = old_up
+                self.adj = self.build_adj()
+                self.results.append(self.reject_row(t, kind))
             else:
-                results.append(outcome)
+                self.results.append(outcome)
         else:
             _, _, new_rules = event
-            if [list(rule) for rule in new_rules] == current_rules:
+            if [list(rule) for rule in new_rules] == self.current_rules:
                 # Loading the rule set already current is idempotent.
-                results.append(idempotent_row(t, kind))
-                continue
-            old_rules = current_rules
-            current_rules = [list(rule) for rule in new_rules]
-            outcome = reroute(t, kind)
+                self.results.append(self.idempotent_row(t, kind))
+                return
+            old_rules = self.current_rules
+            self.current_rules = [list(rule) for rule in new_rules]
+            outcome = self.reroute(t, kind)
             if outcome is None:
                 # Reject: restore the old rule set; paths and loads
                 # were never mutated by the trial search and the usable
                 # adjacency does not depend on the rule set.
-                current_rules = old_rules
-                results.append(reject_row(t, kind))
+                self.current_rules = old_rules
+                self.results.append(self.reject_row(t, kind))
             else:
-                results.append(outcome)
+                self.results.append(outcome)
 
-    return {"events": results,
-            "links": [[link["from"], link["to"], capacity[i], used[i]]
-                      for i, link in enumerate(links)]}
+    def run(self, events):
+        for event in events:
+            self.process_event(event)
+        return self.result()
+
+    def result(self):
+        return {"events": self.results,
+                "links": [[link["from"], link["to"],
+                           self.capacity[i], self.used[i]]
+                          for i, link in enumerate(self.links)]}
+
+
+def compute_pshift(nodes, links, flows, limit, rules, events):
+    return _PShiftEngine(nodes, links, flows, limit, rules).run(events)
+
+
+def _pshiftcp_state(engine, cut, limit, raw_flows, raw_rules,
+                    raw_events, file_bytes):
+    # Build the pshiftcp checkpoint after the first cut events from an
+    # engine run: keys i,r,f,n,l,e,h in this order. r is the current
+    # rule set; f follows live flow order as
+    # [id,s,d,b,p,c,initial-instance-bool,rule,path]; n follows FILE
+    # node order as [node,up]; l follows FILE link order as
+    # [from,to,up,bandwidth,used]; e is the prefix output event rows.
+    # h is the SHA-256, lowercase hex, of FILE's raw bytes followed by
+    # the compact non-ASCII UTF-8 JSON of
+    # [LIMIT,FLOWS,RULES,EVENTS-prefix,i,r,f,n,l,e].
+    r_arr = [list(rule) for rule in engine.current_rules]
+    f_arr = [[rid, s, d, b, p, c, bool(engine.marked[idx]),
+              engine.rules_of[idx], list(path)]
+             for idx, (rid, s, d, b, p, c, path)
+             in enumerate(engine.live)]
+    n_arr = [[node, engine.node_up[node]] for node in engine.nodes]
+    l_arr = [[link["from"], link["to"], engine.link_up[idx],
+              engine.capacity[idx], engine.used[idx]]
+             for idx, link in enumerate(engine.links)]
+    e_arr = engine.results
+    envelope = [limit, raw_flows, raw_rules, raw_events[:cut], cut,
+                r_arr, f_arr, n_arr, l_arr, e_arr]
+    payload = json.dumps(envelope, ensure_ascii=False,
+                         separators=(",", ":"))
+    digest = hashlib.sha256(
+        file_bytes + payload.encode("utf-8")).hexdigest()
+    return {"i": cut, "r": r_arr, "f": f_arr, "n": n_arr,
+            "l": l_arr, "e": e_arr, "h": digest}
+
+
+def _validate_pshiftcp_state(data, engine, cut, limit, raw_flows,
+                             raw_rules, raw_events, file_bytes):
+    # Verify a pshiftcp checkpoint against this invocation: key order
+    # i,r,f,n,l,e,h first, then the h digest over FILE's raw bytes plus
+    # the compact UTF-8 JSON of
+    # [LIMIT,FLOWS,RULES,EVENTS-prefix,i,r,f,n,l,e], then every field
+    # recomputed by replaying the prefix from scratch. cut must equal
+    # the stored i; any mismatch is code 5.
+    keys = ["i", "r", "f", "n", "l", "e", "h"]
+    if not isinstance(data, dict) or list(data.keys()) != keys:
+        fail(5)
+    stored_i = data["i"]
+    r_arr = data["r"]
+    f_arr = data["f"]
+    n_arr = data["n"]
+    l_arr = data["l"]
+    e_arr = data["e"]
+    digest = data["h"]
+    if type(stored_i) is not int or type(stored_i) is bool \
+            or stored_i != cut:
+        fail(5)
+    if type(digest) is not str:
+        fail(5)
+    envelope = [limit, raw_flows, raw_rules, raw_events[:cut], cut,
+                r_arr, f_arr, n_arr, l_arr, e_arr]
+    payload = json.dumps(envelope, ensure_ascii=False,
+                         separators=(",", ":"))
+    expected = hashlib.sha256(
+        file_bytes + payload.encode("utf-8")).hexdigest()
+    if digest != expected:
+        fail(5)
+    recomputed = _pshiftcp_state(engine, cut, limit, raw_flows,
+                                 raw_rules, raw_events, file_bytes)
+    if (r_arr != recomputed["r"] or f_arr != recomputed["f"]
+            or n_arr != recomputed["n"] or l_arr != recomputed["l"]
+            or e_arr != recomputed["e"]):
+        fail(5)
 
 
 def compute_quality(a, b, items):
@@ -5967,6 +6087,195 @@ def _validate_hotload_records(links, events, data, node_set, pair_set, a, b):
                     fail(5)
 
 
+def _parse_pshift_args(file_path, limit_text, flows_text, rules_text,
+                       events_text):
+    # Shared FILE/LIMIT/FLOWS/RULES/EVENTS parsing for pshift and
+    # pshiftcp: load the metrics topology strictly, decode the three
+    # inline JSON arguments with the strict code-4 rules, and run
+    # pshift's exact per-item validation (code 5). Returns the topology,
+    # FILE's raw bytes, the decoded FLOWS/RULES/EVENTS values (for the
+    # checkpoint envelope), the validated flow tuples and rule tuples,
+    # LIMIT, and the validated event tuples.
+    nodes, links, node_set = load_network(file_path, metrics=True,
+                                          strict=True)
+    try:
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
+    except OSError:
+        fail(3)
+    try:
+        raw_flows = json.loads(
+            flows_text, parse_constant=_reject_constant,
+            parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+        raw_rules = json.loads(
+            rules_text, parse_constant=_reject_constant,
+            parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+        raw_events = json.loads(
+            events_text, parse_constant=_reject_constant,
+            parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+    except (ValueError, RecursionError):
+        fail(4)
+    # FLOWS is [id,s,d,b,p,c,path]: id/s/d/b/path keep flowshift's
+    # per-item checks (the given path only has to be an up simple
+    # path in FILE, never a RULES path), p/c keep the policytx
+    # query checks (p a non-boolean integer in 0..65535, c a
+    # 1..32 codepoint UTF-8 string; only a rule's c may be null).
+    if not isinstance(raw_flows, list):
+        fail(5)
+    up_of = {}
+    for link in links:
+        up_of[(link["from"], link["to"])] = link["up"]
+    pair_set = set(up_of)
+    # RULES uses policytx's rule-set shape exactly.
+    rules = _validate_policytx_rules(raw_rules, node_set, pair_set)
+    flows = []
+    seen_ids = set()
+    for item in raw_flows:
+        if not isinstance(item, list) or len(item) != 7:
+            fail(5)
+        rid, s, d, b, port, klass, path = item
+        if type(rid) is not str or not 1 <= len(rid) <= 64:
+            fail(5)
+        try:
+            rid.encode("utf-8")
+        except UnicodeEncodeError:
+            fail(5)
+        if rid in seen_ids:
+            fail(5)
+        seen_ids.add(rid)
+        if (type(s) is not str or type(d) is not str
+                or s not in node_set or d not in node_set or s == d):
+            fail(5)
+        if type(b) is not int or not 1 <= b <= MAX_COST:
+            fail(5)
+        if type(port) is not int or not 0 <= port <= 65535:
+            fail(5)
+        if type(klass) is not str or not 1 <= len(klass) <= 32:
+            fail(5)
+        try:
+            klass.encode("utf-8")
+        except UnicodeEncodeError:
+            fail(5)
+        if (not isinstance(path, list) or not path
+                or path[0] != s or path[-1] != d):
+            fail(5)
+        for node in path:
+            if type(node) is not str or node not in node_set:
+                fail(5)
+        if len(set(path)) != len(path):
+            fail(5)
+        for a, q in zip(path, path[1:]):
+            edge_pair = (a, q)
+            if edge_pair not in up_of or not up_of[edge_pair]:
+                fail(5)
+        flows.append((rid, s, d, b, port, klass, path))
+    limit = _bounded_int_arg(limit_text)
+    # EVENTS is a non-empty array of flowshift's kinds 0..5 with
+    # kind 1 extended to [t,1,id,s,d,b,p,c], plus
+    # [t,6,R] with R a policytx rule set. t is non-decreasing;
+    # cross-event semantics are enforced during the replay and are
+    # also code 5.
+    if not isinstance(raw_events, list) or not raw_events:
+        fail(5)
+
+    def pshift_valid_id(value):
+        if type(value) is not str or not 1 <= len(value) <= 64:
+            return False
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            return False
+        return True
+
+    events = []
+    previous_time = None
+    for item in raw_events:
+        if not isinstance(item, list) or len(item) < 2:
+            fail(5)
+        t, kind = item[0], item[1]
+        if type(t) is not int or not 0 <= t <= MAX_COST:
+            fail(5)
+        if previous_time is not None and t < previous_time:
+            fail(5)
+        if type(kind) is not int or kind not in (0, 1, 2, 3, 4, 5, 6):
+            fail(5)
+        if kind == 0:
+            if len(item) != 5:
+                fail(5)
+            _, _, u, v, b = item
+            if type(u) is not str or type(v) is not str \
+                    or (u, v) not in pair_set:
+                fail(5)
+            if type(b) is not int or not 1 <= b <= MAX_COST:
+                fail(5)
+            events.append((0, t, u, v, b))
+        elif kind == 1:
+            if len(item) != 8:
+                fail(5)
+            _, _, nid, s, d, b, port, klass = item
+            if not pshift_valid_id(nid):
+                fail(5)
+            if (type(s) is not str or type(d) is not str
+                    or s not in node_set or d not in node_set
+                    or s == d):
+                fail(5)
+            if type(b) is not int or not 1 <= b <= MAX_COST:
+                fail(5)
+            if type(port) is not int or not 0 <= port <= 65535:
+                fail(5)
+            if type(klass) is not str or not 1 <= len(klass) <= 32:
+                fail(5)
+            try:
+                klass.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            events.append((1, t, nid, s, d, b, port, klass))
+        elif kind == 2:
+            if len(item) != 3:
+                fail(5)
+            _, _, nid = item
+            if not pshift_valid_id(nid):
+                fail(5)
+            events.append((2, t, nid))
+        elif kind == 3:
+            if len(item) != 4:
+                fail(5)
+            _, _, nid, b = item
+            if not pshift_valid_id(nid):
+                fail(5)
+            if type(b) is not int or not 1 <= b <= MAX_COST:
+                fail(5)
+            events.append((3, t, nid, b))
+        elif kind == 4:
+            if len(item) != 4:
+                fail(5)
+            _, _, n, bring_up = item
+            if type(n) is not str or n not in node_set:
+                fail(5)
+            if type(bring_up) is not bool:
+                fail(5)
+            events.append((4, t, n, bring_up))
+        elif kind == 5:
+            if len(item) != 5:
+                fail(5)
+            _, _, u, v, bring_up = item
+            if type(u) is not str or type(v) is not str \
+                    or (u, v) not in pair_set:
+                fail(5)
+            if type(bring_up) is not bool:
+                fail(5)
+            events.append((5, t, u, v, bring_up))
+        else:
+            if len(item) != 3:
+                fail(5)
+            new_rules = _validate_policytx_rules(
+                item[2], node_set, pair_set)
+            events.append((6, t, new_rules))
+        previous_time = t
+    return (nodes, links, node_set, file_bytes, limit,
+            raw_flows, raw_rules, raw_events, flows, rules, events)
+
+
 def main():
     argv = sys.argv
     if len(argv) < 2:
@@ -7087,180 +7396,63 @@ def main():
     elif argv[1] == "pshift":
         if len(argv) != 7:
             fail(2)
+        (nodes, links, node_set, file_bytes, limit,
+         raw_flows, raw_rules, raw_events, flows, rules,
+         events) = _parse_pshift_args(argv[2], argv[3], argv[4],
+                                      argv[5], argv[6])
+        result = compute_pshift(nodes, links, flows, limit, rules, events)
+    elif argv[1] == "pshiftcp":
+        if len(argv) != 10:
+            fail(2)
         file_path, limit_text, flows_text, rules_text, events_text = \
             argv[2], argv[3], argv[4], argv[5], argv[6]
-        nodes, links, node_set = load_network(file_path, metrics=True,
-                                              strict=True)
-        try:
-            raw_flows = json.loads(
-                flows_text, parse_constant=_reject_constant,
-                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
-            raw_rules = json.loads(
-                rules_text, parse_constant=_reject_constant,
-                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
-            raw_events = json.loads(
-                events_text, parse_constant=_reject_constant,
-                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
-        except (ValueError, RecursionError):
-            fail(4)
-        # FLOWS is [id,s,d,b,p,c,path]: id/s/d/b/path keep flowshift's
-        # per-item checks (the given path only has to be an up simple
-        # path in FILE, never a RULES path), p/c keep the policytx
-        # query checks (p a non-boolean integer in 0..65535, c a
-        # 1..32 codepoint UTF-8 string; only a rule's c may be null).
-        if not isinstance(raw_flows, list):
+        cut_text, mode_text, state_path = argv[7], argv[8], argv[9]
+        (nodes, links, node_set, file_bytes, limit,
+         raw_flows, raw_rules, raw_events, flows, rules,
+         events) = _parse_pshift_args(file_path, limit_text, flows_text,
+                                      rules_text, events_text)
+        # I is a non-boolean integer in 0..len(EVENTS); M is 0 or 1.
+        cut = _bounded_int_arg(cut_text)
+        if cut > len(events):
             fail(5)
-        up_of = {}
-        for link in links:
-            up_of[(link["from"], link["to"])] = link["up"]
-        pair_set = set(up_of)
-        # RULES uses policytx's rule-set shape exactly.
-        rules = _validate_policytx_rules(raw_rules, node_set, pair_set)
-        flows = []
-        seen_ids = set()
-        for item in raw_flows:
-            if not isinstance(item, list) or len(item) != 7:
-                fail(5)
-            rid, s, d, b, port, klass, path = item
-            if type(rid) is not str or not 1 <= len(rid) <= 64:
-                fail(5)
-            try:
-                rid.encode("utf-8")
-            except UnicodeEncodeError:
-                fail(5)
-            if rid in seen_ids:
-                fail(5)
-            seen_ids.add(rid)
-            if (type(s) is not str or type(d) is not str
-                    or s not in node_set or d not in node_set or s == d):
-                fail(5)
-            if type(b) is not int or not 1 <= b <= MAX_COST:
-                fail(5)
-            if type(port) is not int or not 0 <= port <= 65535:
-                fail(5)
-            if type(klass) is not str or not 1 <= len(klass) <= 32:
-                fail(5)
-            try:
-                klass.encode("utf-8")
-            except UnicodeEncodeError:
-                fail(5)
-            if (not isinstance(path, list) or not path
-                    or path[0] != s or path[-1] != d):
-                fail(5)
-            for node in path:
-                if type(node) is not str or node not in node_set:
-                    fail(5)
-            if len(set(path)) != len(path):
-                fail(5)
-            for a, q in zip(path, path[1:]):
-                edge_pair = (a, q)
-                if edge_pair not in up_of or not up_of[edge_pair]:
-                    fail(5)
-            flows.append((rid, s, d, b, port, klass, path))
-        limit = _bounded_int_arg(limit_text)
-        # EVENTS is a non-empty array of flowshift's kinds 0..5 with
-        # kind 1 extended to [t,1,id,s,d,b,p,c], plus
-        # [t,6,R] with R a policytx rule set. t is non-decreasing;
-        # cross-event semantics are enforced during the replay and are
-        # also code 5.
-        if not isinstance(raw_events, list) or not raw_events:
+        mode = _bounded_int_arg(mode_text)
+        if mode > 1:
             fail(5)
-
-        def pshift_valid_id(value):
-            if type(value) is not str or not 1 <= len(value) <= 64:
-                return False
+        if mode == 0:
+            # Run only the first I events, archive the mid-run state,
+            # and emit exactly that checkpoint (stdout is byte-identical
+            # to what STATE holds).
+            engine = _PShiftEngine(nodes, links, flows, limit, rules)
+            engine.run(events[:cut])
+            checkpoint = _pshiftcp_state(
+                engine, cut, limit, raw_flows, raw_rules, raw_events,
+                file_bytes)
+            payload = _state_payload(checkpoint)
+            # Atomic replace, skipped when the file already holds
+            # exactly these bytes; a write failure leaves it untouched.
             try:
-                value.encode("utf-8")
-            except UnicodeEncodeError:
-                return False
-            return True
-
-        events = []
-        previous_time = None
-        for item in raw_events:
-            if not isinstance(item, list) or len(item) < 2:
-                fail(5)
-            t, kind = item[0], item[1]
-            if type(t) is not int or not 0 <= t <= MAX_COST:
-                fail(5)
-            if previous_time is not None and t < previous_time:
-                fail(5)
-            if type(kind) is not int or kind not in (0, 1, 2, 3, 4, 5, 6):
-                fail(5)
-            if kind == 0:
-                if len(item) != 5:
-                    fail(5)
-                _, _, u, v, b = item
-                if type(u) is not str or type(v) is not str \
-                        or (u, v) not in pair_set:
-                    fail(5)
-                if type(b) is not int or not 1 <= b <= MAX_COST:
-                    fail(5)
-                events.append((0, t, u, v, b))
-            elif kind == 1:
-                if len(item) != 8:
-                    fail(5)
-                _, _, nid, s, d, b, port, klass = item
-                if not pshift_valid_id(nid):
-                    fail(5)
-                if (type(s) is not str or type(d) is not str
-                        or s not in node_set or d not in node_set
-                        or s == d):
-                    fail(5)
-                if type(b) is not int or not 1 <= b <= MAX_COST:
-                    fail(5)
-                if type(port) is not int or not 0 <= port <= 65535:
-                    fail(5)
-                if type(klass) is not str or not 1 <= len(klass) <= 32:
-                    fail(5)
-                try:
-                    klass.encode("utf-8")
-                except UnicodeEncodeError:
-                    fail(5)
-                events.append((1, t, nid, s, d, b, port, klass))
-            elif kind == 2:
-                if len(item) != 3:
-                    fail(5)
-                _, _, nid = item
-                if not pshift_valid_id(nid):
-                    fail(5)
-                events.append((2, t, nid))
-            elif kind == 3:
-                if len(item) != 4:
-                    fail(5)
-                _, _, nid, b = item
-                if not pshift_valid_id(nid):
-                    fail(5)
-                if type(b) is not int or not 1 <= b <= MAX_COST:
-                    fail(5)
-                events.append((3, t, nid, b))
-            elif kind == 4:
-                if len(item) != 4:
-                    fail(5)
-                _, _, n, bring_up = item
-                if type(n) is not str or n not in node_set:
-                    fail(5)
-                if type(bring_up) is not bool:
-                    fail(5)
-                events.append((4, t, n, bring_up))
-            elif kind == 5:
-                if len(item) != 5:
-                    fail(5)
-                _, _, u, v, bring_up = item
-                if type(u) is not str or type(v) is not str \
-                        or (u, v) not in pair_set:
-                    fail(5)
-                if type(bring_up) is not bool:
-                    fail(5)
-                events.append((5, t, u, v, bring_up))
-            else:
-                if len(item) != 3:
-                    fail(5)
-                new_rules = _validate_policytx_rules(
-                    item[2], node_set, pair_set)
-                events.append((6, t, new_rules))
-            previous_time = t
-        result = compute_pshift(nodes, links, flows, limit, rules, events)
+                with open(state_path, "rb") as f:
+                    current = f.read()
+            except FileNotFoundError:
+                current = None
+            except OSError:
+                fail(3)
+            if current != payload:
+                _write_state_atomic(state_path, checkpoint)
+            result = checkpoint
+        else:
+            # Read-only resume: the checkpoint must match this
+            # invocation exactly (digest and every recomputed field),
+            # then the remaining events continue from the archived
+            # state, producing the full pshift output byte for byte.
+            raw_state = _load_state(state_path)
+            prefix = _PShiftEngine(nodes, links, flows, limit, rules)
+            prefix.run(events[:cut])
+            _validate_pshiftcp_state(
+                raw_state, prefix, cut, limit, raw_flows, raw_rules,
+                raw_events, file_bytes)
+            prefix.run(events[cut:])
+            result = prefix.result()
     elif argv[1] == "retune":
         if len(argv) != 5:
             fail(2)
