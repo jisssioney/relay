@@ -21,7 +21,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py loadshift FILE LIMIT FLOWS EVENTS
        python relay.py flowshift FILE LIMIT FLOWS EVENTS
        python relay.py pshift FILE LIMIT FLOWS RULES EVENTS
-       python relay.py pshiftcp FILE LIMIT FLOWS RULES EVENTS I M STATE
+       python relay.py pshiftcp FILE LIMIT FLOWS RULES I M STATE EVENTS
        python relay.py retune FILE LIMIT DATA
        python relay.py quality FILE A B DATA
        python relay.py replay FILE A B DATA
@@ -291,28 +291,32 @@ rule the array index of the rule that constrained its committed path
 order as [from,to,bandwidth,used] in the final state. The matching pass
 adds O(KR) per event (K live flows, R rules) and O(R) space; an invalid
 FLOWS, RULES, or EVENTS shape is code 5.
-pshiftcp takes FILE LIMIT FLOWS RULES EVENTS exactly like pshift plus
-I, M, STATE: I is a non-boolean decimal integer in 0..the number of
-events and M is 0 or 1. M=0 runs only the first I events, then writes
-the checkpoint STATE; M=1 reads it read-only and replays the remaining
-events. The checkpoint is a JSON object with key order
-i,r,f,n,l,e,h: i is I; r is the current rule set; f follows live flow
-order as [id,s,d,b,p,c,initial-instance-boolean,rule,path] (the boolean
-marks an original FLOWS instance); n follows FILE node order as
-[node,up]; l follows FILE link order as [from,to,up,bandwidth,used]; e
-is the prefix's output event rows; h is the lowercase hex SHA-256 of
-FILE's raw bytes followed by the compact non-ASCII UTF-8 JSON of
-[LIMIT,FLOWS,RULES,EVENTS-prefix,i,r,f,n,l,e]. On resume every field is
-recomputed from this invocation's inputs and must match, including the
-digest; any mismatch is code 5. M=0 writes STATE atomically in that
-key order, compact separators, non-ASCII UTF-8, with one trailing LF
-and stdout identical to those bytes, rewriting nothing when STATE
-already holds them; M=1 never writes and its stdout must be byte-for-
-byte identical to a full pshift run over all events. STATE read/write
-errors are code 3; STATE JSON syntax errors, duplicate keys, and
-non-finite numbers are code 4; a bad I/M, STATE key order or content,
-or digest mismatch is code 5. On failure stdout stays empty and no
-file is changed.
+pshiftcp takes FILE LIMIT FLOWS RULES I M STATE EVENTS: FILE, LIMIT,
+FLOWS, RULES, and the event semantics match pshift; I is a non-boolean
+decimal integer in 0..the number of events and M is 0 or 1. M=0 parses
+the whole EVENTS argument's JSON syntax, but validates and executes only
+the first I events; the remaining items' structure or semantics may be
+illegal without affecting the archive. The checkpoint is a JSON object
+with key order i,r,f,n,l,e,h: i is I; r is the current rule set; f
+follows live flow order as
+[id,s,d,b,p,c,initial-instance-boolean,rule,path] (the boolean marks an
+original FLOWS instance); n follows FILE node order as [node,up]; l
+follows FILE link order as [from,to,up,bandwidth,used]; e is the
+prefix's output event rows; h is the lowercase hex SHA-256 of FILE's raw
+bytes followed by the compact non-ASCII UTF-8 JSON of
+[LIMIT,FLOWS,RULES,EVENTS-prefix,i,r,f,n,l,e]. I=0 archives the initial
+state. M=0 writes STATE atomically in that key order, compact
+separators, non-ASCII UTF-8, with one trailing LF; stdout is byte-for-
+byte identical to those bytes and STATE is rewritten only when its
+current bytes differ. M=1 validates and executes every event: it only
+reads STATE, checks its key order, fields, and digest against the prefix
+state recomputed from this invocation's inputs, then validates and
+executes the remaining events from that prefix; it never writes STATE
+and its stdout must be byte-for-byte identical to a full pshift run over
+all events. STATE read/write errors are code 3; STATE JSON syntax
+errors, duplicate keys, and non-finite numbers are code 4; a bad I/M,
+STATE key order or content, or a digest mismatch is code 5. On failure
+stdout stays empty and STATE keeps its bytes.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -2763,14 +2767,34 @@ def _pshiftcp_state(engine, cut, limit, raw_flows, raw_rules,
             "l": l_arr, "e": e_arr, "h": digest}
 
 
+def _json_strict_equal(a, b):
+    # Structural JSON equality without Python's bool/int coercion:
+    # True never equals 1, a float never equals an int, dict key order
+    # is irrelevant (arrays carry the required order), and every nested
+    # value must match exactly. The recomputed checkpoint only ever
+    # contains None/bool/int/str/list, so any other stored type
+    # mismatches by construction.
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        if a.keys() != b.keys():
+            return False
+        return all(_json_strict_equal(a[key], b[key]) for key in a)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(
+            _json_strict_equal(x, y) for x, y in zip(a, b))
+    return a == b
+
+
 def _validate_pshiftcp_state(data, engine, cut, limit, raw_flows,
                              raw_rules, raw_events, file_bytes):
     # Verify a pshiftcp checkpoint against this invocation: key order
     # i,r,f,n,l,e,h first, then the h digest over FILE's raw bytes plus
     # the compact UTF-8 JSON of
     # [LIMIT,FLOWS,RULES,EVENTS-prefix,i,r,f,n,l,e], then every field
-    # recomputed by replaying the prefix from scratch. cut must equal
-    # the stored i; any mismatch is code 5.
+    # recomputed by replaying the prefix from scratch under strict JSON
+    # equality (no bool/int or int/float coercion). cut must equal the
+    # stored i; any mismatch is code 5.
     keys = ["i", "r", "f", "n", "l", "e", "h"]
     if not isinstance(data, dict) or list(data.keys()) != keys:
         fail(5)
@@ -2796,9 +2820,8 @@ def _validate_pshiftcp_state(data, engine, cut, limit, raw_flows,
         fail(5)
     recomputed = _pshiftcp_state(engine, cut, limit, raw_flows,
                                  raw_rules, raw_events, file_bytes)
-    if (r_arr != recomputed["r"] or f_arr != recomputed["f"]
-            or n_arr != recomputed["n"] or l_arr != recomputed["l"]
-            or e_arr != recomputed["e"]):
+    if not all(_json_strict_equal(data[key], recomputed[key])
+               for key in ("r", "f", "n", "l", "e")):
         fail(5)
 
 
@@ -6087,34 +6110,17 @@ def _validate_hotload_records(links, events, data, node_set, pair_set, a, b):
                     fail(5)
 
 
-def _parse_pshift_args(file_path, limit_text, flows_text, rules_text,
-                       events_text):
-    # Shared FILE/LIMIT/FLOWS/RULES/EVENTS parsing for pshift and
-    # pshiftcp: load the metrics topology strictly, decode the three
-    # inline JSON arguments with the strict code-4 rules, and run
-    # pshift's exact per-item validation (code 5). Returns the topology,
-    # FILE's raw bytes, the decoded FLOWS/RULES/EVENTS values (for the
-    # checkpoint envelope), the validated flow tuples and rule tuples,
-    # LIMIT, and the validated event tuples.
-    nodes, links, node_set = load_network(file_path, metrics=True,
-                                          strict=True)
-    try:
-        with open(file_path, "rb") as f:
-            file_bytes = f.read()
-    except OSError:
-        fail(3)
-    try:
-        raw_flows = json.loads(
-            flows_text, parse_constant=_reject_constant,
-            parse_float=_finite_float, object_pairs_hook=_object_no_dup)
-        raw_rules = json.loads(
-            rules_text, parse_constant=_reject_constant,
-            parse_float=_finite_float, object_pairs_hook=_object_no_dup)
-        raw_events = json.loads(
-            events_text, parse_constant=_reject_constant,
-            parse_float=_finite_float, object_pairs_hook=_object_no_dup)
-    except (ValueError, RecursionError):
-        fail(4)
+def _parse_pshift_flows_rules(links, node_set, raw_flows, raw_rules,
+                              limit_text):
+    # Shared FLOWS/RULES/LIMIT validation for pshift and pshiftcp,
+    # matching pshift's exact per-item checks (code 5). RULES is a
+    # policytx rule set; FLOWS is [id,s,d,b,p,c,path] with the given
+    # path an up simple path in FILE (never required to satisfy RULES),
+    # p/c the policytx query checks. Returns the validated flow tuples,
+    # rule tuples, the edge pair set, and LIMIT. The topology and the
+    # strict JSON decoding of the inline arguments happen at the call
+    # site so pshiftcp M=0 can bind the whole EVENTS syntax while
+    # validating only its prefix.
     # FLOWS is [id,s,d,b,p,c,path]: id/s/d/b/path keep flowshift's
     # per-item checks (the given path only has to be an up simple
     # path in FILE, never a RULES path), p/c keep the policytx
@@ -6133,7 +6139,7 @@ def _parse_pshift_args(file_path, limit_text, flows_text, rules_text,
     for item in raw_flows:
         if not isinstance(item, list) or len(item) != 7:
             fail(5)
-        rid, s, d, b, port, klass, path = item
+        rid, s, d, b, port, klass, flow_path = item
         if type(rid) is not str or not 1 <= len(rid) <= 64:
             fail(5)
         try:
@@ -6156,25 +6162,34 @@ def _parse_pshift_args(file_path, limit_text, flows_text, rules_text,
             klass.encode("utf-8")
         except UnicodeEncodeError:
             fail(5)
-        if (not isinstance(path, list) or not path
-                or path[0] != s or path[-1] != d):
+        if (not isinstance(flow_path, list) or not flow_path
+                or flow_path[0] != s or flow_path[-1] != d):
             fail(5)
-        for node in path:
+        for node in flow_path:
             if type(node) is not str or node not in node_set:
                 fail(5)
-        if len(set(path)) != len(path):
+        if len(set(flow_path)) != len(flow_path):
             fail(5)
-        for a, q in zip(path, path[1:]):
+        for a, q in zip(flow_path, flow_path[1:]):
             edge_pair = (a, q)
             if edge_pair not in up_of or not up_of[edge_pair]:
                 fail(5)
-        flows.append((rid, s, d, b, port, klass, path))
+        flows.append((rid, s, d, b, port, klass, flow_path))
     limit = _bounded_int_arg(limit_text)
-    # EVENTS is a non-empty array of flowshift's kinds 0..5 with
-    # kind 1 extended to [t,1,id,s,d,b,p,c], plus
-    # [t,6,R] with R a policytx rule set. t is non-decreasing;
-    # cross-event semantics are enforced during the replay and are
-    # also code 5.
+    return flows, rules, pair_set, limit
+
+
+def _parse_pshift_events(raw_events, node_set, pair_set, count=None):
+    # Shared EVENTS validation for pshift and pshiftcp: a non-empty
+    # array of flowshift's kinds 0..5 with kind 1 extended to
+    # [t,1,id,s,d,b,p,c], plus [t,6,R] with R a policytx rule set.
+    # t is non-decreasing; cross-event semantics are enforced during
+    # the replay and are also code 5. pshiftcp M=0 passes count=I: the
+    # whole array has already decoded as JSON (its syntax, duplicate
+    # keys, and number finiteness bind), but only the first I items are
+    # structurally and semantically validated, so an illegal remaining
+    # item never affects the archive. pshift and pshiftcp M=1 pass
+    # count=None and validate every item.
     if not isinstance(raw_events, list) or not raw_events:
         fail(5)
 
@@ -6187,9 +6202,10 @@ def _parse_pshift_args(file_path, limit_text, flows_text, rules_text,
             return False
         return True
 
+    checked = raw_events if count is None else raw_events[:count]
     events = []
     previous_time = None
-    for item in raw_events:
+    for item in checked:
         if not isinstance(item, list) or len(item) < 2:
             fail(5)
         t, kind = item[0], item[1]
@@ -6272,8 +6288,7 @@ def _parse_pshift_args(file_path, limit_text, flows_text, rules_text,
                 item[2], node_set, pair_set)
             events.append((6, t, new_rules))
         previous_time = t
-    return (nodes, links, node_set, file_bytes, limit,
-            raw_flows, raw_rules, raw_events, flows, rules, events)
+    return events
 
 
 def main():
@@ -7396,40 +7411,95 @@ def main():
     elif argv[1] == "pshift":
         if len(argv) != 7:
             fail(2)
-        (nodes, links, node_set, file_bytes, limit,
-         raw_flows, raw_rules, raw_events, flows, rules,
-         events) = _parse_pshift_args(argv[2], argv[3], argv[4],
-                                      argv[5], argv[6])
+        file_path, limit_text, flows_text, rules_text, events_text = \
+            argv[2], argv[3], argv[4], argv[5], argv[6]
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        try:
+            raw_flows = json.loads(
+                flows_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+            raw_rules = json.loads(
+                rules_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+            raw_events = json.loads(
+                events_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        flows, rules, pair_set, limit = _parse_pshift_flows_rules(
+            links, node_set, raw_flows, raw_rules, limit_text)
+        events = _parse_pshift_events(raw_events, node_set, pair_set)
         result = compute_pshift(nodes, links, flows, limit, rules, events)
     elif argv[1] == "pshiftcp":
         if len(argv) != 10:
             fail(2)
-        file_path, limit_text, flows_text, rules_text, events_text = \
-            argv[2], argv[3], argv[4], argv[5], argv[6]
-        cut_text, mode_text, state_path = argv[7], argv[8], argv[9]
-        (nodes, links, node_set, file_bytes, limit,
-         raw_flows, raw_rules, raw_events, flows, rules,
-         events) = _parse_pshift_args(file_path, limit_text, flows_text,
-                                      rules_text, events_text)
-        # I is a non-boolean integer in 0..len(EVENTS); M is 0 or 1.
+        # Public order: FILE LIMIT FLOWS RULES I M STATE EVENTS.
+        (file_path, limit_text, flows_text, rules_text, cut_text,
+         mode_text, state_path, events_text) = (
+            argv[2], argv[3], argv[4], argv[5], argv[6],
+            argv[7], argv[8], argv[9])
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        # I is a non-boolean decimal integer in 0..len(EVENTS) and M is
+        # exactly 0 or 1. Textual or range errors are code 5; I's upper
+        # bound is checked once the EVENTS array has decoded.
         cut = _bounded_int_arg(cut_text)
-        if cut > len(events):
-            fail(5)
         mode = _bounded_int_arg(mode_text)
         if mode > 1:
             fail(5)
+        try:
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
+        except OSError:
+            fail(3)
+        # M=1 reads STATE before the inline JSON decodes (the same
+        # precedence compoundcp uses): a STATE read/UTF-8 error (code
+        # 3) or STATE JSON error (code 4) then wins over the inline
+        # arguments. M=0 never reads STATE as input.
+        if mode == 1:
+            raw_state = _load_state(state_path)
+        try:
+            raw_flows = json.loads(
+                flows_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+            raw_rules = json.loads(
+                rules_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+            # M=0 still decodes the whole EVENTS argument as JSON so a
+            # syntax, duplicate-key, or non-finite-number error is code
+            # 4; only its structural/semantic validation is limited to
+            # the first I items below.
+            raw_events = json.loads(
+                events_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        flows, rules, pair_set, limit = _parse_pshift_flows_rules(
+            links, node_set, raw_flows, raw_rules, limit_text)
+        # The top-level EVENTS array shape binds in both modes (M=0
+        # needs its length and the prefix); its items may be invalid
+        # after the I boundary in M=0.
+        if not isinstance(raw_events, list) or not raw_events:
+            fail(5)
+        if cut > len(raw_events):
+            fail(5)
         if mode == 0:
-            # Run only the first I events, archive the mid-run state,
-            # and emit exactly that checkpoint (stdout is byte-identical
-            # to what STATE holds).
+            # Validate and execute only the first I events; the
+            # remaining items' structure or semantics never reach the
+            # archive. I=0 archives the initial state outright.
+            events = _parse_pshift_events(raw_events, node_set,
+                                          pair_set, count=cut)
             engine = _PShiftEngine(nodes, links, flows, limit, rules)
             engine.run(events[:cut])
             checkpoint = _pshiftcp_state(
                 engine, cut, limit, raw_flows, raw_rules, raw_events,
                 file_bytes)
             payload = _state_payload(checkpoint)
-            # Atomic replace, skipped when the file already holds
-            # exactly these bytes; a write failure leaves it untouched.
+            # The write happens only after the prefix run has fully
+            # succeeded: atomic replace, skipped when STATE already
+            # holds exactly these bytes, with a failure leaving its
+            # bytes untouched.
             try:
                 with open(state_path, "rb") as f:
                     current = f.read()
@@ -7439,13 +7509,16 @@ def main():
                 fail(3)
             if current != payload:
                 _write_state_atomic(state_path, checkpoint)
+            # stdout is byte-for-byte identical to the archived STATE.
             result = checkpoint
         else:
-            # Read-only resume: the checkpoint must match this
-            # invocation exactly (digest and every recomputed field),
-            # then the remaining events continue from the archived
-            # state, producing the full pshift output byte for byte.
-            raw_state = _load_state(state_path)
+            # Read-only resume: validate and execute every event. The
+            # checkpoint must match this invocation exactly (key order,
+            # digest, and every field recomputed by replaying the
+            # prefix), then the remaining events continue from that
+            # prefix state, producing the full pshift output byte for
+            # byte. STATE is never written.
+            events = _parse_pshift_events(raw_events, node_set, pair_set)
             prefix = _PShiftEngine(nodes, links, flows, limit, rules)
             prefix.run(events[:cut])
             _validate_pshiftcp_state(
