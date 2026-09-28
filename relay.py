@@ -6,6 +6,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py protect FILE SOURCE DESTINATION DELAY EVENTS
        python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
        python relay.py queue FILE FROM TO CAP STEP DATA
+       python relay.py fragment DATA
        python relay.py reorder FILE FROM TO BASE WINDOW DATA
        python relay.py converge FILE SRC DST D R EVENTS
        python relay.py policy FILE S D P C RULES
@@ -39,7 +40,7 @@ for policyreplay PACK or STATE, and for policytx op 4 also OUT),
 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance/retune also those in
-FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/
+FILE/DATA/EVENTS/RULES, for fragment that in DATA, for quality/replay/nfail/lfail/impair/
 compound/audit those in DATA, for compoundcp those in STATE/DATA, for
 branch those in DB/OP, for drill/multidrill/convstat/slosum
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
@@ -176,6 +177,22 @@ as [from,to,bandwidth,used]. An invalid DATA shape is code 5.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
+fragment takes DATA only (no FILE), a JSON array [id,ttl,mtus,hex]:
+id is a 1..64 codepoint UTF-8 string, ttl a non-boolean integer in
+1..MAX_COST, mtus a non-empty array of non-boolean integers in
+25..MAX_COST, and hex a non-empty even-length lowercase hexadecimal
+string of at most MAX_COST decoded bytes. The packet starts as one
+fragment covering the whole payload. Every hop adds 1 to time and
+subtracts 1 from ttl: a ttl reaching 0 drops the packet (status 1,
+fragments [], payload null); otherwise the existing fragments are
+re-split in ascending offset order with c=mtu-24, taking floor(c/8)*8
+bytes while the remainder exceeds c and the whole remainder otherwise;
+a take of 0 is code 5. On delivery (status 0) fragments are
+[offset,more,data,checksum] in offset order with absolute offsets,
+more set iff the fragment ends before the payload, and checksum the
+lowercase hex SHA-256 of that fragment's decoded data; payload is the
+reassembled original hex. Result key order is
+id,status,time,ttl,fragments,payload.
 """
 
 import hashlib
@@ -624,6 +641,53 @@ def compute_queue(frm, to, cap, step, packets):
         results.append([pid, "ok", start, depart, start - time])
     return {"from": frm, "to": to, "cap": cap, "step": step,
             "packets": results}
+
+
+def compute_fragment(ident, ttl, mtus, payload):
+    # Explicit per-hop clock fragmentation with no merging. The packet
+    # starts as one fragment covering the whole payload; each link hop
+    # adds 1 to time and subtracts 1 from ttl. A ttl that reaches 0
+    # drops the packet before that hop refragments anything. Otherwise
+    # the current fragments are re-split in ascending offset order with
+    # c = mtu - 24: a remainder longer than c yields floor(c/8)*8 bytes,
+    # any other remainder is taken whole, and a zero take is an error.
+    # Splitting only shrinks pieces, so the fragment list stays sorted
+    # and contiguous, offsets stay absolute, and the final fragment
+    # bytes concatenate back to the payload exactly.
+    pieces = [(0, payload)]
+    time = 0
+    for mtu in mtus:
+        time += 1
+        ttl -= 1
+        if ttl == 0:
+            return {"id": ident, "status": 1, "time": time, "ttl": 0,
+                    "fragments": [], "payload": None}
+        c = mtu - 24
+        next_pieces = []
+        for abs_off, blob in pieces:
+            pos = 0
+            length = len(blob)
+            while pos < length:
+                remaining = length - pos
+                if remaining > c:
+                    take = (c // 8) * 8
+                else:
+                    take = remaining
+                if take == 0:
+                    fail(5)
+                next_pieces.append((abs_off + pos, blob[pos:pos + take]))
+                pos += take
+        pieces = next_pieces
+    fragments = []
+    reassembled = bytearray()
+    payload_len = len(payload)
+    for offset, blob in pieces:
+        reassembled.extend(blob)
+        fragments.append([offset, offset + len(blob) < payload_len,
+                          blob.hex(),
+                          hashlib.sha256(blob).hexdigest()])
+    return {"id": ident, "status": 0, "time": time, "ttl": ttl,
+            "fragments": fragments, "payload": bytes(reassembled).hex()}
 
 
 def compute_reorder(frm, to, base, window, packets):
@@ -4723,6 +4787,39 @@ def main():
                 fail(5)
             packets.append((pid, time, size))
         result = compute_queue(frm, to, cap, step, packets)
+    elif argv[1] == "fragment":
+        if len(argv) != 3:
+            fail(2)
+        data_text = argv[2]
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list) or len(data) != 4:
+            fail(5)
+        ident, ttl, mtus, hex_text = data
+        if type(ident) is not str or not 1 <= len(ident) <= 64:
+            fail(5)
+        try:
+            ident.encode("utf-8")
+        except UnicodeEncodeError:
+            fail(5)
+        if type(ttl) is not int or not 1 <= ttl <= MAX_COST:
+            fail(5)
+        if not isinstance(mtus, list) or len(mtus) == 0:
+            fail(5)
+        for mtu in mtus:
+            if type(mtu) is not int or not 25 <= mtu <= MAX_COST:
+                fail(5)
+        if (type(hex_text) is not str or hex_text == ""
+                or len(hex_text) % 2 != 0
+                or any(ch not in "0123456789abcdef" for ch in hex_text)
+                or len(hex_text) // 2 > MAX_COST):
+            fail(5)
+        payload = bytes.fromhex(hex_text)
+        result = compute_fragment(ident, ttl, mtus, payload)
     elif argv[1] == "reorder":
         if len(argv) != 8:
             fail(2)
