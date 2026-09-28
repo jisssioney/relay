@@ -10,6 +10,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py queue FILE FROM TO CAP STEP DATA
        python relay.py fragment DATA
        python relay.py reassemble DATA
+       python relay.py rewrite R D
        python relay.py reorder FILE FROM TO BASE WINDOW DATA
        python relay.py converge FILE SRC DST D R EVENTS
        python relay.py policy FILE S D P C RULES
@@ -43,7 +44,7 @@ for policyreplay PACK or STATE, and for policytx op 4 also OUT),
 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance/retune also those in
-FILE/DATA/EVENTS/RULES, for fragment/reassemble that in DATA, for quality/replay/nfail/lfail/impair/
+FILE/DATA/EVENTS/RULES, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/impair/
 compound/audit those in DATA, for compoundcp those in STATE/DATA, for
 branch those in DB/OP, for wm/wmecmp those in FILE/W, for drill/multidrill/convstat/slosum
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
@@ -206,6 +207,27 @@ previous offset plus the previous fragment's byte count, so reordering,
 overlap, and gaps are all code 5; the total payload must not exceed
 MAX_COST bytes. more must be true on every fragment but the last. The
 result is the reassembled payload with key order length,payload.
+rewrite takes R and D, each a JSON array, possibly empty. R items are
+[n,ms,md,a,b,mc,ns,nd,np,nc,k]: n is a non-boolean integer in
+0..MAX_COST, a/b are non-boolean integers in 0..65535 with a <= b,
+ms/md/mc and ns/nd/nc are each null or a 1..64 codepoint UTF-8 string,
+np is null or a non-boolean integer in 0..65535, and k is a non-boolean
+integer in 0..MAX_COST. D items are [id,s,d,p,c,ttl,x,h]: id/s/d/c are
+non-null strings (id unique across D; their codepoint length is
+unconstrained), p a non-boolean integer in 0..65535, ttl a non-boolean
+integer in 1..MAX_COST, x an even-length lowercase hexadecimal string
+of at most MAX_COST decoded bytes, and h the lowercase hex SHA-256 of
+the compact non-ASCII-unescaped UTF-8 JSON array [s,d,p,c,ttl,x].
+Rules are considered by ascending n with ties in array order and only
+the first matching rule fires: p must lie in a..b and each non-null
+ms/md/mc must equal s/d/c (null fields are wildcards). An unmatched
+packet keeps every field and its ttl. A matched rule subtracts k from
+ttl and rewrites s/d/p/c from ns/nd/np/nc, null there meaning keep the
+original field; ttl' <= 0 drops the packet. The output has key order
+packets, in D order, each item [id,i,z,q,h]: i is the matched rule's R
+index or null, z is 0 when kept and 1 when dropped, a kept entry carries
+q=[s,d,p,c,ttl,x] with h recomputed over it and a dropped entry has q
+and h null.
 wmecmp takes FILE, S, and W exactly like wm (FILE parsed strictly, so
 duplicate keys or non-finite numbers are code 4) and FLOW exactly like
 ecmp (a 1..MAX_FLOW_LEN codepoint UTF-8 string; an invalid FLOW is code
@@ -874,6 +896,62 @@ def compute_fragment(ident, ttl, mtus, payload):
                           hashlib.sha256(blob).hexdigest()])
     return {"id": ident, "status": 0, "time": time, "ttl": ttl,
             "fragments": fragments, "payload": bytes(reassembled).hex()}
+
+
+def _rewrite_digest(s, d, p, c, ttl, x):
+    # Lowercase hex SHA-256 of the compact non-ASCII-unescaped UTF-8
+    # JSON array [s,d,p,c,ttl,x], exactly the h contract of rewrite.
+    payload = json.dumps([s, d, p, c, ttl, x], ensure_ascii=False,
+                         separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def compute_rewrite(rules, packets):
+    # Stateless rewrite table. Each packet scans R in array order and
+    # keeps the matching rule with the smallest n, replacing the holder
+    # only on a strictly smaller n, so equal n keeps the earliest rule in
+    # array order; the scan is an O(RK) linear search. A rule matches
+    # when its a..b port interval contains p and every non-null
+    # ms/md/mc equals the packet's s/d/c (null = wildcard). Unmatched
+    # packets pass through with index null and untouched ttl. A matched
+    # rule subtracts k and rewrites s/d/p/c from ns/nd/np/nc, where null
+    # means keep the original field; ttl' <= 0 drops the packet,
+    # otherwise h is recomputed over the rewritten fields.
+    results = []
+    for ident, s, d, p, c, ttl, x, _h in packets:
+        best_index = None
+        best_n = None
+        best_rule = None
+        for index, rule in enumerate(rules):
+            _n, ms, md, a, b, mc = rule[:6]
+            if p < a or p > b:
+                continue
+            if ms is not None and s != ms:
+                continue
+            if md is not None and d != md:
+                continue
+            if mc is not None and c != mc:
+                continue
+            if best_index is None or _n < best_n:
+                best_index, best_n, best_rule = index, _n, rule
+        if best_index is None:
+            results.append([ident, None, 0, [s, d, p, c, ttl, x],
+                            _rewrite_digest(s, d, p, c, ttl, x)])
+            continue
+        ns, nd, nport, nc, k = best_rule[6], best_rule[7], \
+            best_rule[8], best_rule[9], best_rule[10]
+        new_ttl = ttl - k
+        if new_ttl <= 0:
+            results.append([ident, best_index, 1, None, None])
+            continue
+        s2 = ns if ns is not None else s
+        d2 = nd if nd is not None else d
+        p2 = nport if nport is not None else p
+        c2 = nc if nc is not None else c
+        results.append([ident, best_index, 0,
+                        [s2, d2, p2, c2, new_ttl, x],
+                        _rewrite_digest(s2, d2, p2, c2, new_ttl, x)])
+    return {"packets": results}
 
 
 def compute_reorder(frm, to, base, window, packets):
@@ -5099,6 +5177,85 @@ def main():
             pieces.append(blob)
         payload = b"".join(pieces)
         result = {"length": len(payload), "payload": payload.hex()}
+    elif argv[1] == "rewrite":
+        if len(argv) != 4:
+            fail(2)
+        r_text, d_text = argv[2], argv[3]
+        try:
+            rules = json.loads(r_text, parse_constant=_reject_constant,
+                               parse_float=_finite_float,
+                               object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        try:
+            packets = json.loads(d_text, parse_constant=_reject_constant,
+                                 parse_float=_finite_float,
+                                 object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(rules, list):
+            fail(5)
+        parsed_rules = []
+        for rule in rules:
+            if not isinstance(rule, list) or len(rule) != 11:
+                fail(5)
+            n, ms, md, a, b, mc, ns, nd, nport, nc, k = rule
+            if type(n) is not int or not 0 <= n <= MAX_COST:
+                fail(5)
+            if type(a) is not int or type(b) is not int \
+                    or not 0 <= a <= 65535 or not 0 <= b <= 65535 \
+                    or a > b:
+                fail(5)
+            for value in (ms, md, mc, ns, nd, nc):
+                if value is not None:
+                    if type(value) is not str \
+                            or not 1 <= len(value) <= 64:
+                        fail(5)
+                    try:
+                        value.encode("utf-8")
+                    except UnicodeEncodeError:
+                        fail(5)
+            if nport is not None and (type(nport) is not int
+                                      or not 0 <= nport <= 65535):
+                fail(5)
+            if type(k) is not int or not 0 <= k <= MAX_COST:
+                fail(5)
+            parsed_rules.append(rule)
+        if not isinstance(packets, list):
+            fail(5)
+        parsed_packets = []
+        seen_ids = set()
+        for item in packets:
+            if not isinstance(item, list) or len(item) != 8:
+                fail(5)
+            ident, s, d, p, c, ttl, hex_text, digest = item
+            for value in (ident, s, d, c):
+                if type(value) is not str:
+                    fail(5)
+                try:
+                    value.encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(5)
+            if ident in seen_ids:
+                fail(5)
+            seen_ids.add(ident)
+            if type(p) is not int or not 0 <= p <= 65535:
+                fail(5)
+            if type(ttl) is not int or not 1 <= ttl <= MAX_COST:
+                fail(5)
+            if (type(hex_text) is not str
+                    or len(hex_text) % 2 != 0
+                    or any(ch not in "0123456789abcdef" for ch in hex_text)
+                    or len(hex_text) // 2 > MAX_COST):
+                fail(5)
+            if (type(digest) is not str or len(digest) != 64
+                    or any(ch not in "0123456789abcdef"
+                           for ch in digest)):
+                fail(5)
+            if _rewrite_digest(s, d, p, c, ttl, hex_text) != digest:
+                fail(5)
+            parsed_packets.append(item)
+        result = compute_rewrite(parsed_rules, parsed_packets)
     elif argv[1] == "reorder":
         if len(argv) != 8:
             fail(2)
