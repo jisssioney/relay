@@ -13,6 +13,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py policyreplay PACK STATE TV PV DATA
        python relay.py reserve FILE DATA
        python relay.py rebalance FILE DATA LIMIT
+       python relay.py retune FILE LIMIT DATA
        python relay.py quality FILE A B DATA
        python relay.py replay FILE A B DATA
        python relay.py audit FILE A B DATA
@@ -37,7 +38,7 @@ Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE,
 for policyreplay PACK or STATE, and for policytx op 4 also OUT),
 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/reorder/converge/policy/reserve/rebalance also those in
+for queue/reorder/converge/policy/reserve/rebalance/retune also those in
 FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/
 compound/audit those in DATA, for compoundcp those in STATE/DATA, for
 branch those in DB/OP, for drill/multidrill/convstat/slosum
@@ -153,6 +154,25 @@ edge) with the route lowest-cost path as fallback. The result has key
 order topologyVersion, policyVersion, results; each result item is
 [s, d, p, c, rule, cost, path] with rule the matched rule's array index
 (null on fallback) and null, null, [] when no route exists.
+retune takes FILE and LIMIT exactly like rebalance and DATA=[C,G]. C is
+a JSON array, possibly empty, using rebalance's [id,s,d,b,path] shape
+and all of its per-item validation; its ids are unique. G is non-empty
+and holds [0,id] deletions and [1,id,s,d,b] additions with s/d/b
+validated as in reserve/rebalance; G ids are unique, every deletion id
+must occur in C, and every addition id must not. The target flow set
+keeps C's surviving flows in C order, then appends the additions in G
+order. The joint search assigns every target flow one up simple path
+with sum b no greater than each link's bandwidth and at most LIMIT
+surviving flows rerouted (additions never count); feasible assignments
+rank by peak used/bandwidth, moved count, and the target-order path
+vector with rebalance's exact comparisons. The best feasible
+assignment commits (status 1) even without improving the peak; only no
+feasible assignment rejects (status 0) and reports C unchanged, with
+moved 0. Result key order is status,peak,moved,flows,links: peak is
+the before/after peaks as six-decimal fixed-point strings ("0.000000"
+for an empty flow set), moved is the surviving-flow reroute count,
+flows is the final [id,s,d,b,path] list, and links follows FILE order
+as [from,to,bandwidth,used]. An invalid DATA shape is code 5.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -1063,6 +1083,191 @@ def compute_rebalance(nodes, links, demands, limit):
             "moved": moved_out,
             "flows": [[demands[i][0], demands[i][4], new_paths[i]]
                       for i in range(count)],
+            "links": [[link["from"], link["to"], capacity[i],
+                       final_used[i]]
+                      for i, link in enumerate(links)]}
+
+
+def compute_retune(nodes, links, current, changes, limit):
+    # Joint path reallocation for a changed flow set, generalizing
+    # compute_rebalance. `current` holds the committed C flows as
+    # (id, s, d, b, path); `changes` holds validated (0, id) deletions
+    # and (1, id, s, d, b) additions -- every deletion hits C, every
+    # addition id is new to C, and G ids are unique. The target set keeps
+    # C's surviving flows in C order, then appends the additions in G
+    # order. Every target flow receives one up simple path; an assignment
+    # is feasible when no link carries more than its bandwidth and at
+    # most `limit` surviving flows leave their original path (additions
+    # have no original path and never count as moved). Feasible
+    # assignments rank by peak used/bandwidth (fractions compared with
+    # integer cross-multiplication), moved count, then the target-order
+    # vector of paths in Unicode code point order -- exactly the
+    # comparisons in compute_rebalance. Unlike rebalance there is no
+    # strict-improvement gate: the flow set changed, so the best feasible
+    # assignment commits; only an empty feasible set rejects and reports
+    # C unchanged. The Cartesian product enumerates with an explicit
+    # stack -- O((V!)^K (KV+E)) time, O(KV+E) space.
+    adj = {n: [] for n in nodes}
+    index_of = {}
+    for index, link in enumerate(links):
+        index_of[(link["from"], link["to"])] = index
+        if link["up"]:
+            adj[link["from"]].append((link["to"], index))
+    capacity = [link["bandwidth"] for link in links]
+
+    initial_used = [0] * len(links)
+    for _, _, _, b, path in current:
+        for a, c in zip(path, path[1:]):
+            initial_used[index_of[(a, c)]] += b
+    for index, used_here in enumerate(initial_used):
+        if used_here > capacity[index]:
+            # As in rebalance, the committed placement must fit.
+            fail(5)
+
+    def peak_of(used):
+        # max(used[i]/capacity[i]) as an exact fraction.
+        num, den = 0, 1
+        for u, c in zip(used, capacity):
+            if u * den > num * c:
+                num, den = u, c
+        return num, den
+
+    init_num, init_den = peak_of(initial_used)
+
+    deleted = set()
+    additions = []
+    for change in changes:
+        if change[0] == 0:
+            deleted.add(change[1])
+        else:
+            additions.append((change[1], change[2], change[3], change[4]))
+    # Surviving C flows first in C order, then additions in G order.
+    demands = [flow for flow in current if flow[0] not in deleted]
+    demands.extend((rid, s, d, b, None) for rid, s, d, b in additions)
+    count = len(demands)
+
+    def enum_paths(source, destination):
+        # Yield (path, edge_indices) for every up simple path from
+        # source to destination via iterative DFS, so the enumeration
+        # depth is bounded by heap, not by the Python recursion limit.
+        path = [source]
+        edges = []
+        visited = {source}
+        iters = [iter(adj[source])]
+        while iters:
+            try:
+                to, index = next(iters[-1])
+            except StopIteration:
+                iters.pop()
+                if iters:
+                    visited.remove(path.pop())
+                    edges.pop()
+                continue
+            if to in visited:
+                continue
+            visited.add(to)
+            path.append(to)
+            edges.append(index)
+            if to == destination:
+                yield list(path), list(edges)
+                visited.remove(path.pop())
+                edges.pop()
+            else:
+                iters.append(iter(adj[to]))
+
+    best_num = best_den = best_moved = None
+    best_paths = best_used = None
+    used = [0] * len(links)
+    current_paths = [None] * count
+    current_edges = [None] * count
+    generators = [None] * count
+    moved = 0
+    depth = 0
+    if count:
+        generators[0] = enum_paths(demands[0][1], demands[0][2])
+    while depth >= 0:
+        if count == 0:
+            # The empty assignment over zero target flows is feasible.
+            best_num, best_den = peak_of(used)
+            best_moved = 0
+            best_paths = []
+            best_used = list(used)
+            break
+        item = next(generators[depth], None)
+        if item is None:
+            # The level's paths are exhausted: backtrack and undo the
+            # shallower level's assignment.
+            generators[depth] = None
+            depth -= 1
+            if depth >= 0:
+                b = demands[depth][3]
+                for index in current_edges[depth]:
+                    used[index] -= b
+                original = demands[depth][4]
+                if original is not None and current_paths[depth] != original:
+                    moved -= 1
+                current_paths[depth] = None
+                current_edges[depth] = None
+            continue
+        path, edges = item
+        b = demands[depth][3]
+        if any(used[index] + b > capacity[index] for index in edges):
+            continue
+        original = demands[depth][4]
+        # Only surviving flows with a committed path count as rerouted;
+        # added flows keep the move tally unchanged on every path.
+        delta = 1 if original is not None and path != original else 0
+        if moved + delta > limit:
+            continue
+        for index in edges:
+            used[index] += b
+        current_paths[depth] = path
+        current_edges[depth] = edges
+        moved += delta
+        if depth + 1 < count:
+            depth += 1
+            generators[depth] = enum_paths(demands[depth][1],
+                                           demands[depth][2])
+        else:
+            num, den = peak_of(used)
+            if (best_paths is None
+                    or num * best_den < best_num * den
+                    or (num * best_den == best_num * den
+                        and (moved < best_moved
+                             or (moved == best_moved
+                                 and current_paths < best_paths)))):
+                best_num, best_den = num, den
+                best_moved = moved
+                best_paths = list(current_paths)
+                best_used = list(used)
+            for index in edges:
+                used[index] -= b
+            moved -= delta
+            current_paths[depth] = None
+            current_edges[depth] = None
+
+    if best_paths is not None:
+        status = 1
+        final_used = best_used
+        moved_out = best_moved
+        out_num, out_den = best_num, best_den
+        final_flows = [[demands[i][0], demands[i][1], demands[i][2],
+                        demands[i][3], best_paths[i]]
+                       for i in range(count)]
+    else:
+        # No feasible assignment: reject and keep C exactly as given.
+        status = 0
+        final_used = initial_used
+        moved_out = 0
+        out_num, out_den = init_num, init_den
+        final_flows = [[rid, s, d, b, path]
+                       for rid, s, d, b, path in current]
+
+    return {"status": status,
+            "peak": [_format_peak(init_num, init_den),
+                     _format_peak(out_num, out_den)],
+            "moved": moved_out,
+            "flows": final_flows,
             "links": [[link["from"], link["to"], capacity[i],
                        final_used[i]]
                       for i, link in enumerate(links)]}
@@ -5023,6 +5228,107 @@ def main():
             demands.append((rid, s, d, b, path))
         limit = _bounded_int_arg(limit_text)
         result = compute_rebalance(nodes, links, demands, limit)
+    elif argv[1] == "retune":
+        if len(argv) != 5:
+            fail(2)
+        file_path, limit_text, data_text = argv[2], argv[3], argv[4]
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if (not isinstance(data, list) or len(data) != 2
+                or not isinstance(data[0], list)
+                or not isinstance(data[1], list)):
+            fail(5)
+        c_items, g_items = data[0], data[1]
+        if not g_items:
+            # G must be non-empty.
+            fail(5)
+        up_of = {}
+        for link in links:
+            up_of[(link["from"], link["to"])] = link["up"]
+        current = []
+        current_ids = set()
+        for item in c_items:
+            if not isinstance(item, list) or len(item) != 5:
+                fail(5)
+            rid, s, d, b, path = item
+            if type(rid) is not str or not 1 <= len(rid) <= 64:
+                fail(5)
+            try:
+                rid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if rid in current_ids:
+                fail(5)
+            current_ids.add(rid)
+            if (type(s) is not str or type(d) is not str
+                    or s not in node_set or d not in node_set or s == d):
+                fail(5)
+            if type(b) is not int or not 1 <= b <= MAX_COST:
+                fail(5)
+            if (not isinstance(path, list) or not path
+                    or path[0] != s or path[-1] != d):
+                fail(5)
+            for node in path:
+                if type(node) is not str or node not in node_set:
+                    fail(5)
+            if len(set(path)) != len(path):
+                fail(5)
+            for a, c in zip(path, path[1:]):
+                pair = (a, c)
+                if pair not in up_of or not up_of[pair]:
+                    fail(5)
+            current.append((rid, s, d, b, path))
+        changes = []
+        seen_changes = set()
+        for item in g_items:
+            if not isinstance(item, list) or not 2 <= len(item) <= 5:
+                fail(5)
+            if type(item[0]) is not int or item[0] not in (0, 1):
+                fail(5)
+            if item[0] == 0:
+                if len(item) != 2:
+                    fail(5)
+                rid = item[1]
+                if type(rid) is not str or not 1 <= len(rid) <= 64:
+                    fail(5)
+                try:
+                    rid.encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(5)
+                if rid in seen_changes or rid not in current_ids:
+                    # G ids are unique and every deletion must hit C.
+                    fail(5)
+                seen_changes.add(rid)
+                changes.append((0, rid))
+            else:
+                if len(item) != 5:
+                    fail(5)
+                rid, s, d, b = item[1], item[2], item[3], item[4]
+                if type(rid) is not str or not 1 <= len(rid) <= 64:
+                    fail(5)
+                try:
+                    rid.encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(5)
+                if rid in seen_changes or rid in current_ids:
+                    # G ids are unique and a new id must not be in C.
+                    fail(5)
+                seen_changes.add(rid)
+                if (type(s) is not str or type(d) is not str
+                        or s not in node_set or d not in node_set
+                        or s == d):
+                    fail(5)
+                if type(b) is not int or not 1 <= b <= MAX_COST:
+                    fail(5)
+                changes.append((1, rid, s, d, b))
+        limit = _bounded_int_arg(limit_text)
+        result = compute_retune(nodes, links, current, changes, limit)
     elif argv[1] == "quality":
         if len(argv) != 6:
             fail(2)
