@@ -7,6 +7,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
        python relay.py queue FILE FROM TO CAP STEP DATA
        python relay.py fragment DATA
+       python relay.py reassemble DATA
        python relay.py reorder FILE FROM TO BASE WINDOW DATA
        python relay.py converge FILE SRC DST D R EVENTS
        python relay.py policy FILE S D P C RULES
@@ -40,7 +41,8 @@ for policyreplay PACK or STATE, and for policytx op 4 also OUT),
 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance/retune also those in
-FILE/DATA/EVENTS/RULES, for fragment that in DATA, for quality/replay/nfail/lfail/impair/
+FILE/DATA/EVENTS/RULES, for fragment that in DATA, for reassemble that in
+DATA, for quality/replay/nfail/lfail/impair/
 compound/audit those in DATA, for compoundcp those in STATE/DATA, for
 branch those in DB/OP, for drill/multidrill/convstat/slosum
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
@@ -193,6 +195,19 @@ more set iff the fragment ends before the payload, and checksum the
 lowercase hex SHA-256 of that fragment's decoded data; payload is the
 reassembled original hex. Result key order is
 id,status,time,ttl,fragments,payload.
+reassemble takes DATA only (no FILE), a non-empty JSON array whose
+elements are strictly [offset,more,data,checksum]: offset is a
+non-boolean integer in 0..MAX_COST, more a boolean, data a non-empty
+even-length lowercase hexadecimal string of at most MAX_COST decoded
+bytes, and checksum the lowercase hex SHA-256 (exactly 64 chars) of
+data's decoded bytes. The first element must have offset 0; each later
+offset must equal the previous offset plus that fragment's byte count,
+and the total payload must not exceed MAX_COST bytes. Only the last
+element may have more=false, every other element more=true.
+Out-of-order arrival, overlap, gaps, wrong tail flags, and checksum
+mismatches are all code 5. On success stdout is an object with key
+order length,payload: length is the total byte count and payload the
+in-order concatenated hex.
 """
 
 import hashlib
@@ -688,6 +703,51 @@ def compute_fragment(ident, ttl, mtus, payload):
                           hashlib.sha256(blob).hexdigest()])
     return {"id": ident, "status": 0, "time": time, "ttl": ttl,
             "fragments": fragments, "payload": bytes(reassembled).hex()}
+
+
+def compute_reassemble(fragments):
+    # Validate and concatenate an externally supplied fragment sequence.
+    # Fragments are presented as [offset,more,data,checksum] and must
+    # already lie in strict contiguous order beginning at offset 0: the
+    # sequence is not reordered, so an out-of-order element, an overlap,
+    # or a gap is a failure. Every non-final element is a continuation
+    # (more=true) and only the final element carries more=false. The
+    # checksum binds each fragment's own bytes, checked as the sequence
+    # is walked so a bad fragment rejects the whole reassembly.
+    pieces = []
+    expected = 0
+    total = 0
+    count = len(fragments)
+    for index, item in enumerate(fragments):
+        if not isinstance(item, list) or len(item) != 4:
+            fail(5)
+        offset, more, data, checksum = item
+        if type(offset) is not int or not 0 <= offset <= MAX_COST:
+            fail(5)
+        if type(more) is not bool:
+            fail(5)
+        if (type(data) is not str or data == ""
+                or len(data) % 2 != 0
+                or any(ch not in "0123456789abcdef" for ch in data)
+                or len(data) // 2 > MAX_COST):
+            fail(5)
+        if (type(checksum) is not str or len(checksum) != 64
+                or any(ch not in "0123456789abcdef" for ch in checksum)):
+            fail(5)
+        if offset != expected:
+            fail(5)
+        blob = bytes.fromhex(data)
+        if hashlib.sha256(blob).hexdigest() != checksum:
+            fail(5)
+        if more is not (index < count - 1):
+            fail(5)
+        total += len(blob)
+        if total > MAX_COST:
+            fail(5)
+        pieces.append(blob)
+        expected = offset + len(blob)
+    payload = b"".join(pieces)
+    return {"length": len(payload), "payload": payload.hex()}
 
 
 def compute_reorder(frm, to, base, window, packets):
@@ -4820,6 +4880,19 @@ def main():
             fail(5)
         payload = bytes.fromhex(hex_text)
         result = compute_fragment(ident, ttl, mtus, payload)
+    elif argv[1] == "reassemble":
+        if len(argv) != 3:
+            fail(2)
+        data_text = argv[2]
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list) or len(data) == 0:
+            fail(5)
+        result = compute_reassemble(data)
     elif argv[1] == "reorder":
         if len(argv) != 8:
             fail(2)
