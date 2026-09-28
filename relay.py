@@ -10,6 +10,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py converge FILE SRC DST D R EVENTS
        python relay.py policy FILE S D P C RULES
        python relay.py policytx FILE STATE OP
+       python relay.py policyreplay PACK STATE TV PV DATA
        python relay.py reserve FILE DATA
        python relay.py rebalance FILE DATA LIMIT
        python relay.py quality FILE A B DATA
@@ -33,7 +34,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py branch FILE S D W DB OP
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE,
-and for policytx op 4 also OUT),
+and for policytx op 4 also OUT; policyreplay reads PACK and STATE),
 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance also those in
@@ -44,7 +45,7 @@ EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
 those in OLD/NEW/EVENTS/DATA, for slogate those in
 CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA, for
 snapshot those in STATE/OP/IN, for config those in PACK/OP/IN, for
-policytx those in STATE/OP),
+policytx those in STATE/OP, for policyreplay those in PACK/STATE/DATA),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
 P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
 unknown-node/overflow/re-failure error; for hotload code 5 also covers
@@ -136,6 +137,16 @@ the canonical compact UTF-8 form with one trailing LF (directly
 usable as a STATE), skips the replace when OUT already holds those
 exact bytes, and on failure leaves STATE and OUT's bytes untouched and
 removes only its own staging temp file.
+For policyreplay code 5 also covers a PACK that is not a valid config
+pack, a STATE whose v/r/h or rule structure is invalid against the
+selected topology, a TV outside the pack's history or absent topology,
+a PV that is not present in the STATE history (TV/PV themselves are
+decimal non-boolean integers in 0..MAX_COST), and the policytx op 1
+S/D/P/C checks on every DATA item except that s and d may equal (DATA
+is a JSON array, possibly empty or with duplicates, of [s, d, p, c]
+items with p a non-boolean integer in 0..65535 and c a 1..32 code point
+UTF-8 string); policyreplay is strictly read-only and never writes PACK,
+STATE, or any other file.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -796,6 +807,62 @@ def compute_policytx(nodes, links, source, destination, port, klass,
     cost = cost_of[destination]
     path = path_of[destination]
     return [None, cost, path if path is not None else []]
+
+
+def compute_policyreplay(nodes, links, rules, queries):
+    # Read-only policy replay over a batch of [s, d, p, c] queries against
+    # one topology/version of an interval-port policytx rule set. Matching
+    # follows compute_policytx exactly: rules are tried by ascending n
+    # with ties keeping array order (_priority_order); a rule matches when
+    # its s/d equal the query, a <= p <= b, its c is null (wildcard) or
+    # equal, and every path edge is up (down-edge rules are skipped, not
+    # fallen back from). The first match emits [s, d, p, c, index, cost,
+    # path]; with none usable, the route subcommand's lowest-cost up-link
+    # path from s is the fallback, emitted as [..., null, cost, path], or
+    # [..., null, null, []] when d is unreachable. Queries stay in input
+    # order including duplicates. A fallback runs the route Dijkstra per
+    # query (O(V^2 + E) time, O(V^2) space); each query's rule scan is
+    # O(R + L) with L the total node count of the rule set's paths, so the
+    # batch is O(K(VE + V^2 + L)) time (E <= VE and R <= L bound the scan
+    # and the per-query fallback) and O(S + V^2 + E + L) space, with S the
+    # input/output byte count. Fallback searches are not cached across
+    # sources: caching all V runs could hold O(V^3) path nodes.
+    up_of = {}
+    cost_of_link = {}
+    for link in links:
+        pair = (link["from"], link["to"])
+        up_of[pair] = link["up"]
+        cost_of_link[pair] = link["cost"]
+    order = _priority_order(rules)
+
+    results = []
+    for source, destination, port, klass in queries:
+        matched = None
+        for i in order:
+            _, s, d, a, b, c, path = rules[i]
+            if s != source or d != destination:
+                continue
+            if not a <= port <= b:
+                continue
+            if c is not None and c != klass:
+                continue
+            pairs = list(zip(path, path[1:]))
+            if not all(up_of[pair] for pair in pairs):
+                # Paths with a down edge are skipped, not fallen back from.
+                continue
+            matched = [i, sum(cost_of_link[pair] for pair in pairs), path]
+            break
+        if matched is None:
+            cost_of, path_of = shortest_paths(nodes, links, source)
+            cost = cost_of[destination]
+            path = path_of[destination]
+            results.append([source, destination, port, klass,
+                            None, cost, path if path is not None else []])
+        else:
+            rule_index, cost, path = matched
+            results.append([source, destination, port, klass,
+                            rule_index, cost, path])
+    return results
 
 
 def compute_reserve(nodes, links, requests):
@@ -4735,6 +4802,74 @@ def main():
                       "result": export}
         else:
             fail(5)
+    elif argv[1] == "policyreplay":
+        if len(argv) != 7:
+            fail(2)
+        pack_path, state_path = argv[2], argv[3]
+        tv_text, pv_text, data_text = argv[4], argv[5], argv[6]
+        # Read-only replay: PACK is a config pack and STATE a policytx
+        # state, both reused exactly as those subcommands read them
+        # (read errors code 3, strict JSON errors code 4). DATA is an
+        # inline JSON array; nothing is ever written.
+        raw_pack = _load_state(pack_path)
+        raw_state = _load_state(state_path)
+        tv = _bounded_int_arg(tv_text)
+        pv = _bounded_int_arg(pv_text)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        # The pack's history is the topology/policy source; the topology
+        # at TV is validated against the metrics schema like every pack t.
+        pack_history = _validate_config_pack(raw_pack)[3]
+        if not 0 <= tv <= pack_history[-1][0]:
+            fail(5)
+        tv_topology = pack_history[tv][1]
+        tv_nodes = tv_topology["nodes"]
+        tv_links = tv_topology["links"]
+        tv_node_set = set(tv_nodes)
+        tv_pair_set = {(link["from"], link["to"]) for link in tv_links}
+        # The selected rules must be legal for the selected topology, so
+        # the policytx state is validated against that topology's nodes
+        # and edges; the version PV must exist in its h.
+        pv_history = _validate_policytx_state(
+            raw_state, tv_node_set, tv_pair_set)[2]
+        selected_rules = None
+        for hv, hr in pv_history:
+            if hv == pv:
+                selected_rules = hr
+                break
+        if selected_rules is None:
+            fail(5)
+        # Queries mirror the policytx op 1 S/D/P/C checks, with s and d
+        # allowed to equal; input order (including empty and duplicate
+        # items) is preserved in the output.
+        queries = []
+        for item in data:
+            if not isinstance(item, list) or len(item) != 4:
+                fail(5)
+            s, d, p, c = item
+            if (type(s) is not str or type(d) is not str
+                    or s not in tv_node_set or d not in tv_node_set):
+                fail(5)
+            if type(p) is not int or type(p) is bool \
+                    or not 0 <= p <= 65535:
+                fail(5)
+            if type(c) is not str or not 1 <= len(c) <= 32:
+                fail(5)
+            try:
+                c.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            queries.append((s, d, p, c))
+        replay_results = compute_policyreplay(
+            tv_nodes, tv_links, selected_rules, queries)
+        result = {"topologyVersion": tv, "policyVersion": pv,
+                  "results": replay_results}
     elif argv[1] == "reserve":
         if len(argv) != 4:
             fail(2)
