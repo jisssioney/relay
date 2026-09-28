@@ -4,6 +4,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py ecmp FILE SOURCE FLOW
        python relay.py metric FILE SOURCE ORDER
        python relay.py wm FILE S W
+       python relay.py wmecmp FILE S FLOW W
        python relay.py protect FILE SOURCE DESTINATION DELAY EVENTS
        python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
        python relay.py queue FILE FROM TO CAP STEP DATA
@@ -44,7 +45,7 @@ for policyreplay PACK or STATE, and for policytx op 4 also OUT),
 for queue/reorder/converge/policy/reserve/rebalance/retune also those in
 FILE/DATA/EVENTS/RULES, for fragment/reassemble that in DATA, for quality/replay/nfail/lfail/impair/
 compound/audit those in DATA, for compoundcp those in STATE/DATA, for
-branch those in DB/OP, for wm those in W, for drill/multidrill/convstat/slosum
+branch those in DB/OP, for wm/wmecmp those in FILE/W, for drill/multidrill/convstat/slosum
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
 those in OLD/NEW/EVENTS/DATA, for slogate those in
 CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA, for
@@ -205,6 +206,23 @@ previous offset plus the previous fragment's byte count, so reordering,
 overlap, and gaps are all code 5; the total payload must not exceed
 MAX_COST bytes. more must be true on every fragment but the last. The
 result is the reassembled payload with key order length,payload.
+wmecmp takes FILE, S, and W exactly like wm (FILE parsed strictly, so
+duplicate keys or non-finite numbers are code 4) and FLOW exactly like
+ecmp (a 1..MAX_FLOW_LEN codepoint UTF-8 string; an invalid FLOW is code
+5). It enumerates every directed simple up path from S and keeps, per
+destination, every path minimizing wm's q. Each destination's candidate
+first hops are the distinct first hops of those minimum-q paths, sorted
+by Unicode code point, each represented by its path with the smallest
+code point order. The selected first hop is chosen by the SHA-256 of
+the compact non-ASCII-unescaped UTF-8 JSON array [FLOW,S,destination]:
+the first 8 digest bytes as a big-endian integer modulo the first-hop
+count index the sorted first-hop array. A reachable non-source
+destination whose minimum q exceeds MAX_TIME is code 5. The result has
+key order s,f,w,r; r is sorted by destination and each item is
+[destination, nextHops, selectedNextHop, q, h, x, y, z, path] with
+h/x/y/z/path those of the selected first hop's representative path.
+The source item is [S,[S],S,0,0,0,null,0,[S]] and an unreachable
+destination's item is [destination,[],null,null,null,null,null,null,[]].
 """
 
 import hashlib
@@ -530,6 +548,92 @@ def compute_wm(nodes, links, source, weights):
             routes.append([n, path[1], q, hop_count, cost, bandwidth,
                            latency, path])
     return {"s": source, "w": [a, b, c, d], "r": routes}
+
+
+def compute_wmecmp(nodes, links, source, flow, weights):
+    # Directed adjacency over up links only.
+    adj = {n: [] for n in nodes}
+    for link in links:
+        if link["up"]:
+            adj[link["from"]].append(
+                (link["to"], link["cost"], link["bandwidth"], link["latency"]))
+
+    a, b, c, d = weights
+
+    # Enumerate every directed simple path from the source via DFS (same
+    # enumeration as compute_wm) and keep, per destination, every path
+    # minimizing q = a*h + b*x + c*(M-y) + d*z with exact integer
+    # arithmetic, where h/x/y/z are the hop count, cost sum, bottleneck
+    # bandwidth, and latency sum. The minimum-q paths are grouped by
+    # first hop; each first hop is represented by its path with the
+    # smallest Unicode code point order.
+    # best[n] = (q, {first_hop: ((hop, cost, bandwidth, latency), path)})
+    best = {}
+
+    def consider(path, hop_count, cost, bandwidth, latency):
+        q = (a * hop_count + b * cost + c * (MAX_COST - bandwidth)
+             + d * latency)
+        dest = path[-1]
+        first = path[1]
+        entry = ((hop_count, cost, bandwidth, latency), list(path))
+        cur = best.get(dest)
+        if cur is None or q < cur[0]:
+            best[dest] = (q, {first: entry})
+        elif q == cur[0]:
+            hops = cur[1]
+            old = hops.get(first)
+            if old is None or path < old[1]:
+                hops[first] = entry
+
+    # Iterative DFS with an explicit stack, so the enumeration depth is
+    # bounded by heap, not by the Python recursion limit. metrics[d] holds
+    # the accumulated (hop, cost, bandwidth, latency) for path[:d+1].
+    path = [source]
+    visited = {source}
+    metrics = [(0, 0, MAX_COST, 0)]
+    stack = [iter(adj[source])]
+    while stack:
+        try:
+            to, w, bw, lat = next(stack[-1])
+        except StopIteration:
+            stack.pop()
+            if stack:
+                metrics.pop()
+                visited.remove(path.pop())
+            continue
+        if to in visited:
+            continue
+        visited.add(to)
+        path.append(to)
+        hop_count, cost, bandwidth, latency = metrics[-1]
+        entry = (hop_count + 1, cost + w, min(bandwidth, bw), latency + lat)
+        metrics.append(entry)
+        consider(path, *entry)
+        stack.append(iter(adj[to]))
+
+    routes = []
+    for n in sorted(nodes):
+        if n == source:
+            routes.append([n, [source], source, 0, 0, 0, None, 0,
+                           [source]])
+        elif n not in best:
+            routes.append([n, [], None, None, None, None, None, None, []])
+        else:
+            q, hops = best[n]
+            if q > MAX_TIME:
+                fail(5)
+            # Candidate first hops: deduplicated and sorted by Unicode
+            # code point.
+            first_hops = sorted(hops)
+            key = json.dumps([flow, source, n], ensure_ascii=False,
+                             separators=(",", ":")).encode("utf-8")
+            digest = hashlib.sha256(key).digest()
+            selected = first_hops[int.from_bytes(digest[:8], "big")
+                                  % len(first_hops)]
+            (hop_count, cost, bandwidth, latency), rep = hops[selected]
+            routes.append([n, first_hops, selected, q, hop_count, cost,
+                           bandwidth, latency, rep])
+    return {"s": source, "f": flow, "w": [a, b, c, d], "r": routes}
 
 
 def compute_ecmp(nodes, links, source, flow):
@@ -4747,7 +4851,8 @@ def main():
         if len(argv) != 5:
             fail(2)
         file_path, source, weights_text = argv[2], argv[3], argv[4]
-        nodes, links, node_set = load_network(file_path, metrics=True)
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
         try:
             weights = json.loads(weights_text,
                                  parse_constant=_reject_constant,
@@ -4763,6 +4868,34 @@ def main():
         if source not in node_set:
             fail(5)
         result = compute_wm(nodes, links, source, weights)
+    elif argv[1] == "wmecmp":
+        if len(argv) != 6:
+            fail(2)
+        file_path, source, flow = argv[2], argv[3], argv[4]
+        weights_text = argv[5]
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        try:
+            weights = json.loads(weights_text,
+                                 parse_constant=_reject_constant,
+                                 parse_float=_finite_float,
+                                 object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if (not isinstance(weights, list) or len(weights) != 4
+                or any(type(w) is not int or not 0 <= w <= MAX_COST
+                       for w in weights)
+                or all(w == 0 for w in weights)):
+            fail(5)
+        if not 1 <= len(flow) <= MAX_FLOW_LEN:
+            fail(5)
+        try:
+            flow.encode("utf-8")
+        except UnicodeEncodeError:
+            fail(5)
+        if source not in node_set:
+            fail(5)
+        result = compute_wmecmp(nodes, links, source, flow, weights)
     elif argv[1] == "protect":
         if len(argv) != 7:
             fail(2)
