@@ -6,6 +6,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py protect FILE SOURCE DESTINATION DELAY EVENTS
        python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
        python relay.py queue FILE FROM TO CAP STEP DATA
+       python relay.py fragment DATA
        python relay.py reorder FILE FROM TO BASE WINDOW DATA
        python relay.py converge FILE SRC DST D R EVENTS
        python relay.py policy FILE S D P C RULES
@@ -39,7 +40,7 @@ for policyreplay PACK or STATE, and for policytx op 4 also OUT),
 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance/retune also those in
-FILE/DATA/EVENTS/RULES, for quality/replay/nfail/lfail/impair/
+FILE/DATA/EVENTS/RULES, for fragment those in DATA, for quality/replay/nfail/lfail/impair/
 compound/audit those in DATA, for compoundcp those in STATE/DATA, for
 branch those in DB/OP, for drill/multidrill/convstat/slosum
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
@@ -47,7 +48,7 @@ those in OLD/NEW/EVENTS/DATA, for slogate those in
 CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA, for
 snapshot those in STATE/OP/IN, for config those in PACK/OP/IN, for
 policytx those in STATE/OP, for policyreplay those in PACK/STATE/DATA),
-5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
+5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/TTL/MTUS/DATA/D/R/
 P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
 unknown-node/overflow/re-failure error; for hotload code 5 also covers
 a STATE whose v/p/h structure, version continuity, or version conflict
@@ -624,6 +625,54 @@ def compute_queue(frm, to, cap, step, packets):
         results.append([pid, "ok", start, depart, start - time])
     return {"from": frm, "to": to, "cap": cap, "step": step,
             "packets": results}
+
+
+def compute_fragment(pid, ttl, mtus, payload):
+    # Explicit per-hop clock fragmentation and reassembly. The initial
+    # fragment set covers the whole payload; every hop advances time by
+    # one and spends one ttl. When ttl reaches 0 the packet is dropped
+    # (status 1, no fragments, null payload); otherwise the hop's mtu
+    # gives c = mtu - 24 bytes of data capacity, and the fragments
+    # already present (in ascending offset order) are split further: a
+    # remainder longer than c yields floor(c/8)*8 bytes, the whole
+    # remainder otherwise. Taking zero bytes is error 5. The fragments
+    # always form one contiguous cover of the payload, so each split is
+    # a linear sweep over fragments and bytes for O(HB+P) time across H
+    # hops and O(B+P) space (B output bytes, P payload bytes).
+    fragments = [(0, len(payload))]
+    time = 0
+    for mtu in mtus:
+        time += 1
+        ttl -= 1
+        if ttl == 0:
+            return {"id": pid, "status": 1, "time": time, "ttl": 0,
+                    "fragments": [], "payload": None}
+        capacity = mtu - 24
+        next_fragments = []
+        for offset, end in fragments:
+            remaining = end - offset
+            while remaining > 0:
+                if remaining > capacity:
+                    take = (capacity // 8) * 8
+                    if take == 0:
+                        fail(5)
+                else:
+                    take = remaining
+                chunk_end = offset + take
+                next_fragments.append((offset, chunk_end))
+                offset = chunk_end
+                remaining = end - offset
+        fragments = next_fragments
+
+    payload_len = len(payload)
+    out_fragments = [
+        [offset, 1 if end < payload_len else 0,
+         payload[offset:end].hex(),
+         hashlib.sha256(payload[offset:end]).hexdigest()]
+        for offset, end in fragments
+    ]
+    return {"id": pid, "status": 0, "time": time, "ttl": ttl,
+            "fragments": out_fragments, "payload": payload.hex()}
 
 
 def compute_reorder(frm, to, base, window, packets):
@@ -4723,6 +4772,43 @@ def main():
                 fail(5)
             packets.append((pid, time, size))
         result = compute_queue(frm, to, cap, step, packets)
+    elif argv[1] == "fragment":
+        if len(argv) != 3:
+            fail(2)
+        data_text = argv[2]
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list) or len(data) != 4:
+            fail(5)
+        pid, ttl, mtus, hex_text = data
+        if type(pid) is not str or not 1 <= len(pid) <= 64:
+            fail(5)
+        try:
+            pid.encode("utf-8")
+        except UnicodeEncodeError:
+            fail(5)
+        if type(ttl) is not int or not 1 <= ttl <= MAX_COST:
+            fail(5)
+        if not isinstance(mtus, list) or not mtus:
+            fail(5)
+        for mtu in mtus:
+            if type(mtu) is not int or not 25 <= mtu <= MAX_COST:
+                fail(5)
+        if (type(hex_text) is not str or not hex_text
+                or len(hex_text) % 2 != 0
+                or any(c not in "0123456789abcdef" for c in hex_text)):
+            fail(5)
+        try:
+            payload = bytes.fromhex(hex_text)
+        except ValueError:
+            fail(5)
+        if len(payload) > MAX_COST:
+            fail(5)
+        result = compute_fragment(pid, ttl, mtus, payload)
     elif argv[1] == "reorder":
         if len(argv) != 8:
             fail(2)
