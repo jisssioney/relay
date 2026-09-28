@@ -7,6 +7,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
        python relay.py queue FILE FROM TO CAP STEP DATA
        python relay.py fragment DATA
+       python relay.py reassemble DATA
        python relay.py reorder FILE FROM TO BASE WINDOW DATA
        python relay.py converge FILE SRC DST D R EVENTS
        python relay.py policy FILE S D P C RULES
@@ -40,7 +41,7 @@ for policyreplay PACK or STATE, and for policytx op 4 also OUT),
 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance/retune also those in
-FILE/DATA/EVENTS/RULES, for fragment that in DATA, for quality/replay/nfail/lfail/impair/
+FILE/DATA/EVENTS/RULES, for fragment/reassemble that in DATA, for quality/replay/nfail/lfail/impair/
 compound/audit those in DATA, for compoundcp those in STATE/DATA, for
 branch those in DB/OP, for drill/multidrill/convstat/slosum
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
@@ -193,6 +194,16 @@ more set iff the fragment ends before the payload, and checksum the
 lowercase hex SHA-256 of that fragment's decoded data; payload is the
 reassembled original hex. Result key order is
 id,status,time,ttl,fragments,payload.
+reassemble takes DATA only (no FILE), a non-empty JSON array of
+[offset,more,data,checksum] fragments: offset is a non-boolean integer
+in 0..MAX_COST, more a boolean, data a non-empty even-length lowercase
+hexadecimal string of at most MAX_COST decoded bytes, and checksum the
+lowercase hex SHA-256 of that fragment's decoded data. The first
+fragment must start at offset 0 and each later offset must equal the
+previous offset plus the previous fragment's byte count, so reordering,
+overlap, and gaps are all code 5; the total payload must not exceed
+MAX_COST bytes. more must be true on every fragment but the last. The
+result is the reassembled payload with key order length,payload.
 """
 
 import hashlib
@@ -4820,6 +4831,50 @@ def main():
             fail(5)
         payload = bytes.fromhex(hex_text)
         result = compute_fragment(ident, ttl, mtus, payload)
+    elif argv[1] == "reassemble":
+        if len(argv) != 3:
+            fail(2)
+        data_text = argv[2]
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list) or len(data) == 0:
+            fail(5)
+        pieces = []
+        expected_offset = 0
+        last_index = len(data) - 1
+        for index, item in enumerate(data):
+            if not isinstance(item, list) or len(item) != 4:
+                fail(5)
+            offset, more, hex_text, checksum = item
+            if type(offset) is not int or not 0 <= offset <= MAX_COST:
+                fail(5)
+            if type(more) is not bool or more != (index != last_index):
+                fail(5)
+            if (type(hex_text) is not str or hex_text == ""
+                    or len(hex_text) % 2 != 0
+                    or any(ch not in "0123456789abcdef" for ch in hex_text)
+                    or len(hex_text) // 2 > MAX_COST):
+                fail(5)
+            if (type(checksum) is not str or len(checksum) != 64
+                    or any(ch not in "0123456789abcdef"
+                           for ch in checksum)):
+                fail(5)
+            blob = bytes.fromhex(hex_text)
+            if hashlib.sha256(blob).hexdigest() != checksum:
+                fail(5)
+            # Contiguity check: rejects reordering, overlap, and gaps.
+            if offset != expected_offset:
+                fail(5)
+            expected_offset += len(blob)
+            if expected_offset > MAX_COST:
+                fail(5)
+            pieces.append(blob)
+        payload = b"".join(pieces)
+        result = {"length": len(payload), "payload": payload.hex()}
     elif argv[1] == "reorder":
         if len(argv) != 8:
             fail(2)
