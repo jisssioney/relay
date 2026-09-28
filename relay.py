@@ -18,6 +18,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py policyreplay PACK STATE TV PV DATA
        python relay.py reserve FILE DATA
        python relay.py rebalance FILE DATA LIMIT
+       python relay.py loadshift FILE LIMIT FLOWS EVENTS
        python relay.py retune FILE LIMIT DATA
        python relay.py quality FILE A B DATA
        python relay.py replay FILE A B DATA
@@ -44,7 +45,7 @@ for policyreplay PACK or STATE, and for policytx op 4 also OUT),
 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance/retune also those in
-FILE/DATA/EVENTS/RULES, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/impair/
+FILE/DATA/EVENTS/RULES, and for loadshift also those in FILE/FLOWS/EVENTS, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/impair/
 compound/audit those in DATA, for compoundcp those in STATE/DATA, for
 branch those in DB/OP, for wm/wmecmp those in FILE/W, for drill/multidrill/convstat/slosum
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
@@ -178,6 +179,31 @@ the before/after peaks as six-decimal fixed-point strings ("0.000000"
 for an empty flow set), moved is the surviving-flow reroute count,
 flows is the final [id,s,d,b,path] list, and links follows FILE order
 as [from,to,bandwidth,used]. An invalid DATA shape is code 5.
+loadshift takes FILE and LIMIT exactly like rebalance (FLOWS uses
+rebalance's DATA argument position and LIMIT its own), FLOWS being
+rebalance's [id,s,d,b,path] array with all of its per-item validation,
+and EVENTS a non-empty JSON array of [t,u,v,b] items: t is a non-boolean
+integer in 0..MAX_COST and non-decreasing, b is a non-boolean integer in
+1..MAX_COST, u->v must name an edge in FILE, and the same edge may not
+appear in two events with the same t. The events advance an explicit
+clock in order. For each event, b equal to the edge's current bandwidth
+is idempotent (status 1) and changes nothing; otherwise the edge's
+bandwidth is temporarily set to b and the flows jointly receive one up
+simple path each so that every link carries at most its bandwidth and at
+most LIMIT flows leave their current path, with feasible assignments
+ranked by peak used/bandwidth, moved count, and the FLOWS-order path
+vector using rebalance's exact comparisons (fractions by integer
+cross-multiplication, paths by Unicode code point order). A feasible
+assignment commits atomically (status 0, keeping the temporary
+bandwidth); no feasible assignment rejects (status 2) and restores the
+prior paths, loads, and bandwidth exactly. Result key order is
+events,links. Each events item is [t,status,peak,moved,paths]: status 0
+committed, 1 idempotent, 2 rejected; peak is the post-processing peak as
+the same six-decimal fixed-point string as a rebalance peak; moved is
+the rerouted flow count (0 for idempotent and rejected events); paths
+lists each flow's path in FLOWS order after the event. links follows
+FILE order as [from,to,bandwidth,used] in the final state. An invalid
+EVENTS or FLOWS shape is code 5.
 On failure stdout stays empty and stderr is exactly {"error":N} plus a
 newline. A hotload rejection (s=1) is not a failure: it exits 0, leaves
 STATE untouched, and reports the slogate gate codes in why.
@@ -1598,6 +1624,189 @@ def compute_retune(nodes, links, current, changes, limit):
             "flows": final_flows,
             "links": [[link["from"], link["to"], capacity[i],
                        final_used[i]]
+                      for i, link in enumerate(links)]}
+
+
+def compute_loadshift(nodes, links, flows, limit, events):
+    # Explicit-clock replay of bandwidth-change events over a fixed flow
+    # set. `flows` holds validated (id, s, d, b, path) tuples in FLOWS
+    # order, each path an up simple path that initially fits. Each event
+    # is (t, u, v, nb): it advances the clock to t (events are already
+    # non-decreasing) and temporarily sets edge (u, v)'s bandwidth to nb.
+    # nb equal to the current bandwidth is idempotent (status 1) and
+    # changes nothing; otherwise the joint search of compute_rebalance
+    # assigns every flow one up simple path so that no link carries more
+    # than its (possibly temporarily changed) bandwidth and at most
+    # `limit` flows leave their current path. Feasible assignments rank
+    # by peak used/bandwidth (integer cross-multiplication), moved count,
+    # then the FLOWS-order path vector in Unicode code point order -- the
+    # exact comparisons in compute_rebalance. A feasible assignment
+    # commits atomically (status 0) with the temporary bandwidth kept; no
+    # feasible assignment rejects (status 2), restoring the prior paths,
+    # used counts, and bandwidth. The per-event enumeration is
+    # O((V!)^K (KV+E)); across Q events and with output size P the whole
+    # replay is O(Q (V!)^K (KV+E) + P) time, O(KV+E+Q+P) space.
+    index_of = {(link["from"], link["to"]): i
+                for i, link in enumerate(links)}
+    capacity = [link["bandwidth"] for link in links]
+
+    used = [0] * len(links)
+    paths = []
+    for _, _, _, b, path in flows:
+        paths.append(list(path))
+        for a, c in zip(path, path[1:]):
+            used[index_of[(a, c)]] += b
+    for index, used_here in enumerate(used):
+        if used_here > capacity[index]:
+            # As in rebalance, the committed placement must already fit.
+            fail(5)
+
+    # Link up/down state never changes during the replay (only
+    # bandwidths do), so the up adjacency is built once.
+    adj = {n: [] for n in nodes}
+    for index, link in enumerate(links):
+        if link["up"]:
+            adj[link["from"]].append((link["to"], index))
+
+    def peak_of(counts):
+        # max(counts[i]/capacity[i]) as an exact fraction.
+        num, den = 0, 1
+        for u, c in zip(counts, capacity):
+            if u * den > num * c:
+                num, den = u, c
+        return num, den
+
+    def enum_paths(source, destination):
+        # Every up simple path from source to destination via iterative
+        # DFS, so enumeration depth is bounded by heap, not the Python
+        # recursion limit.
+        path = [source]
+        edges = []
+        visited = {source}
+        stack = [iter(adj[source])]
+        while stack:
+            try:
+                to, eindex = next(stack[-1])
+            except StopIteration:
+                stack.pop()
+                if stack:
+                    visited.remove(path.pop())
+                    edges.pop()
+                continue
+            if to in visited:
+                continue
+            visited.add(to)
+            path.append(to)
+            edges.append(eindex)
+            if to == destination:
+                yield list(path), list(edges)
+                visited.remove(path.pop())
+                edges.pop()
+            else:
+                stack.append(iter(adj[to]))
+
+    def search(count):
+        # Cartesian-product search over the per-flow up simple path sets
+        # with an explicit stack, as in compute_rebalance, against the
+        # current `capacity`. Returns (num, den, moved, new_paths,
+        # new_used) for the best feasible assignment, or None when no
+        # assignment satisfies capacity and the reroute limit.
+        best_num = best_den = best_moved = None
+        best_paths = best_used = None
+        trial = [0] * len(links)
+        cur_paths = [None] * count
+        cur_edges = [None] * count
+        gens = [None] * count
+        moved = 0
+        depth = 0
+        if count:
+            gens[0] = enum_paths(flows[0][1], flows[0][2])
+        while depth >= 0:
+            if count == 0:
+                # The empty assignment over zero flows is feasible.
+                return (0, 1, 0, [], list(trial))
+            item = next(gens[depth], None)
+            if item is None:
+                # Level exhausted: backtrack and undo the assignment
+                # made by the shallower level.
+                gens[depth] = None
+                depth -= 1
+                if depth >= 0:
+                    b = flows[depth][3]
+                    for eindex in cur_edges[depth]:
+                        trial[eindex] -= b
+                    if cur_paths[depth] != paths[depth]:
+                        moved -= 1
+                    cur_paths[depth] = None
+                    cur_edges[depth] = None
+                continue
+            path, edges = item
+            b = flows[depth][3]
+            if any(trial[eindex] + b > capacity[eindex]
+                   for eindex in edges):
+                continue
+            delta = 1 if path != paths[depth] else 0
+            if moved + delta > limit:
+                continue
+            for eindex in edges:
+                trial[eindex] += b
+            cur_paths[depth] = path
+            cur_edges[depth] = edges
+            moved += delta
+            if depth + 1 < count:
+                depth += 1
+                gens[depth] = enum_paths(flows[depth][1],
+                                         flows[depth][2])
+            else:
+                num, den = peak_of(trial)
+                if (best_paths is None
+                        or num * best_den < best_num * den
+                        or (num * best_den == best_num * den
+                            and (moved < best_moved
+                                 or (moved == best_moved
+                                     and cur_paths < best_paths)))):
+                    best_num, best_den = num, den
+                    best_moved = moved
+                    best_paths = list(cur_paths)
+                    best_used = list(trial)
+                for eindex in edges:
+                    trial[eindex] -= b
+                moved -= delta
+                cur_paths[depth] = None
+                cur_edges[depth] = None
+        if best_paths is None:
+            return None
+        return best_num, best_den, best_moved, best_paths, best_used
+
+    results = []
+    count = len(flows)
+    for t, u, v, nb in events:
+        eindex = index_of[(u, v)]
+        if nb == capacity[eindex]:
+            # Idempotent: the bandwidth already equals the request.
+            num, den = peak_of(used)
+            results.append([t, 1, _format_peak(num, den), 0,
+                            [list(path) for path in paths]])
+            continue
+        old_bw = capacity[eindex]
+        capacity[eindex] = nb
+        found = search(count)
+        if found is None:
+            # Reject: restore the prior state exactly.
+            capacity[eindex] = old_bw
+            num, den = peak_of(used)
+            results.append([t, 2, _format_peak(num, den), 0,
+                            [list(path) for path in paths]])
+        else:
+            # Atomic commit of paths, loads, and the temporary bandwidth.
+            num, den, moved_count, new_paths, new_used = found
+            paths = new_paths
+            used = new_used
+            results.append([t, 0, _format_peak(num, den), moved_count,
+                            [list(path) for path in paths]])
+
+    return {"events": results,
+            "links": [[link["from"], link["to"], capacity[i], used[i]]
                       for i, link in enumerate(links)]}
 
 
@@ -5761,6 +5970,95 @@ def main():
             demands.append((rid, s, d, b, path))
         limit = _bounded_int_arg(limit_text)
         result = compute_rebalance(nodes, links, demands, limit)
+    elif argv[1] == "loadshift":
+        if len(argv) != 6:
+            fail(2)
+        file_path, limit_text, flows_text, events_text = \
+            argv[2], argv[3], argv[4], argv[5]
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        try:
+            raw_flows = json.loads(
+                flows_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+            raw_events = json.loads(
+                events_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        # FLOWS uses rebalance's DATA shape exactly: [id,s,d,b,path]
+        # items with unique ids and up simple paths.
+        if not isinstance(raw_flows, list):
+            fail(5)
+        up_of = {}
+        for link in links:
+            up_of[(link["from"], link["to"])] = link["up"]
+        flows = []
+        seen_ids = set()
+        for item in raw_flows:
+            if not isinstance(item, list) or len(item) != 5:
+                fail(5)
+            rid, s, d, b, path = item
+            if type(rid) is not str or not 1 <= len(rid) <= 64:
+                fail(5)
+            try:
+                rid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if rid in seen_ids:
+                fail(5)
+            seen_ids.add(rid)
+            if (type(s) is not str or type(d) is not str
+                    or s not in node_set or d not in node_set or s == d):
+                fail(5)
+            if type(b) is not int or not 1 <= b <= MAX_COST:
+                fail(5)
+            if (not isinstance(path, list) or not path
+                    or path[0] != s or path[-1] != d):
+                fail(5)
+            for node in path:
+                if type(node) is not str or node not in node_set:
+                    fail(5)
+            if len(set(path)) != len(path):
+                fail(5)
+            for a, c in zip(path, path[1:]):
+                pair = (a, c)
+                if pair not in up_of or not up_of[pair]:
+                    fail(5)
+            flows.append((rid, s, d, b, path))
+        limit = _bounded_int_arg(limit_text)
+        # EVENTS is a non-empty array of [t,u,v,b]: t non-decreasing in
+        # 0..MAX_COST, b in 1..MAX_COST, both non-boolean integers; the
+        # edge u->v must exist in FILE; the same edge may not repeat at
+        # the same time. Syntax failures are code 4, every shape or value
+        # failure here is code 5.
+        if not isinstance(raw_events, list) or not raw_events:
+            fail(5)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        events = []
+        previous_time = None
+        seen_at_time = set()
+        for item in raw_events:
+            if not isinstance(item, list) or len(item) != 4:
+                fail(5)
+            t, u, v, b = item
+            if type(t) is not int or not 0 <= t <= MAX_COST:
+                fail(5)
+            if previous_time is not None and t < previous_time:
+                fail(5)
+            if type(u) is not str or type(v) is not str \
+                    or (u, v) not in pair_set:
+                fail(5)
+            if type(b) is not int or not 1 <= b <= MAX_COST:
+                fail(5)
+            if t != previous_time:
+                seen_at_time = set()
+            if (u, v) in seen_at_time:
+                fail(5)
+            seen_at_time.add((u, v))
+            previous_time = t
+            events.append((t, u, v, b))
+        result = compute_loadshift(nodes, links, flows, limit, events)
     elif argv[1] == "retune":
         if len(argv) != 5:
             fail(2)
