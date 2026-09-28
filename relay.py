@@ -3,6 +3,7 @@
 Usage: python relay.py route FILE SOURCE
        python relay.py ecmp FILE SOURCE FLOW
        python relay.py metric FILE SOURCE ORDER
+       python relay.py wm FILE S W
        python relay.py protect FILE SOURCE DESTINATION DELAY EVENTS
        python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
        python relay.py queue FILE FROM TO CAP STEP DATA
@@ -39,7 +40,8 @@ Usage: python relay.py route FILE SOURCE
 Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE,
 for policyreplay PACK or STATE, and for policytx op 4 also OUT),
 4 JSON syntax
-(for forward also duplicate keys or non-finite numbers in FILE/TABLE,
+(for wm that in W,
+for forward also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/reorder/converge/policy/reserve/rebalance/retune also those in
 FILE/DATA/EVENTS/RULES, for fragment/reassemble that in DATA, for quality/replay/nfail/lfail/impair/
 compound/audit those in DATA, for compoundcp those in STATE/DATA, for
@@ -459,6 +461,74 @@ def compute_metric(nodes, links, source, order_names):
                            "bandwidth": bandwidth, "latency": latency,
                            "path": path})
     return {"source": source, "order": order_names, "routes": routes}
+
+
+def compute_wm(nodes, links, source, weights):
+    # Weighted scalar metric over up simple paths. Along a path h is the
+    # hop count, x the summed cost, y the bottleneck (minimum) bandwidth,
+    # and z the summed latency; q = a*h + b*x + c*(M-y) + d*z is computed
+    # exactly over integers. The destination takes the minimum q, and an
+    # exact tie goes to the smallest node sequence in Unicode code point
+    # order. best[n] = (q, path, h, x, y, z).
+    a, b, c, d = weights
+    adj = {n: [] for n in nodes}
+    for link in links:
+        if link["up"]:
+            adj[link["from"]].append(
+                (link["to"], link["cost"], link["bandwidth"], link["latency"]))
+
+    best = {}
+
+    def consider(path, hop_count, cost, bandwidth, latency):
+        q = a * hop_count + b * cost + c * (MAX_COST - bandwidth) + d * latency
+        dest = path[-1]
+        cur = best.get(dest)
+        if cur is None or q < cur[0] or (q == cur[0] and path < cur[1]):
+            best[dest] = (q, list(path), hop_count, cost, bandwidth, latency)
+
+    # Iterative DFS with an explicit stack, matching compute_metric;
+    # metrics[d] holds the accumulated (hop, cost, bandwidth, latency)
+    # for path[:d+1].
+    path = [source]
+    visited = {source}
+    metrics = [(0, 0, MAX_COST, 0)]
+    consider(path, 0, 0, MAX_COST, 0)
+    stack = [iter(adj[source])]
+    while stack:
+        try:
+            to, w, bw, lat = next(stack[-1])
+        except StopIteration:
+            stack.pop()
+            if stack:
+                metrics.pop()
+                visited.remove(path.pop())
+            continue
+        if to in visited:
+            continue
+        visited.add(to)
+        path.append(to)
+        hop_count, cost, bandwidth, latency = metrics[-1]
+        entry = (hop_count + 1, cost + w, min(bandwidth, bw), latency + lat)
+        metrics.append(entry)
+        consider(path, *entry)
+        stack.append(iter(adj[to]))
+
+    # Every reachable non-source destination has a finite best q; if any
+    # of them exceeds MAX_TIME the whole query is an overflow error.
+    for n in nodes:
+        if n != source and n in best and best[n][0] > MAX_TIME:
+            fail(5)
+
+    routes = []
+    for n in sorted(nodes):
+        if n == source:
+            routes.append([n, source, 0, 0, 0, None, 0, [source]])
+        elif n not in best:
+            routes.append([n, None, None, None, None, None, None, []])
+        else:
+            q, p, hop_count, cost, bandwidth, latency = best[n]
+            routes.append([n, p[1], q, hop_count, cost, bandwidth, latency, p])
+    return {"s": source, "w": list(weights), "r": routes}
 
 
 def compute_ecmp(nodes, links, source, flow):
@@ -4672,6 +4742,28 @@ def main():
         if source not in node_set:
             fail(5)
         result = compute_metric(nodes, links, source, order_names)
+    elif argv[1] == "wm":
+        if len(argv) != 5:
+            fail(2)
+        file_path, source, weights_text = argv[2], argv[3], argv[4]
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        try:
+            weights = json.loads(weights_text,
+                                 parse_constant=_reject_constant,
+                                 parse_float=_finite_float,
+                                 object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(weights, list) or len(weights) != 4:
+            fail(5)
+        for weight in weights:
+            if type(weight) is not int or not 0 <= weight <= MAX_COST:
+                fail(5)
+        if not any(weights):
+            fail(5)
+        if source not in node_set:
+            fail(5)
+        result = compute_wm(nodes, links, source, weights)
     elif argv[1] == "protect":
         if len(argv) != 7:
             fail(2)
