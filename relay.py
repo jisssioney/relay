@@ -38,6 +38,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py config PACK OP
        python relay.py nfail FILE S D W DATA
        python relay.py lfail FILE S D W DATA
+       python relay.py lrepair FILE S D W DATA
        python relay.py impair FILE S D DATA
        python relay.py compound FILE S D W DATA
        python relay.py compoundcp FILE S D W AT M STATE DATA
@@ -50,7 +51,7 @@ for policyreplay PACK or STATE, and for policytx op 4 also OUT),
 for queue/reorder/converge/policy/reserve/rebalance/retune also those in
 FILE/DATA/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
-those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/impair/
+those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/impair/
 compound/audit those in DATA, for compoundcp those in STATE/DATA, for
 branch those in DB/OP, for wm/wmecmp those in FILE/W, for drill/multidrill/convstat/slosum
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
@@ -385,6 +386,35 @@ key order s,f,w,r; r is sorted by destination and each item is
 h/x/y/z/path those of the selected first hop's representative path.
 The source item is [S,[S],S,0,0,0,null,0,[S]] and an unreachable
 destination's item is [destination,[],null,null,null,null,null,null,[]].
+lrepair takes FILE S D W DATA: FILE/S/D/W follow lfail, and DATA is a
+JSON array, possibly empty, of [t,u,v,up] link items only (t a
+non-boolean integer in 0..MAX_COST, non-decreasing with equal t kept in
+input order, u->v naming a FILE edge, up a boolean). The primary m is
+the lowest-cost S->D path in the initial up-graph, ties going to the
+node sequence smallest in Unicode code point order (exactly the
+shortest_paths tie-break); no primary, or a primary edge whose repair
+does not exist, is code 5. The repair routes b follow the primary's
+edge order as [u,v,[cost,path]]: for each primary edge (u, v) delete
+that edge and the primary nodes strictly before u, take the
+lowest-cost u->D path with the same tie-break, and splice the primary
+S..u prefix in front; the reported cost is the prefix cost plus the
+suffix cost. Every repair is computed once from the initial up-graph
+and never recomputed; a link item only flips that link's up state and
+a repeated setting is idempotent and leaves the timer alone. After a
+real change the target is the usable primary, else the first all-up
+repair in primary-edge order with ties by cost then path order, else
+nothing (code 5). A target differing from the installed route (re)arms
+a changeover timer at t+W (an overflow past MAX_TIME is code 5); an
+equal target cancels any pending timer. Items at one tick run in input
+order before a timer expiring on it; a timer due before the next
+item's tick completes first, and a timer pending after the last item
+keeps advancing. Result key order is s,d,m,b,e,r,f; routes are
+[cost,path]. e follows processing order with an input row
+[t,0,u,v,up,k,old,target,due] per item (k 1 on a real flip else 0, due
+the pending completion time or null, old the installed route before
+the item and target the route a pending completion would install, else
+the installed one) and a completion row [t,1,old,new,elapsed]; r is
+the completion count and f the final installed route.
 """
 
 import hashlib
@@ -3844,6 +3874,140 @@ def compute_lfail(nodes, links, source, destination, wait, items):
             else [None, []],
             "s": switches,
             "p": packets}
+
+
+def compute_lrepair(nodes, links, source, destination, wait, items):
+    # Link-failure local repair with a debounced changeover delay. The
+    # primary is the lowest-cost path in the initial up-graph, ties going
+    # to the node sequence smallest in Unicode code point order (exactly
+    # the shortest_paths tie-break). One repair path is precomputed per
+    # primary edge (u, v): delete that edge together with the primary
+    # nodes strictly before u, then take the lowest-cost u->D path under
+    # the same tie-break and splice the primary prefix S..u in front of
+    # it; no primary, or any edge with no such u->D path, is an error.
+    # The repairs are computed once here and never recomputed; link
+    # items only flip link up states (repeated setting is idempotent).
+    up_links = [link for link in links if link["up"]]
+    cost_of, path_of = shortest_paths(nodes, up_links, source)
+    primary_path = path_of[destination]
+    if primary_path is None:
+        fail(5)
+    primary = (cost_of[destination], primary_path)
+
+    # repairs follows the primary's edge order; entry j covers
+    # primary_path[j] -> primary_path[j+1] as (cost, full path).
+    repairs = []
+    for j in range(len(primary_path) - 1):
+        u = primary_path[j]
+        edge = (u, primary_path[j + 1])
+        prefix = set(primary_path[:j])
+        rlinks = [link for link in up_links
+                  if link["from"] not in prefix
+                  and link["to"] not in prefix
+                  and (link["from"], link["to"]) != edge]
+        rcost_of, rpath_of = shortest_paths(nodes, rlinks, u)
+        suffix = rpath_of[destination]
+        if suffix is None:
+            fail(5)
+        # u sits on the primary shortest path, so cost_of[u] is the
+        # primary prefix's cost; the repair route's cost is the prefix
+        # plus the u->D suffix cost.
+        repairs.append((cost_of[u] + rcost_of[destination],
+                        primary_path[:j + 1] + suffix[1:]))
+
+    state = {(link["from"], link["to"]): link["up"] for link in links}
+    repair_edges = [set(zip(route[1], route[1][1:]))
+                    for route in repairs]
+    primary_edges = set(zip(primary_path, primary_path[1:]))
+    primary_down = 0
+    repair_down = [0] * len(repairs)
+
+    def route_of(target):
+        return [target[0], target[1]] if target is not None else [None, []]
+
+    def target():
+        # The usable primary first; otherwise the first all-up repair in
+        # primary-edge order, ties broken by cost then path order;
+        # otherwise no path.
+        if primary_down == 0:
+            return primary
+        choice = None
+        choice_key = None
+        for j, route in enumerate(repairs):
+            if repair_down[j] == 0:
+                key = (route[0], route[1])
+                if choice_key is None or key < choice_key:
+                    choice_key = key
+                    choice = route
+        return choice
+
+    installed = primary
+    timer_start = None
+    timer_at = None
+    timer_target = None
+    events = []
+    completed = 0
+    i = 0
+    n = len(items)
+    while i < n or timer_at is not None:
+        wakes = []
+        if i < n:
+            wakes.append(items[i][0])
+        if timer_at is not None:
+            wakes.append(timer_at)
+        now = min(wakes)
+        # All items at this tick run in input order before a timer
+        # completing on it; a timer due before the next item's tick
+        # completes first.
+        while i < n and items[i][0] == now:
+            _, u, v, up = items[i]
+            i += 1
+            pair = (u, v)
+            real = 0
+            old = route_of(installed)
+            if state[pair] != up:
+                state[pair] = up
+                real = 1
+                delta = -1 if up else 1
+                if pair in primary_edges:
+                    primary_down += delta
+                for j, edges in enumerate(repair_edges):
+                    if pair in edges:
+                        repair_down[j] += delta
+            new_target = target()
+            if real:
+                if new_target is None:
+                    # Neither the primary nor any repair is usable.
+                    fail(5)
+                if new_target != installed:
+                    # (Re)arm the changeover timer at t+W.
+                    timer_start = now
+                    timer_at = now + wait
+                    if timer_at > MAX_TIME:
+                        fail(5)
+                    timer_target = new_target
+                else:
+                    # The installed route is already the target: cancel.
+                    timer_start = timer_at = timer_target = None
+            due = timer_at
+            events.append([now, 0, u, v, up, real, old,
+                           route_of(timer_target if timer_at is not None
+                                    else installed),
+                           due])
+        if timer_at is not None and timer_at == now:
+            old = installed
+            installed = timer_target
+            events.append([now, 1, route_of(old), route_of(installed),
+                           now - timer_start])
+            completed += 1
+            timer_start = timer_at = timer_target = None
+
+    return {"s": source, "d": destination,
+            "m": route_of(primary),
+            "b": [[primary_path[j], primary_path[j + 1],
+                   route_of(repairs[j])]
+                  for j in range(len(repairs))],
+            "e": events, "r": completed, "f": route_of(installed)}
 
 
 def compute_fault(nodes, links, source, destination, wait, batches):
@@ -8276,6 +8440,44 @@ def main():
                 items.append((t, pid))
         result = compute_lfail(nodes, links, source, destination,
                                wait, items)
+    elif argv[1] == "lrepair":
+        if len(argv) != 7:
+            fail(2)
+        file_path, source, destination = argv[2], argv[3], argv[4]
+        wait_text, data_text = argv[5], argv[6]
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        if (source not in node_set or destination not in node_set
+                or source == destination):
+            fail(5)
+        wait = _bounded_int_arg(wait_text)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        items = []
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 4:
+                fail(5)
+            t, u, v, up = item
+            if type(t) is not int or not 0 <= t <= MAX_COST:
+                fail(5)
+            if previous_time is not None and t < previous_time:
+                fail(5)
+            previous_time = t
+            if (type(u) is not str or type(v) is not str
+                    or (u, v) not in pair_set):
+                fail(5)
+            if type(up) is not bool:
+                fail(5)
+            items.append((t, u, v, up))
+        result = compute_lrepair(nodes, links, source, destination,
+                                 wait, items)
     elif argv[1] == "fault":
         if len(argv) != 7:
             fail(2)
