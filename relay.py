@@ -45,6 +45,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py compoundcp FILE S D W AT M STATE DATA
        python relay.py branch FILE S D W DB OP
        python relay.py failstat FILE S D W A B DATA
+       python relay.py failreport FILE S D W A B SCENARIOS
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE,
 for policyreplay PACK or STATE, and for policytx op 4 also OUT),
@@ -54,7 +55,7 @@ for queue/reorder/converge/policy/reserve/rebalance/retune also those in
 FILE/DATA/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
-compound/audit/failstat those in DATA, for compoundcp those in STATE/DATA, for
+compound/audit/failstat those in DATA, for failreport that in SCENARIOS, for compoundcp those in STATE/DATA, for
 branch those in DB/OP, for wm/wmecmp those in FILE/W, for drill/multidrill/convstat/slosum
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
 those in OLD/NEW/EVENTS/DATA, for slogate those in
@@ -471,6 +472,29 @@ rows [t,1,old,new,delay,reachable]. o items are [start,end,duration];
 x is [batch count, real change count, completion count, interval
 count, total unavailable duration, longest unavailable duration], the
 last two 0 with no interval.
+failreport takes FILE S D W A B SCENARIOS: FILE/S/D/W/A/B and each
+per-scenario batch DATA reuse failstat's exact contract, except the
+window constraint is strict (A < B). SCENARIOS is a non-empty JSON
+array whose items are exactly [name, DATA] pairs; name is a distinct
+1..64 code point UTF-8 string and each DATA is non-empty (and otherwise
+a valid failstat batch list whose times all lie in [A, B]). Scenarios
+run independently, each from FILE's initial state; every argument and
+every scenario is fully validated before any scenario is executed, so a
+validation failure outputs nothing. The success object's key order is
+s,d,a,b,c,x. c follows input order, each entry [name,r,u,q]; r is the
+object that running failstat on that DATA produces, u formats
+(D-L)/D with quality's six-decimal algorithm where D = B-A and
+L = r.x[4] (the total unavailable duration), and q summarizes the delay
+of the completed (type-1) entries of r.e as [n,min,max,p50,p95], an
+empty set [0,null,null,null,null] and the percentiles the
+ceil(.50 n)-th / ceil(.95 n)-th ascending items (1-based). x is
+[scenario count, overall u, sum of L, max L, sum of switch counts,
+merged q]; overall u uses scenario count * D as the denominator the
+same way, the switch count is r.x[2] (failstat's completion count), and
+the merged q pools every scenario's completion delays on the same
+basis. The JSON byte and exit-code 2..5 contracts follow failstat; a
+SCENARIOS syntax error is code 4 and every other new-form error is
+code 5. The old entry point is unchanged and out of scope here.
 """
 
 import hashlib
@@ -1047,6 +1071,66 @@ def _bounded_int_arg(text):
     if value > MAX_COST:
         fail(5)
     return value
+
+
+def _parse_failstat_batches(data, node_set, pair_set, window_a, window_b):
+    # Validate an already JSON-decoded value as failstat's non-empty batch
+    # list and return the internal (t, changes) batches. Every rule is a
+    # code-5 schema error; this is shared byte-for-byte by failstat and
+    # each failreport scenario's DATA.
+    if not isinstance(data, list) or not data:
+        fail(5)
+    batches = []
+    previous_time = None
+    for item in data:
+        if not isinstance(item, list) or len(item) != 2:
+            fail(5)
+        t, changes = item
+        if type(t) is not int or not 0 <= t <= MAX_COST:
+            fail(5)
+        if not window_a <= t <= window_b:
+            fail(5)
+        if previous_time is not None and t <= previous_time:
+            fail(5)
+        previous_time = t
+        if not isinstance(changes, list) or not changes:
+            fail(5)
+        seen_nodes = set()
+        seen_pairs = set()
+        batch = []
+        for change in changes:
+            if not isinstance(change, list) or len(change) not in (3, 4):
+                fail(5)
+            kind = change[0]
+            if type(kind) is not int or kind not in (0, 1):
+                fail(5)
+            if kind == 0:
+                if len(change) != 3:
+                    fail(5)
+                _, node, up = change
+                if type(node) is not str or node not in node_set:
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                if node in seen_nodes:
+                    fail(5)
+                seen_nodes.add(node)
+                batch.append((0, node, up))
+            else:
+                if len(change) != 4:
+                    fail(5)
+                _, u, v, up = change
+                if (type(u) is not str or type(v) is not str
+                        or (u, v) not in pair_set):
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                if (u, v) in seen_pairs:
+                    fail(5)
+                seen_pairs.add((u, v))
+                batch.append((1, u, v, up))
+        batches.append((t, batch))
+    return batches
 
 
 def compute_queue(frm, to, cap, step, packets):
@@ -4470,6 +4554,63 @@ def compute_failstat(nodes, links, source, destination, wait, batches,
             "b": window_b, "i": route_of(initial), "e": events,
             "o": intervals, "x": stats,
             "f": route_of(installed)}
+
+
+def _failreport_delay_q(delays):
+    # [n,min,max,p50,p95] over a set of completion delays, with p50/p95
+    # the ceil(.50 n)-th / ceil(.95 n)-th ascending item (1-based), the
+    # same percentile convention as compute_quality. An empty set is
+    # [0,null,null,null,null].
+    n = len(delays)
+    if not n:
+        return [0, None, None, None, None]
+    ordered = sorted(delays)
+    return [n, ordered[0], ordered[-1],
+            ordered[(50 * n + 99) // 100 - 1],
+            ordered[(95 * n + 99) // 100 - 1]]
+
+
+def compute_failreport(nodes, links, source, destination, wait,
+                       window_a, window_b, scenarios):
+    # Independent per-scenario failstat runs, each starting from FILE's
+    # initial state. scenarios holds validated (name, batches) pairs in
+    # input order; compute_failstat rebuilds its own initial route, node
+    # and link up-state, timer and event bookkeeping, so runs never share
+    # mutable state. D = B-A is positive (A < B is validated). u is
+    # (D-L)/D, L the run's total unavailable duration (r.x[4]), formatted
+    # with quality's exact six-decimal half-up rule; the overall u uses
+    # scenario count * D as the denominator over the summed L. q
+    # summarizes completion (type-1 event) delays, and the merged q pools
+    # every scenario's completion delays on the same basis.
+    window_d = window_b - window_a
+    entries = []
+    pooled_delays = []
+    total_unavailable = 0
+    max_unavailable = 0
+    total_switches = 0
+    for name, batches in scenarios:
+        result = compute_failstat(nodes, links, source, destination,
+                                  wait, batches, window_a, window_b)
+        unavailable = result["x"][4]
+        switches = result["x"][2]
+        delays = [event[4] for event in result["e"] if event[1] == 1]
+        total_unavailable += unavailable
+        total_switches += switches
+        if unavailable > max_unavailable:
+            max_unavailable = unavailable
+        pooled_delays.extend(delays)
+        u = _format_peak(window_d - unavailable, window_d)
+        entries.append([name, result, u, _failreport_delay_q(delays)])
+
+    scenario_count = len(scenarios)
+    overall_den = scenario_count * window_d
+    overall_u = _format_peak(overall_den - total_unavailable, overall_den)
+    merged_q = _failreport_delay_q(pooled_delays)
+    summary = [scenario_count, overall_u, total_unavailable,
+               max_unavailable, total_switches, merged_q]
+
+    return {"s": source, "d": destination, "a": window_a,
+            "b": window_b, "c": entries, "x": summary}
 
 
 def compute_impair(nodes, links, source, destination, items):
@@ -8964,61 +9105,58 @@ def main():
                               object_pairs_hook=_object_no_dup)
         except (ValueError, RecursionError):
             fail(4)
-        if not isinstance(data, list) or not data:
-            fail(5)
         pair_set = {(link["from"], link["to"]) for link in links}
-        batches = []
-        previous_time = None
-        for item in data:
-            if not isinstance(item, list) or len(item) != 2:
-                fail(5)
-            t, changes = item
-            if type(t) is not int or not 0 <= t <= MAX_COST:
-                fail(5)
-            if not window_a <= t <= window_b:
-                fail(5)
-            if previous_time is not None and t <= previous_time:
-                fail(5)
-            previous_time = t
-            if not isinstance(changes, list) or not changes:
-                fail(5)
-            seen_nodes = set()
-            seen_pairs = set()
-            batch = []
-            for change in changes:
-                if not isinstance(change, list) or len(change) not in (3, 4):
-                    fail(5)
-                kind = change[0]
-                if type(kind) is not int or kind not in (0, 1):
-                    fail(5)
-                if kind == 0:
-                    if len(change) != 3:
-                        fail(5)
-                    _, node, up = change
-                    if type(node) is not str or node not in node_set:
-                        fail(5)
-                    if type(up) is not bool:
-                        fail(5)
-                    if node in seen_nodes:
-                        fail(5)
-                    seen_nodes.add(node)
-                    batch.append((0, node, up))
-                else:
-                    if len(change) != 4:
-                        fail(5)
-                    _, u, v, up = change
-                    if (type(u) is not str or type(v) is not str
-                            or (u, v) not in pair_set):
-                        fail(5)
-                    if type(up) is not bool:
-                        fail(5)
-                    if (u, v) in seen_pairs:
-                        fail(5)
-                    seen_pairs.add((u, v))
-                    batch.append((1, u, v, up))
-            batches.append((t, batch))
+        batches = _parse_failstat_batches(data, node_set, pair_set,
+                                          window_a, window_b)
         result = compute_failstat(nodes, links, source, destination,
                                   wait, batches, window_a, window_b)
+    elif argv[1] == "failreport":
+        if len(argv) != 9:
+            fail(2)
+        file_path, source, destination = argv[2], argv[3], argv[4]
+        wait_text, a_text, b_text, scenarios_text = (argv[5], argv[6],
+                                                     argv[7], argv[8])
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        if (source not in node_set or destination not in node_set
+                or source == destination):
+            fail(5)
+        wait = _bounded_int_arg(wait_text)
+        window_a = _bounded_int_arg(a_text)
+        window_b = _bounded_int_arg(b_text)
+        if window_a >= window_b:
+            # failreport requires a strict, positive window D = B-A.
+            fail(5)
+        try:
+            raw_scenarios = json.loads(scenarios_text,
+                                       parse_constant=_reject_constant,
+                                       parse_float=_finite_float,
+                                       object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(raw_scenarios, list) or not raw_scenarios:
+            fail(5)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        # Fully validate every scenario before running any of them.
+        scenarios = []
+        seen_names = set()
+        for entry in raw_scenarios:
+            if not isinstance(entry, list) or len(entry) != 2:
+                fail(5)
+            name, data = entry
+            if type(name) is not str or not 1 <= len(name) <= 64:
+                fail(5)
+            try:
+                name.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if name in seen_names:
+                fail(5)
+            seen_names.add(name)
+            batches = _parse_failstat_batches(data, node_set, pair_set,
+                                              window_a, window_b)
+            scenarios.append((name, batches))
+        result = compute_failreport(nodes, links, source, destination,
+                                    wait, window_a, window_b, scenarios)
     elif argv[1] == "impair":
         if len(argv) != 6:
             fail(2)
