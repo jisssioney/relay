@@ -46,6 +46,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py branch FILE S D W DB OP
        python relay.py failstat FILE S D W A B DATA
        python relay.py failreport FILE S D W A B SCENARIOS
+       python relay.py failcmp OLD NEW S D W A B SCENARIOS
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE,
 for policyreplay PACK or STATE, and for policytx op 4 also OUT),
@@ -55,7 +56,7 @@ for queue/reorder/converge/policy/reserve/rebalance/retune also those in
 FILE/DATA/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
-compound/audit/failstat those in DATA, for failreport that in SCENARIOS, for compoundcp those in STATE/DATA, for
+compound/audit/failstat those in DATA, for failreport that in SCENARIOS, for failcmp code 3 covers an unreadable OLD/NEW and code 4 a SCENARIOS syntax error, for compoundcp those in STATE/DATA, for
 branch those in DB/OP, for wm/wmecmp those in FILE/W, for drill/multidrill/convstat/slosum
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
 those in OLD/NEW/EVENTS/DATA, for slogate those in
@@ -64,7 +65,10 @@ snapshot those in STATE/OP/IN, for config those in PACK/OP/IN, for
 policytx those in STATE/OP, for policyreplay those in PACK/STATE/DATA),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
 P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
-unknown-node/overflow/re-failure error; for hotload code 5 also covers
+unknown-node/overflow/re-failure error; for failcmp code 5 also covers
+S or D absent from either graph or equal, A >= B, and any failreport
+new-form error in SCENARIOS validated against the two graphs' common
+node and link sets; for hotload code 5 also covers
 a STATE whose v/p/h structure, version continuity, or version conflict
 is invalid; for snapshot code 5 also covers an invalid OP shape, path,
 or BASE, a STATE/IN whose v/p/h structure, key order, or version
@@ -495,6 +499,44 @@ the merged q pools every scenario's completion delays on the same
 basis. The JSON byte and exit-code 2..5 contracts follow failstat; a
 SCENARIOS syntax error is code 4 and every other new-form error is
 code 5. The old entry point is unchanged and out of scope here.
+failcmp takes OLD NEW S D W A B SCENARIOS: OLD/NEW each reuse
+failreport's FILE contract and W/A/B/SCENARIOS and every per-scenario
+DATA reuse failreport's exact contract with its strict A < B window. S
+and D must name nodes present in both graphs and differ; every node and
+link a scenario references must exist in both graphs (the intersection
+set), but the two graphs may otherwise differ freely. Both files,
+every argument, and every scenario are fully validated before any
+scenario executes, so a validation failure outputs nothing; OLD is
+read before NEW and the command is read-only. Each scenario then runs
+failstat independently from each graph's own initial state, exactly as
+two failreport invocations. The success object's key order is
+s,d,a,b,c,x. c follows SCENARIOS input order, each entry [name,O,N,d,g].
+O/N are [r,u,q]: r is the failstat object running that scenario
+produces on the OLD/NEW graph, u the six-decimal availability string,
+and q its [n,min,max,p50,p95] completion-delay summary, each exactly
+what failreport emits. d is six elements NEW minus OLD:
+[du,dL,dM,dR,d50,d95], where du is the signed six-decimal string of
+the difference in the millionths behind u (a signed zero written
+"0.000000"), dL/dM are integer differences of total unavailable
+duration (r.x[4]) and longest unavailable duration (r.x[5]), dR the
+integer difference of the switch count (r.x[2]), and d50/d95 the
+integer differences of q's p50/p95, null when either side's percentile
+is null; every other difference is an integer. The verdict compares
+the lexicographic key (L,M,R,p95,p50) of loss metrics, where
+L = dL/dM/dR as above, p95/p50 = d95/d50, and a strictly negative key
+element means NEW improved and a positive one regressed: g is 0 for
+improvement, 1 for a tie, 2 for regression; percentiles are treated as
+equal there when R = 0 (both sides then hold no completion when the
+comparison reaches them, so d50/d95 are null). x is
+[OX,NX,d,[improvement count,tie count,regression count]]: OX/NX are
+each side's failreport summary x and the trailing d is computed over
+the two summaries on the same basis (overall availability millionths,
+summed total duration, max longest duration, summed switch count, and
+the merged-pool p50/p95). H/P are the total batch count and the output
+byte count. The JSON byte and exit-code 2..5 contracts follow
+failreport; an OLD/NEW read error is code 3 and a cross-topology
+illegality is code 5. The old entry point is unchanged and out of
+scope here.
 """
 
 import hashlib
@@ -4611,6 +4653,122 @@ def compute_failreport(nodes, links, source, destination, wait,
 
     return {"s": source, "d": destination, "a": window_a,
             "b": window_b, "c": entries, "x": summary}
+
+
+def _failcmp_fixed(value):
+    # A six-decimal fixed-point rendering of an integer difference:
+    # "-" prefix only for strictly negative values, no sign on positive
+    # values, and a signed zero normalized to "0.000000".
+    if value < 0:
+        return "-%d.%06d" % (-value // 1000000, -value % 1000000)
+    return "%d.%06d" % (value // 1000000, value % 1000000)
+
+
+def _failcmp_u_millionths(u):
+    # The integer behind a failreport six-decimal availability string,
+    # parsed digit-wise so no float rounding is involved.
+    whole, frac = u.split(".")
+    return int(whole) * 1000000 + int(frac)
+
+
+def _failcmp_pdiff(old_p, new_p):
+    # The NEW-minus-OLD difference of one percentile (q's p50/p95);
+    # null when either side lacks a completion percentile.
+    if old_p is None or new_p is None:
+        return None
+    return new_p - old_p
+
+
+def _failcmp_d(old_vals, new_vals):
+    # The six-element NEW-minus-OLD difference [du, dL, dM, dR, d50,
+    # d95] from the paired values (u millionths, total L, longest M,
+    # switch count R, p50, p95): du a signed six-decimal string, dL/dM/
+    # dR integers, d50/d95 integers or null when a percentile is absent
+    # on either side.
+    return [_failcmp_fixed(new_vals[0] - old_vals[0]),
+            new_vals[1] - old_vals[1],
+            new_vals[2] - old_vals[2],
+            new_vals[3] - old_vals[3],
+            _failcmp_pdiff(old_vals[4], new_vals[4]),
+            _failcmp_pdiff(old_vals[5], new_vals[5])]
+
+
+def _failcmp_verdict(diff):
+    # Rank NEW against OLD on the lexicographic loss key (L, M, R, p95,
+    # p50) = (dL, dM, dR, d95, d50): the first strictly negative
+    # element means NEW loses less (improvement, 0), a positive one a
+    # regression (2), all equal a tie (1). When R = 0 the comparison
+    # reaches the percentile slots only with zero completions on both
+    # sides, so null percentiles there are regarded as equal and
+    # skipped.
+    for index in (1, 2, 3):
+        value = diff[index]
+        if value < 0:
+            return 0
+        if value > 0:
+            return 2
+    for index in (5, 4):
+        value = diff[index]
+        if value is None:
+            # R = 0 with no percentile on a side: treated as equal.
+            continue
+        if value < 0:
+            return 0
+        if value > 0:
+            return 2
+    return 1
+
+
+def compute_failcmp(old_report, new_report):
+    # Side-by-side comparison of two failreport runs over the shared
+    # S/D/W/A/B scenario set. Both reports share identical scenarios in
+    # identical input order (validated by the caller), so entries pair
+    # positionally. Each c entry is [name, O, N, d, g] with O/N the
+    # [failstat result r, availability u, delay summary q] triple on the
+    # OLD/NEW side, d the six NEW-minus-OLD differences (see
+    # _failcmp_d), and g the 0/1/2 improvement/tie/regression verdict
+    # from the lexicographic (L, M, R, p95, p50) key. x is
+    # [OX, NX, d, [improvement, tie, regression counts]] with OX/NX
+    # each side's failreport summary and the trailing d built over the
+    # two summaries on the same basis (the merged-pool q carries each
+    # side's pooled p50/p95).
+    entries = []
+    improved = tied = regressed = 0
+    for old_c, new_c in zip(old_report["c"], new_report["c"]):
+        name, old_result, old_u, old_q = old_c
+        _, new_result, new_u, new_q = new_c
+        old_vals = (_failcmp_u_millionths(old_u), old_result["x"][4],
+                    old_result["x"][5], old_result["x"][2],
+                    old_q[3], old_q[4])
+        new_vals = (_failcmp_u_millionths(new_u), new_result["x"][4],
+                    new_result["x"][5], new_result["x"][2],
+                    new_q[3], new_q[4])
+        diff = _failcmp_d(old_vals, new_vals)
+        verdict = _failcmp_verdict(diff)
+        if verdict == 0:
+            improved += 1
+        elif verdict == 2:
+            regressed += 1
+        else:
+            tied += 1
+        entries.append([name,
+                        [old_result, old_u, old_q],
+                        [new_result, new_u, new_q],
+                        diff, verdict])
+
+    old_ox = old_report["x"]
+    new_ox = new_report["x"]
+    old_summary = (_failcmp_u_millionths(old_ox[1]), old_ox[2],
+                   old_ox[3], old_ox[4], old_ox[5][3], old_ox[5][4])
+    new_summary = (_failcmp_u_millionths(new_ox[1]), new_ox[2],
+                   new_ox[3], new_ox[4], new_ox[5][3], new_ox[5][4])
+    summary_diff = _failcmp_d(old_summary, new_summary)
+
+    return {"s": new_report["s"], "d": new_report["d"],
+            "a": new_report["a"], "b": new_report["b"],
+            "c": entries,
+            "x": [old_ox, new_ox, summary_diff,
+                  [improved, tied, regressed]]}
 
 
 def compute_impair(nodes, links, source, destination, items):
@@ -9157,6 +9315,74 @@ def main():
             scenarios.append((name, batches))
         result = compute_failreport(nodes, links, source, destination,
                                     wait, window_a, window_b, scenarios)
+    elif argv[1] == "failcmp":
+        if len(argv) != 10:
+            fail(2)
+        old_path, new_path, source, destination = (argv[2], argv[3],
+                                                   argv[4], argv[5])
+        wait_text, a_text, b_text, scenarios_text = (argv[6], argv[7],
+                                                     argv[8], argv[9])
+        # OLD and NEW each reuse failreport's FILE contract; OLD is read
+        # before NEW, so an unreadable OLD reports 3 even when NEW is.
+        old_nodes, old_links, old_node_set = load_network(old_path,
+                                                          metrics=True)
+        new_nodes, new_links, new_node_set = load_network(new_path,
+                                                          metrics=True)
+        # S/D must exist in both graphs and must differ (the failstat
+        # source == destination rejection is folded into this check).
+        if (source not in old_node_set or source not in new_node_set
+                or destination not in old_node_set
+                or destination not in new_node_set
+                or source == destination):
+            fail(5)
+        wait = _bounded_int_arg(wait_text)
+        window_a = _bounded_int_arg(a_text)
+        window_b = _bounded_int_arg(b_text)
+        if window_a >= window_b:
+            # As in failreport, D = B-A must be strictly positive.
+            fail(5)
+        try:
+            raw_scenarios = json.loads(scenarios_text,
+                                       parse_constant=_reject_constant,
+                                       parse_float=_finite_float,
+                                       object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(raw_scenarios, list) or not raw_scenarios:
+            fail(5)
+        # Scenario references must be common to both graphs, so node and
+        # link changes validate against the intersection sets; every
+        # other scenario rule is failreport's exactly. Both graphs and
+        # every scenario are fully validated before any failstat runs.
+        common_nodes = old_node_set & new_node_set
+        common_pairs = ({(link["from"], link["to"]) for link in old_links}
+                        & {(link["from"], link["to"]) for link in new_links})
+        scenarios = []
+        seen_names = set()
+        for entry in raw_scenarios:
+            if not isinstance(entry, list) or len(entry) != 2:
+                fail(5)
+            name, data = entry
+            if type(name) is not str or not 1 <= len(name) <= 64:
+                fail(5)
+            try:
+                name.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if name in seen_names:
+                fail(5)
+            seen_names.add(name)
+            batches = _parse_failstat_batches(data, common_nodes,
+                                              common_pairs, window_a,
+                                              window_b)
+            scenarios.append((name, batches))
+        old_report = compute_failreport(old_nodes, old_links, source,
+                                        destination, wait, window_a,
+                                        window_b, scenarios)
+        new_report = compute_failreport(new_nodes, new_links, source,
+                                        destination, wait, window_a,
+                                        window_b, scenarios)
+        result = compute_failcmp(old_report, new_report)
     elif argv[1] == "impair":
         if len(argv) != 6:
             fail(2)
