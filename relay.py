@@ -44,6 +44,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py compound FILE S D W DATA
        python relay.py compoundcp FILE S D W AT M STATE DATA
        python relay.py branch FILE S D W DB OP
+       python relay.py failstat FILE S D W A B DATA
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE,
 for policyreplay PACK or STATE, and for policytx op 4 also OUT),
@@ -53,7 +54,7 @@ for queue/reorder/converge/policy/reserve/rebalance/retune also those in
 FILE/DATA/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
-compound/audit those in DATA, for compoundcp those in STATE/DATA, for
+compound/audit/failstat those in DATA, for compoundcp those in STATE/DATA, for
 branch those in DB/OP, for wm/wmecmp those in FILE/W, for drill/multidrill/convstat/slosum
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
 those in OLD/NEW/EVENTS/DATA, for slogate those in
@@ -445,6 +446,31 @@ the pending completion time or null, old the installed route before
 the item and target the route a pending completion would install, else
 the installed one) and a completion row [t,1,old,new,delay]; r is the
 completion count and f the final installed route.
+failstat takes FILE S D W A B DATA: FILE/S/D/W follow fault's command
+mode (FILE with metrics) and DATA is fault's non-empty batch list
+([t,changes] with strictly increasing t, each changes a non-empty list
+of node [0,n,up] and link [1,u,v,up] boolean settings, each node or
+pair set at most once per batch), with every batch t additionally a
+non-boolean integer in [A, B]; A/B are non-boolean decimal integers in
+0..MAX_COST with A <= B, and a batch outside [A, B], A > B, or any
+structure fault rejects is code 5. The clock advances from A to B
+following fault's atomic-batch, idempotent, cancel-recompute-retarget
+and t+W install semantics, batches at one tick running before a timer
+expiring on it; a switch still pending past B is not completed and a
+timer due at B completes after B's batch. The installed route is
+unavailable when it is [null,[]] or holds a currently down node or
+link. Availability at A is sampled before the tick is processed:
+unavailable there opens an interval at A; afterwards a
+usable-to-unusable turn at t opens [t, ?) and the reverse closes it at
+t, an interval still open at B closes at B, and a zero-duration
+interval is kept. Result key order is s,d,a,b,i,e,o,x,f; routes are
+[cost,path], no route [null,[]]. i is the installed route before A's
+processing and f the installed route after B's; e follows processing
+order with batch rows [t,0,k,old,target,due,reachable] and completion
+rows [t,1,old,new,delay,reachable]. o items are [start,end,duration];
+x is [batch count, real change count, completion count, interval
+count, total unavailable duration, longest unavailable duration], the
+last two 0 with no interval.
 """
 
 import hashlib
@@ -4273,6 +4299,177 @@ def compute_fault(nodes, links, source, destination, wait, batches):
 
     return {"s": source, "d": destination, "i": route_of(initial),
             "e": events, "r": reroutes}
+
+
+def compute_failstat(nodes, links, source, destination, wait, batches,
+                     window_a, window_b):
+    # Joint-failure availability over [A, B] on fault's debounced
+    # recompute-and-install machine. The initial route, atomic batches,
+    # idempotent settings, cancel/recompute/retarget and t+W install
+    # semantics are exactly compute_fault's; the clock is bounded by the
+    # window instead of running out after the last batch: at one tick the
+    # batch still runs before a timer expiring on it, but a completion
+    # due after B never happens and a batch tick is only ever reached
+    # inside [A, B] (every batch t validates into the window). The
+    # installed route is available when it exists and every node and
+    # link on it is currently up; an installed [null, []] is not.
+    # Availability is sampled at A before any processing: unavailable
+    # there opens an interval at A. Within processing order a batch
+    # reports the post-batch (pre-expiry, same as fault's recorded
+    # target state) availability, and a completion reports its
+    # post-install availability; an unavailable turn at t opens [t, ?)
+    # and a recovery at t closes the open interval at t, so a close and
+    # a reopen may share a tick and a zero-duration interval is kept.
+    # An interval still open at B closes at B.
+    up_links = [link for link in links if link["up"]]
+    cost_of, path_of = shortest_paths(nodes, up_links, source)
+    initial_path = path_of[destination]
+    installed = ((cost_of[destination], initial_path)
+                 if initial_path is not None else None)
+    initial = installed
+
+    node_up = {n: True for n in nodes}
+    link_up = {(link["from"], link["to"]): link["up"] for link in links}
+
+    def recompute():
+        # Lowest-cost path over up nodes and up links joining them.
+        if not (node_up[source] and node_up[destination]):
+            return None
+        live_nodes = [n for n in nodes if node_up[n]]
+        live_links = [{"from": link["from"], "to": link["to"],
+                       "cost": link["cost"], "up": True}
+                      for link in links
+                      if link_up[(link["from"], link["to"])]
+                      and node_up[link["from"]] and node_up[link["to"]]]
+        live_cost_of, live_path_of = shortest_paths(live_nodes,
+                                                    live_links, source)
+        path = live_path_of[destination]
+        return ((live_cost_of[destination], path)
+                if path is not None else None)
+
+    def route_of(target):
+        return [target[0], target[1]] if target is not None else [None, []]
+
+    def reachable_of(route):
+        # The installed route counts only while it exists and every node
+        # and link on it is currently up.
+        if route is None:
+            return False
+        path = route[1]
+        for node in path:
+            if not node_up[node]:
+                return False
+        for u, v in zip(path, path[1:]):
+            if not link_up[(u, v)]:
+                return False
+        return True
+
+    events = []
+    intervals = []
+    interval_start = None
+    batch_count = 0
+    real_count = 0
+    reroutes = 0
+
+    def flip(state):
+        # Track an availability edge at this moment.
+        nonlocal interval_start
+        if state:
+            if interval_start is not None:
+                intervals.append([interval_start, cursor,
+                                  cursor - interval_start])
+                interval_start = None
+        elif interval_start is None:
+            interval_start = cursor
+
+    # Sample at A before anything is processed.
+    cursor = window_a
+    if not reachable_of(installed):
+        interval_start = window_a
+
+    timer_start = None
+    timer_at = None
+    timer_target = None
+    i = 0
+    n = len(batches)
+    while True:
+        wakes = []
+        if i < n:
+            wakes.append(batches[i][0])
+        if timer_at is not None:
+            wakes.append(timer_at)
+        if not wakes:
+            # Nothing left but the window still has to be closed at B.
+            now = window_b
+        else:
+            now = min(wakes)
+            if now > window_b:
+                # The pending switch (and every later wake) belongs past
+                # B; it is never completed.
+                break
+        cursor = now
+        if i < n and batches[i][0] == now:
+            _, changes = batches[i]
+            i += 1
+            batch_count += 1
+            real = 0
+            for change in changes:
+                if change[0] == 0:
+                    _, node, up = change
+                    if node_up[node] != up:
+                        node_up[node] = up
+                        real += 1
+                else:
+                    _, u, v, up = change
+                    pair = (u, v)
+                    if link_up[pair] != up:
+                        link_up[pair] = up
+                        real += 1
+            if real:
+                real_count += real
+                # Cancel the old timer and re-target on the new graph.
+                timer_start = timer_at = timer_target = None
+                target = recompute()
+                if target != installed:
+                    # Arm the install timer at t+W.
+                    timer_start = now
+                    timer_at = now + wait
+                    timer_target = target
+            events.append([now, 0, real, route_of(installed),
+                           route_of(timer_target if timer_at is not None
+                                    else installed),
+                           timer_at, reachable_of(installed)])
+            # The batch may have broken the installed route even when no
+            # timer is running (or ever installs a fix).
+            flip(reachable_of(installed))
+        if timer_at is not None and timer_at == now:
+            old = installed
+            installed = timer_target
+            reachable = reachable_of(installed)
+            events.append([now, 1, route_of(old), route_of(installed),
+                           now - timer_start, reachable])
+            reroutes += 1
+            timer_start = timer_at = timer_target = None
+            flip(reachable)
+        if now == window_b:
+            break
+
+    # State at B after all in-window processing; an outage still open is
+    # closed at B (zero length when the break itself was at B).
+    cursor = window_b
+    if interval_start is not None:
+        intervals.append([interval_start, window_b,
+                          window_b - interval_start])
+    total = sum(duration for _, _, duration in intervals)
+    longest = max((duration for _, _, duration in intervals),
+                  default=0)
+    stats = [batch_count, real_count, reroutes, len(intervals),
+             total, longest]
+
+    return {"s": source, "d": destination, "a": window_a,
+            "b": window_b, "i": route_of(initial), "e": events,
+            "o": intervals, "x": stats,
+            "f": route_of(installed)}
 
 
 def compute_impair(nodes, links, source, destination, items):
@@ -8746,6 +8943,82 @@ def main():
             batches.append((t, batch))
         result = compute_fault(nodes, links, source, destination,
                                wait, batches)
+    elif argv[1] == "failstat":
+        if len(argv) != 9:
+            fail(2)
+        file_path, source, destination = argv[2], argv[3], argv[4]
+        wait_text, a_text, b_text, data_text = (argv[5], argv[6],
+                                                argv[7], argv[8])
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        if (source not in node_set or destination not in node_set
+                or source == destination):
+            fail(5)
+        wait = _bounded_int_arg(wait_text)
+        window_a = _bounded_int_arg(a_text)
+        window_b = _bounded_int_arg(b_text)
+        if window_a > window_b:
+            fail(5)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list) or not data:
+            fail(5)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        batches = []
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 2:
+                fail(5)
+            t, changes = item
+            if type(t) is not int or not 0 <= t <= MAX_COST:
+                fail(5)
+            if not window_a <= t <= window_b:
+                fail(5)
+            if previous_time is not None and t <= previous_time:
+                fail(5)
+            previous_time = t
+            if not isinstance(changes, list) or not changes:
+                fail(5)
+            seen_nodes = set()
+            seen_pairs = set()
+            batch = []
+            for change in changes:
+                if not isinstance(change, list) or len(change) not in (3, 4):
+                    fail(5)
+                kind = change[0]
+                if type(kind) is not int or kind not in (0, 1):
+                    fail(5)
+                if kind == 0:
+                    if len(change) != 3:
+                        fail(5)
+                    _, node, up = change
+                    if type(node) is not str or node not in node_set:
+                        fail(5)
+                    if type(up) is not bool:
+                        fail(5)
+                    if node in seen_nodes:
+                        fail(5)
+                    seen_nodes.add(node)
+                    batch.append((0, node, up))
+                else:
+                    if len(change) != 4:
+                        fail(5)
+                    _, u, v, up = change
+                    if (type(u) is not str or type(v) is not str
+                            or (u, v) not in pair_set):
+                        fail(5)
+                    if type(up) is not bool:
+                        fail(5)
+                    if (u, v) in seen_pairs:
+                        fail(5)
+                    seen_pairs.add((u, v))
+                    batch.append((1, u, v, up))
+            batches.append((t, batch))
+        result = compute_failstat(nodes, links, source, destination,
+                                  wait, batches, window_a, window_b)
     elif argv[1] == "impair":
         if len(argv) != 6:
             fail(2)
