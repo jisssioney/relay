@@ -984,6 +984,124 @@ def compute_ecmp(nodes, links, source, flow):
     return {"source": source, "flow": flow, "routes": routes}
 
 
+def dispatch_candidates(nodes, links, source, destination):
+    # (total_cost, first_hops, rep_paths) for the equal lowest-cost paths
+    # from source to destination, grouped by first hop. When the
+    # destination is unreachable, total_cost is None and the other two
+    # members are empty lists. Candidate first hops are deduplicated,
+    # sorted by Unicode code point order, and each represented by the
+    # complete path with the smallest node sequence.
+    #
+    # Distances to the destination are computed once with a Dijkstra on
+    # the reversed up-graph (O(V^2) selection, distances only -- no path
+    # sequences are copied), then each node gets the smallest successor
+    # still lying on a minimum-cost path to the destination; following
+    # successors materializes the lexicographically smallest minimum-cost
+    # path from any node. This groups all equal-cost paths by first hop in
+    # O(V^2) time and O(V^2) space without enumerating the exponentially
+    # many equal-cost simple paths.
+    rev = {n: [] for n in nodes}
+    for link in links:
+        if link["up"]:
+            rev[link["to"]].append((link["from"], link["cost"]))
+
+    dist = {n: None for n in nodes}
+    dist[destination] = 0
+    settled = set()
+    while True:
+        u = None
+        ud = None
+        for n in nodes:
+            c = dist[n]
+            if c is not None and n not in settled \
+                    and (ud is None or c < ud):
+                u, ud = n, c
+        if u is None:
+            break
+        settled.add(u)
+        for v, w in rev[u]:
+            if v in settled:
+                continue
+            nc = ud + w
+            if dist[v] is None or nc < dist[v]:
+                dist[v] = nc
+
+    total = dist[source]
+    if total is None:
+        return None, [], []
+
+    # Smallest next node (Unicode code point order) on a shortest route to
+    # the destination. Every link cost is >= 1, so along a qualifying edge
+    # the distance strictly decreases and successor chains cannot cycle.
+    succ = {}
+    for link in links:
+        if not link["up"]:
+            continue
+        u, v, w = link["from"], link["to"], link["cost"]
+        if dist[u] is not None and dist[v] is not None \
+                and w + dist[v] == dist[u]:
+            cur = succ.get(u)
+            if cur is None or v < cur:
+                succ[u] = v
+
+    # A first hop is usable iff some lowest-cost path starts with it.
+    first_cost = {}
+    for link in links:
+        if link["up"] and link["from"] == source:
+            first_cost[link["to"]] = link["cost"]
+    hops = sorted(h for h, w in first_cost.items()
+                  if dist[h] is not None and w + dist[h] == total)
+
+    rep_paths = []
+    for h in hops:
+        path = [source]
+        u = h
+        while u != destination:
+            path.append(u)
+            u = succ[u]
+        path.append(destination)
+        rep_paths.append(path)
+    return total, hops, rep_paths
+
+
+def compute_dispatch(nodes, links, source, destination, mode, packets):
+    total, hops, rep_paths = dispatch_candidates(
+        nodes, links, source, destination)
+    if total is None:
+        return {"source": source, "destination": destination, "mode": mode,
+                "nextHops": [], "cost": None,
+                "packets": [[pid, flow, None, None, []]
+                            for pid, flow in packets]}
+
+    hashes = None
+    if mode == "flow":
+        # Same rule as ecmp: the first eight bytes of the SHA-256 of the
+        # compact [flow, source, destination] JSON, modulo the candidate
+        # count. Equal flows always land on the same candidate.
+        hashes = {}
+        modulus = len(hops)
+        for _, flow in packets:
+            if flow not in hashes:
+                key = json.dumps([flow, source, destination],
+                                 ensure_ascii=False,
+                                 separators=(",", ":")).encode("utf-8")
+                digest = hashlib.sha256(key).digest()
+                hashes[flow] = int.from_bytes(digest[:8], "big") % modulus
+
+    rows = []
+    for seq, (pid, flow) in enumerate(packets):
+        if mode == "flow":
+            index = hashes[flow]
+        else:
+            # Packet mode: round-robin over candidates in DATA order,
+            # starting at the first candidate and wrapping at the end;
+            # the cursor advances solely with packet position.
+            index = seq % len(hops)
+        rows.append([pid, flow, index, hops[index], rep_paths[index]])
+    return {"source": source, "destination": destination, "mode": mode,
+            "nextHops": hops, "cost": total, "packets": rows}
+
+
 def compute_protect(nodes, links, source, destination, delay, events):
     # Primary: lowest-cost path in the initial up-graph. Backup: lowest-cost
     # path after removing the primary's directed edges. Both are computed
@@ -7348,6 +7466,45 @@ def main():
         if source not in node_set:
             fail(5)
         result = compute_wmecmp(nodes, links, source, flow, weights)
+    elif argv[1] == "dispatch":
+        if len(argv) != 7:
+            fail(2)
+        file_path, source, destination, mode, data_text = (
+            argv[2], argv[3], argv[4], argv[5], argv[6])
+        nodes, links, node_set = load_network(file_path)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if mode not in ("flow", "packet"):
+            fail(5)
+        if source not in node_set or destination not in node_set \
+                or source == destination:
+            fail(5)
+        if not isinstance(data, list) or not data:
+            fail(5)
+        packets = []
+        seen_ids = set()
+        for item in data:
+            if not isinstance(item, list) or len(item) != 2:
+                fail(5)
+            pid, flow = item
+            for value in (pid, flow):
+                if type(value) is not str \
+                        or not 1 <= len(value) <= MAX_FLOW_LEN:
+                    fail(5)
+                try:
+                    value.encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(5)
+            if pid in seen_ids:
+                fail(5)
+            seen_ids.add(pid)
+            packets.append((pid, flow))
+        result = compute_dispatch(nodes, links, source, destination,
+                                  mode, packets)
     elif argv[1] == "protect":
         if len(argv) != 7:
             fail(2)
