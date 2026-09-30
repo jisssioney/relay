@@ -8,6 +8,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py protect FILE SOURCE DESTINATION DELAY EVENTS
        python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
        python relay.py queue FILE FROM TO CAP STEP DATA
+       python relay.py qdisc FILE FROM TO STEP CLASSES DATA
        python relay.py fragment DATA
        python relay.py reassemble DATA
        python relay.py rewrite R D
@@ -53,7 +54,7 @@ for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
 policytx op 4 also OUT),
 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/reorder/converge/policy/reserve/rebalance/retune also those in
+for queue/qdisc/reorder/converge/policy/reserve/rebalance/retune also those in
 FILE/DATA/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
@@ -66,7 +67,7 @@ those in OLD/NEW/EVENTS/DATA, for slogate those in
 CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA, for
 snapshot those in STATE/OP/IN, for config those in PACK/OP/IN, for
 policytx those in STATE/OP, for policyreplay those in PACK/STATE/DATA),
-5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
+5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/CLASSES/DATA/D/R/
 P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
 unknown-node/overflow/re-failure error; for hotload code 5 also covers
 a STATE whose v/p/h structure, version continuity, or version conflict
@@ -1189,6 +1190,133 @@ def compute_queue(frm, to, cap, step, packets):
         results.append([pid, "ok", start, depart, start - time])
     return {"from": frm, "to": to, "cap": cap, "step": step,
             "packets": results}
+
+
+def compute_qdisc(frm, to, step, classes, arrivals):
+    # Deficit round-robin shaper on a single directed link. Each class is
+    # a FIFO of waiting bytes capped at its capacity: an arrival that
+    # would exceed capacity is tail-dropped without touching the cursor
+    # or that class's deficit, and a packet leaves its class queue the
+    # moment it starts service, so capacity counts waiting bytes only.
+    # The explicit event clock handles at each tick, in order, the
+    # transmission completion, arrivals in DATA order, and then selection
+    # while the link is idle. A round walks at most C classes from the
+    # cursor: a non-empty class is credited its quantum once and sends its
+    # head packet while the deficit covers it (the transmission is
+    # non-preemptive and the cursor stays on the class, so a head exposed
+    # by the completion is retried with no second quantum), otherwise the
+    # cursor advances; an empty class has its deficit cleared. A full
+    # walk that sends nothing starts another round at once, while a truly
+    # empty ring jumps the clock to the next arrival. Every walk is O(C)
+    # and quantum credits over the run total O(P + B/Q), giving
+    # O(C(P + B/Q)) time on O(P + C) state.
+    names = [c[0] for c in classes]
+    quanta = [c[1] for c in classes]
+    capacities = [c[2] for c in classes]
+    class_count = len(classes)
+    queues = [deque() for _ in classes]
+    occupancy = [0] * class_count
+    deficit = [0] * class_count
+    packet_count = len(arrivals)
+    status = [None] * packet_count
+    starts = [0] * packet_count
+    departs = [0] * packet_count
+
+    cursor = 0
+    serving = -1
+    in_flight = None  # (depart, class index, data index, size)
+    next_arrival = 0
+    now = arrivals[0][1] if arrivals else 0
+    end_time = 0
+
+    def enqueue(entry_index):
+        _pid, time, size, ci = arrivals[entry_index]
+        if occupancy[ci] + size > capacities[ci]:
+            # Tail drop: cursor and deficits are untouched.
+            status[entry_index] = "drop"
+            return
+        occupancy[ci] += size
+        queues[ci].append((entry_index, size, time))
+
+    def select_packet():
+        # One ring walk from the cursor; None means no class could send
+        # this round. The class still in service after a completion is
+        # revisited with no fresh quantum credit.
+        nonlocal cursor, serving
+        steps = 0
+        while steps < class_count:
+            ci = cursor
+            queue = queues[ci]
+            if queue:
+                if serving != ci:
+                    deficit[ci] += quanta[ci]
+                head_index, head_size, _arrival = queue[0]
+                if deficit[ci] >= head_size:
+                    depart = now + head_size * step
+                    if depart > MAX_TIME:
+                        fail(5)
+                    deficit[ci] -= head_size
+                    occupancy[ci] -= head_size
+                    queue.popleft()
+                    serving = ci
+                    return depart, ci, head_index, head_size
+                serving = -1
+            else:
+                deficit[ci] = 0
+                if serving == ci:
+                    serving = -1
+            cursor = (cursor + 1) % class_count
+            steps += 1
+        return None
+
+    while True:
+        if in_flight is not None and in_flight[0] == now:
+            in_flight = None
+            end_time = now
+        while (next_arrival < packet_count
+               and arrivals[next_arrival][1] == now):
+            enqueue(next_arrival)
+            next_arrival += 1
+        if in_flight is None:
+            # Always take at least one walk when idle: a transmission
+            # that emptied the ring still leaves the cursor on its class,
+            # and visiting that now-empty class is what clears its
+            # residual deficit and drops the just-served marker before
+            # the clock jumps. Backlog that no deficit covers this round
+            # starts the next round at once; a walk over a truly empty
+            # ring sends nothing and then waits for arrivals.
+            while True:
+                pick = select_packet()
+                if pick is not None:
+                    depart, _ci, data_index, _size = pick
+                    in_flight = pick
+                    status[data_index] = "ok"
+                    starts[data_index] = now
+                    departs[data_index] = depart
+                    break
+                if not any(queues):
+                    break
+        if in_flight is None:
+            if next_arrival >= packet_count:
+                break
+            now = arrivals[next_arrival][1]
+        elif (next_arrival < packet_count
+                and arrivals[next_arrival][1] < in_flight[0]):
+            now = arrivals[next_arrival][1]
+        else:
+            now = in_flight[0]
+
+    rows = []
+    for index, (pid, time, size, ci) in enumerate(arrivals):
+        if status[index] == "drop":
+            rows.append([pid, names[ci], time, size, "drop",
+                         None, None, None])
+        else:
+            rows.append([pid, names[ci], time, size, "ok",
+                         starts[index], departs[index],
+                         starts[index] - time])
+    return {"from": frm, "to": to, "step": step,
+            "packets": rows, "endTime": end_time}
 
 
 def compute_fragment(ident, ttl, mtus, payload):
@@ -7309,6 +7437,88 @@ def main():
                 fail(5)
             packets.append((pid, time, size))
         result = compute_queue(frm, to, cap, step, packets)
+    elif argv[1] == "qdisc":
+        if len(argv) != 8:
+            fail(2)
+        file_path, frm, to = argv[2], argv[3], argv[4]
+        step_text, classes_text, data_text = argv[5], argv[6], argv[7]
+        nodes, links, node_set = load_network(file_path, strict=True)
+        if frm not in node_set or to not in node_set:
+            fail(5)
+        if not any(link["from"] == frm and link["to"] == to and link["up"]
+                   for link in links):
+            fail(5)
+        step = _bounded_int_arg(step_text)
+        if step < 1:
+            fail(5)
+        try:
+            classes = json.loads(classes_text,
+                                 parse_constant=_reject_constant,
+                                 parse_float=_finite_float,
+                                 object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(classes, list) or len(classes) == 0:
+            fail(5)
+        parsed_classes = []
+        seen_names = set()
+        for item in classes:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            name, quantum, capacity = item
+            if type(name) is not str or name == "" or name in seen_names:
+                fail(5)
+            try:
+                name.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_names.add(name)
+            if (type(quantum) is not int
+                    or not 1 <= quantum <= MAX_COST):
+                fail(5)
+            if (type(capacity) is not int
+                    or not 1 <= capacity <= MAX_COST):
+                fail(5)
+            parsed_classes.append((name, quantum, capacity))
+        class_index_of = {name: i
+                          for i, (name, _q, _c) in enumerate(parsed_classes)}
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if data is None:
+            data = []
+        if not isinstance(data, list):
+            fail(5)
+        packets = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 4:
+                fail(5)
+            pid, time, size, class_name = item
+            if type(pid) is not str or pid == "" or pid in seen_ids:
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_ids.add(pid)
+            if type(time) is not int or not 0 <= time <= MAX_COST:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if type(size) is not int or not 1 <= size <= MAX_COST:
+                fail(5)
+            if type(class_name) is not str \
+                    or class_name not in class_index_of:
+                fail(5)
+            packets.append((pid, time, size,
+                            class_index_of[class_name]))
+        result = compute_qdisc(frm, to, step, parsed_classes, packets)
     elif argv[1] == "fragment":
         if len(argv) != 3:
             fail(2)
