@@ -2,6 +2,7 @@
 
 Usage: python relay.py route FILE SOURCE
        python relay.py ecmp FILE SOURCE FLOW
+       python relay.py dispatch FILE SOURCE DESTINATION MODE DATA
        python relay.py metric FILE SOURCE ORDER
        python relay.py wm FILE S W
        python relay.py wmecmp FILE S FLOW W
@@ -57,7 +58,7 @@ policytx op 4 also OUT),
 for queue/qdisc/reorder/converge/policy/reserve/rebalance/retune also those in
 FILE/DATA/CLASSES/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
-those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
+those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for dispatch that in DATA, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
 compound/audit/failstat those in DATA, for failreport that in
 SCENARIOS, for failcmp that in OLD/NEW and SCENARIOS, for compoundcp
 those in STATE/DATA, for
@@ -394,6 +395,35 @@ key order s,f,w,r; r is sorted by destination and each item is
 h/x/y/z/path those of the selected first hop's representative path.
 The source item is [S,[S],S,0,0,0,null,0,[S]] and an unreachable
 destination's item is [destination,[],null,null,null,null,null,null,[]].
+dispatch takes FILE SOURCE DESTINATION MODE DATA using only the plain
+topology's cost and up, like route/ecmp (FILE parsed non-strictly).
+SOURCE and DESTINATION must name distinct FILE nodes or it is code 5.
+MODE must be exactly "flow" or "packet" (anything else code 5), and DATA
+is a non-empty JSON array, parsed strictly (invalid UTF-8/JSON syntax,
+duplicate keys, and non-finite numbers are code 4), whose items are
+exactly [id,flow] pairs of 1..256 code point UTF-8 strings; id must be
+unique within DATA and every other DATA shape is code 5. DATA is never
+reordered and duplicate flows are legal. The command first computes the
+lowest total cost from SOURCE to DESTINATION, then groups all equal
+lowest-cost paths by first hop without enumerating simple paths: it runs
+the O(V^2) lexicographic shortest_paths Dijkstra once from SOURCE and
+once per distinct up-link first-hop target, and a first hop is a
+candidate iff first_cost[h] + dist(h, D) == dist(S, D). Candidates are
+sorted by Unicode code point and each is represented by
+[SOURCE] + the node-sequence-smallest h->D shortest path (exactly the
+ecmp reconstruction). flow mode reuses the ecmp rule per packet: the
+SHA-256 of the compact non-ASCII-unescaped UTF-8 JSON [flow,SOURCE,
+DESTINATION], first 8 digest bytes as a big-endian integer modulo the
+candidate count, so equal flows always pick the same candidate. packet
+mode round-robins packets in DATA order starting at candidate 0 and
+wrapping after the last; the cursor advances only with packet position.
+When DESTINATION is unreachable nextHops is [], cost is null, and every
+packet is [id,flow,null,null,[]], still with exit code 0. The success
+object uses key order source,destination,mode,nextHops,cost,packets;
+each packet is [id,flow,index,nextHop,path] with index the candidate's
+zero-based index. Worst-case time is O(V^3+P) and extra space
+O(V^2+P), where P is the packet count; the same input always yields
+byte-identical output.
 lrepair takes FILE S D W DATA: FILE/S/D/W follow lfail, and DATA is a
 JSON array, possibly empty, of [t,u,v,up] link items only (t a
 non-boolean integer in 0..MAX_COST, non-decreasing with equal t kept in
@@ -982,6 +1012,55 @@ def compute_ecmp(nodes, links, source, flow):
                        "selectedNextHop": selected, "cost": total,
                        "path": [source] + hop_path[selected][n]})
     return {"source": source, "flow": flow, "routes": routes}
+
+
+def compute_dispatch(nodes, links, source, destination, mode, packets):
+    # Equal lowest-cost paths grouped by first hop without enumerating the
+    # potentially exponential set of simple paths: one Dijkstra from the
+    # source and one per distinct up-link first-hop target. A hop h is a
+    # candidate iff first_cost[h] + dist(h, destination) == total.
+    cost_of, _ = shortest_paths(nodes, links, source)
+
+    first_cost = {}
+    for link in links:
+        if link["up"] and link["from"] == source:
+            first_cost[link["to"]] = link["cost"]
+
+    hop_cost = {}
+    hop_path = {}
+    for h in first_cost:
+        hop_cost[h], hop_path[h] = shortest_paths(nodes, links, h)
+
+    total = cost_of[destination]
+    if total is None:
+        next_hops = []
+        paths = {}
+    else:
+        next_hops = sorted(
+            h for h, w in first_cost.items()
+            if hop_cost[h][destination] is not None
+            and w + hop_cost[h][destination] == total
+        )
+        paths = {h: [source] + hop_path[h][destination] for h in next_hops}
+
+    results = []
+    cursor = 0
+    for pid, flow in packets:
+        if not next_hops:
+            results.append([pid, flow, None, None, []])
+            continue
+        if mode == "flow":
+            key = json.dumps([flow, source, destination], ensure_ascii=False,
+                             separators=(",", ":")).encode("utf-8")
+            digest = hashlib.sha256(key).digest()
+            index = int.from_bytes(digest[:8], "big") % len(next_hops)
+        else:
+            index = cursor % len(next_hops)
+            cursor += 1
+        results.append([pid, flow, index, next_hops[index],
+                        paths[next_hops[index]]])
+    return {"source": source, "destination": destination, "mode": mode,
+            "nextHops": next_hops, "cost": total, "packets": results}
 
 
 def compute_protect(nodes, links, source, destination, delay, events):
@@ -7286,6 +7365,47 @@ def main():
         if source not in node_set:
             fail(5)
         result = compute_ecmp(nodes, links, source, flow)
+    elif argv[1] == "dispatch":
+        if len(argv) != 7:
+            fail(2)
+        file_path, source, destination, mode, data_text = (
+            argv[2], argv[3], argv[4], argv[5], argv[6])
+        nodes, links, node_set = load_network(file_path)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if mode not in ("flow", "packet"):
+            fail(5)
+        if (source not in node_set or destination not in node_set
+                or source == destination):
+            fail(5)
+        if not isinstance(data, list) or not data:
+            fail(5)
+        packets = []
+        seen_ids = set()
+        for item in data:
+            if not isinstance(item, list) or len(item) != 2:
+                fail(5)
+            pid, flow = item
+            if type(pid) is not str or type(flow) is not str:
+                fail(5)
+            if not (1 <= len(pid) <= MAX_FLOW_LEN
+                    and 1 <= len(flow) <= MAX_FLOW_LEN):
+                fail(5)
+            try:
+                pid.encode("utf-8")
+                flow.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if pid in seen_ids:
+                fail(5)
+            seen_ids.add(pid)
+            packets.append((pid, flow))
+        result = compute_dispatch(nodes, links, source, destination, mode,
+                                  packets)
     elif argv[1] == "metric":
         if len(argv) != 5:
             fail(2)
