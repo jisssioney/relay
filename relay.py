@@ -8,6 +8,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py protect FILE SOURCE DESTINATION DELAY EVENTS
        python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
        python relay.py queue FILE FROM TO CAP STEP DATA
+       python relay.py qdisc FILE FROM TO STEP CLASSES DATA
        python relay.py fragment DATA
        python relay.py reassemble DATA
        python relay.py rewrite R D
@@ -53,8 +54,8 @@ for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
 policytx op 4 also OUT),
 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/reorder/converge/policy/reserve/rebalance/retune also those in
-FILE/DATA/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
+for queue/qdisc/reorder/converge/policy/reserve/rebalance/retune also those in
+FILE/DATA/CLASSES/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
 compound/audit/failstat those in DATA, for failreport that in
@@ -66,7 +67,7 @@ those in OLD/NEW/EVENTS/DATA, for slogate those in
 CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA, for
 snapshot those in STATE/OP/IN, for config those in PACK/OP/IN, for
 policytx those in STATE/OP, for policyreplay those in PACK/STATE/DATA),
-5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/D/R/
+5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/CLASSES/D/R/
 P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
 unknown-node/overflow/re-failure error; for hotload code 5 also covers
 a STATE whose v/p/h structure, version continuity, or version conflict
@@ -1189,6 +1190,170 @@ def compute_queue(frm, to, cap, step, packets):
         results.append([pid, "ok", start, depart, start - time])
     return {"from": frm, "to": to, "cap": cap, "step": step,
             "packets": results}
+
+
+def compute_qdisc(frm, to, step, classes, packets):
+    # Deficit round-robin shaper over several service classes sharing
+    # one directed up link. Each class is a FIFO byte queue with its
+    # own capacity; an admitted packet occupies capacity only while it
+    # is pending, so a packet already in transmission no longer counts.
+    # A packet that would overflow its class capacity is tail-dropped
+    # at arrival and leaves the cursor and every deficit untouched.
+    #
+    # The clock is explicit: events are arrivals and completions. At
+    # the same instant the completion happens first, then arrivals are
+    # admitted in DATA order, then one packet is chosen on the idle
+    # link. A normal visit adds a non-empty class's quantum to its
+    # deficit and sends the FIFO head whenever the deficit covers it;
+    # an empty class has its deficit cleared. Right after a completion
+    # the just-served class gets one quantum-free retry with its
+    # residual deficit, and only when its head still does not fit (or
+    # it is empty) does the cursor move on and a normal scan start. A
+    # sweep that finds every class empty means the link is idle and
+    # the clock jumps to the next arrival; a sweep blocked solely by
+    # heads too expensive starts another round, since every visit adds
+    # positive quantum. Transmission is non-preemptible and a
+    # departure past MAX_TIME is code 5.
+    count = len(classes)
+    names = [c[0] for c in classes]
+    quanta = [c[1] for c in classes]
+    capacities = [c[2] for c in classes]
+    queues = [deque() for _ in range(count)]
+    occupancy = [0] * count
+    deficit = [0] * count
+
+    times = [p[1] for p in packets]
+    sizes = [p[2] for p in packets]
+    class_of = [p[3] for p in packets]
+    results = [[packets[i][0], names[class_of[i]], times[i],
+                sizes[i], "drop", None, None, None]
+               for i in range(len(packets))]
+
+    cursor = 0
+    now = 0
+    arrival_index = 0
+    busy_until = None
+    end_time = 0
+
+    def admit():
+        # Enqueue arrivals up to the current clock in DATA order; the
+        # times are non-decreasing so this is always a prefix.
+        nonlocal arrival_index
+        while (arrival_index < len(packets)
+               and times[arrival_index] <= now):
+            idx = arrival_index
+            cidx = class_of[idx]
+            size = sizes[idx]
+            if occupancy[cidx] + size <= capacities[cidx]:
+                occupancy[cidx] += size
+                queues[cidx].append(idx)
+            arrival_index += 1
+
+    def pick(start):
+        # DRR scan beginning at start: return (class, packet) of the
+        # first sendable head, or None once a full sweep finds every
+        # class empty. A sweep whose heads are all simply too
+        # expensive runs another round.
+        c = start
+        nonempty_seen = False
+        visited = 0
+        while True:
+            q = queues[c]
+            if q:
+                nonempty_seen = True
+                deficit[c] += quanta[c]
+                head = q[0]
+                if deficit[c] >= sizes[head]:
+                    return c, head
+            else:
+                deficit[c] = 0
+            c = (c + 1) % count
+            visited += 1
+            if visited == count:
+                if not nonempty_seen:
+                    return None
+                nonempty_seen = False
+                visited = 0
+
+    def send(cidx, idx):
+        nonlocal cursor, busy_until, end_time
+        size = sizes[idx]
+        queues[cidx].popleft()
+        occupancy[cidx] -= size
+        deficit[cidx] -= size
+        depart = now + size * step
+        if depart > MAX_TIME:
+            fail(5)
+        entry = results[idx]
+        entry[4] = "ok"
+        entry[5] = now
+        entry[6] = depart
+        entry[7] = now - times[idx]
+        cursor = cidx
+        busy_until = depart
+        end_time = depart
+
+    def schedule_fresh():
+        chosen = pick(cursor)
+        if chosen is None:
+            return False
+        cidx, idx = chosen
+        send(cidx, idx)
+        return True
+
+    def schedule_after_completion():
+        # Keep the cursor on the class that just finished: retry its
+        # head with the residual deficit and no new quantum; if it is
+        # empty the residual is cleared, and either way a miss moves
+        # the scan on to the following class.
+        cidx = cursor
+        q = queues[cidx]
+        if q and deficit[cidx] >= sizes[q[0]]:
+            send(cidx, q[0])
+            return True
+        if not q:
+            deficit[cidx] = 0
+        chosen = pick((cidx + 1) % count)
+        if chosen is None:
+            return False
+        nxt, idx = chosen
+        send(nxt, idx)
+        return True
+
+    def jump_to_next_arrival():
+        nonlocal now
+        if arrival_index >= len(packets):
+            return False
+        now = times[arrival_index]
+        admit()
+        return True
+
+    admit()
+    while True:
+        if busy_until is not None:
+            if (arrival_index < len(packets)
+                    and times[arrival_index] < busy_until):
+                # An arrival mid-transmission is admitted at its own
+                # instant (that is when capacity is tested) but the
+                # link stays busy, so no packet is chosen here.
+                now = times[arrival_index]
+                admit()
+                continue
+            now = busy_until
+            busy_until = None
+            admit()
+            if schedule_after_completion():
+                continue
+            if not jump_to_next_arrival():
+                break
+        else:
+            if schedule_fresh():
+                continue
+            if not jump_to_next_arrival():
+                break
+
+    return {"from": frm, "to": to, "step": step, "packets": results,
+            "endTime": end_time}
 
 
 def compute_fragment(ident, ttl, mtus, payload):
@@ -7309,6 +7474,81 @@ def main():
                 fail(5)
             packets.append((pid, time, size))
         result = compute_queue(frm, to, cap, step, packets)
+    elif argv[1] == "qdisc":
+        if len(argv) != 8:
+            fail(2)
+        file_path, frm, to = argv[2], argv[3], argv[4]
+        step_text, classes_text, data_text = argv[5], argv[6], argv[7]
+        nodes, links, node_set = load_network(file_path, strict=True)
+        if frm not in node_set or to not in node_set:
+            fail(5)
+        if not any(link["from"] == frm and link["to"] == to and link["up"]
+                   for link in links):
+            fail(5)
+        step = _bounded_int_arg(step_text)
+        if step < 1:
+            fail(5)
+        try:
+            raw_classes = json.loads(classes_text,
+                                     parse_constant=_reject_constant,
+                                     parse_float=_finite_float,
+                                     object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(raw_classes, list) or not raw_classes:
+            fail(5)
+        classes = []
+        seen_names = set()
+        for item in raw_classes:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            name, quantum, capacity = item
+            if type(name) is not str or name == "" or name in seen_names:
+                fail(5)
+            try:
+                name.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_names.add(name)
+            if type(quantum) is not int or not 1 <= quantum <= MAX_COST:
+                fail(5)
+            if type(capacity) is not int or not 1 <= capacity <= MAX_COST:
+                fail(5)
+            classes.append((name, quantum, capacity))
+        class_index = {name: i for i, (name, _, _) in enumerate(classes)}
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        packets = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 4:
+                fail(5)
+            pid, time, size, klass = item
+            if type(pid) is not str or pid == "" or pid in seen_ids:
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_ids.add(pid)
+            if type(time) is not int or not 0 <= time <= MAX_COST:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if type(size) is not int or not 1 <= size <= MAX_COST:
+                fail(5)
+            if type(klass) is not str or klass not in class_index:
+                fail(5)
+            packets.append((pid, time, size, class_index[klass]))
+        result = compute_qdisc(frm, to, step, classes, packets)
     elif argv[1] == "fragment":
         if len(argv) != 3:
             fail(2)
