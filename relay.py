@@ -18,6 +18,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py reorder FILE FROM TO BASE WINDOW DATA
        python relay.py tbucket FILE FROM TO BURST CAP DATA
        python relay.py netqueue FILE QUEUES DATA
+       python relay.py netfail FILE QUEUES EVENTS DATA
        python relay.py netqdisc FILE CONFIG DATA
        python relay.py converge FILE SRC DST D R EVENTS
        python relay.py policy FILE S D P C RULES
@@ -61,7 +62,7 @@ for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
 policytx op 4 also OUT),
 4 JSON syntax
 (for forward/loopsafe also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/qdisc/reorder/tbucket/netqueue/netqdisc/converge/policy/reserve/rebalance/retune also those in
+for queue/qdisc/reorder/tbucket/netqueue/netfail/netqdisc/converge/policy/reserve/rebalance/retune also those in
 FILE/DATA/CLASSES/CONFIG/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
@@ -663,6 +664,71 @@ admissions, overflow the failed ones, peak the highest simultaneous
 occupancy, and lastDepart the last send completion time (0 for a link
 that never sent). Worst case is O(S((V+E) log V) + H log(P+E)) for S
 distinct sources and H actual hops, with O(V+E+P+H) extra space.
+netfail takes FILE QUEUES EVENTS DATA and is read-only, combining
+netqueue's deterministic multi-hop store-and-forward with topology
+failure and repair events on one explicit event clock. FILE is parsed
+like netqueue's, QUEUES uses netqueue's exact complete 1:1 link
+coverage and capacity contract, and DATA uses netqueue's exact
+[id,time,source,destination,size] array contract. EVENTS is a non-empty
+JSON array of [t,0,node,up] node events and [t,1,from,to,up] link
+events: t is a non-boolean integer in 0..MAX_TIME non-decreasing in
+array order (same-instant events keep input order), up is a boolean,
+the node names a FILE node, and from,to names a directed FILE link; a
+malformed member is code 5. Routing is dynamic: at injection and again
+at every node arrival a packet selects the lowest-cost path available
+then, over links whose own up flag is set and whose both endpoints are
+up, with ties broken by the Unicode node sequence; source ==
+destination delivers immediately at the injection time, and a packet
+with no available path ends unreachable without occupying any queue,
+keeping the actual node prefix reached so far (an empty prefix for an
+unreachable injection). Link servers, byte capacities, FIFO
+admissions, ceil(size/bandwidth) sends, latency receptions, and
+overflow on a capacity-exceeding admission follow netqueue exactly.
+Setting an already-current node or link state is an idempotent event
+(changed false) and moves nothing. A real down event at its time
+faults, on each affected link (the link itself for a link event; every
+link incident to the node for a node event), every packet whose send
+is in progress: it ends as fault at the event time with the failing
+object recorded (the [from,to] link or the node), and every packet
+still waiting unsent on those links is removed at once, its bytes
+released, and reselects its route from the node it sits at and
+re-enqueues in DATA order, each removal counting one reroute; a
+re-admission that does not fit ends that packet as overflow and a
+missing route ends it as unreachable. A send already completed and
+only awaiting its reception is unaffected by a later link down, but a
+packet whose receiving node is down when the reception lands ends as
+fault at that reception time, with that node recorded. At each
+distinct time, repeatedly until stable: the due events apply in input
+order and trigger their removals and reroutes; then sends complete and
+release capacity; then receptions and fresh injections due at the
+time are handled in DATA order (merged by packet index); then every
+idle link with a queued head starts it once in FILE order; zero-delay
+work repeats until the instant is stable. Any newly computed time
+above MAX_TIME fails the whole run with code 5 and writes no partial
+output. Result top-level key order is packets,events,links. Each
+packet row is [id,status,path,finish,delay,drop,hops,reroutes] in DATA
+order: status is delivered, unreachable, overflow, or fault; path is
+the actual node prefix reached (empty for an unreachable injection,
+singleton for source == destination); finish is the ending time and
+delay finish-injection for every terminal status (0 for a packet that
+ends at its own injection time); drop is null, the overflow
+[from,to], the faulting [from,to] link, or the faulted node string;
+hops follows netqueue's exact
+per-link object key order and null conventions, with a faulted send
+carrying its arrive/start/wait and null depart/receive; reroutes is
+the number of down-event removals that re-enqueued the packet. events
+follows input order as [t,kind,target,up,changed,requeued,faulted]:
+target is the node string for kind 0 and the [from,to] pair for kind
+1, up the requested state, changed whether the state actually moved,
+requeued the number of waiting packets removed and re-enqueued, and
+faulted the number of in-progress packets ended as fault. links
+follows FILE order as
+[from,to,enqueued,overflow,peak,lastDepart,faultRemoved,up]: the first
+six fields follow netqueue's link counters, faultRemoved counts
+waiting packets removed from that link by down events, and up is the
+link's final state. Worst case is O((P+R)((V+E) log V) + H log(P+E))
+for P packets, R reselections, and H actual hops, with O(V+E+P+H)
+extra space.
 netqdisc takes FILE CONFIG DATA and combines netqueue's deterministic
 multi-hop store-and-forward with qdisc's deficit round-robin, one
 independent qdisc per directed FILE link with no scheduling state
@@ -2554,6 +2620,333 @@ def compute_netqueue(nodes, links, cap_of, packets):
     return {"packets": results,
             "links": [[links[i]["from"], links[i]["to"], admitted[i],
                        overflows[i], peak[i], last_depart[i]]
+                      for i in range(E)]}
+
+
+def compute_netfail(nodes, links, cap_of, events, packets):
+    # netqueue's deterministic multi-hop store-and-forward on a single
+    # explicit clock that also carries topology change events. Link
+    # servers, capacities, hop records, and the start/complete/receive
+    # mechanics follow compute_netqueue exactly; routing is dynamic.
+    #
+    # A route is selected at injection and again at every arrival over
+    # the topology available then: lowest cost over links whose up flag
+    # is set AND whose endpoints are up, ties broken by the full Unicode
+    # node sequence. No route ends the packet as unreachable, keeping the
+    # actual node prefix reached so far.
+    #
+    # Events are [t,0,node,up] and [t,1,from,to,up]. Setting the current
+    # state again is idempotent (changed false, nothing moves). A real
+    # down event faults every packet still SENDING on each affected link
+    # (the link itself for a link event; every link incident to the node
+    # for a node event) at the event time with status fault, and removes
+    # every packet still WAITING in those links' FIFO queues: the bytes
+    # are released, the tentative arrive-only hop record is dropped, and
+    # each packet reselects from its current node and re-enqueues in
+    # DATA order; a re-admission over capacity ends it as overflow and a
+    # missing route as unreachable. A send that has already completed is
+    # unaffected by later link downs, but a reception whose receiver node
+    # is down ends as fault at the reception time. Faulted sends leave
+    # stale completion heap entries that are discarded when they surface.
+    #
+    # At each distinct time, repeatedly until stable: due events apply in
+    # input order; then sends complete and release capacity; then
+    # receptions and fresh injections due at the time are handled in DATA
+    # order (the two streams merged by packet index); then every idle
+    # link with a queued head starts it once in FILE order. Any computed
+    # time above MAX_TIME fails with code 5 and no output is written.
+    E = len(links)
+    m = len(events)
+    n = len(packets)
+
+    link_index = {(l["from"], l["to"]): i for i, l in enumerate(links)}
+    incident = {u: [] for u in nodes}
+    for i, l in enumerate(links):
+        incident[l["from"]].append(i)
+        incident[l["to"]].append(i)
+
+    bw = [l["bandwidth"] for l in links]
+    lat = [l["latency"] for l in links]
+    cap = [cap_of[i] for i in range(E)]
+    node_up = {u: True for u in nodes}
+    link_up = [l["up"] for l in links]
+
+    occupancy = [0] * E
+    queues = [deque() for _ in range(E)]
+    busy = [False] * E
+    send_of = [-1] * E
+    admitted = [0] * E
+    overflows = [0] * E
+    peak = [0] * E
+    last_depart = [0] * E
+    fault_removed = [0] * E
+
+    def current_adj():
+        # Usable directed links: own up flag set and both endpoints up.
+        adj = {u: [] for u in nodes}
+        for i, l in enumerate(links):
+            if (link_up[i] and node_up[l["from"]]
+                    and node_up[l["to"]]):
+                adj[l["from"]].append((l["to"], l["cost"]))
+        return adj
+
+    # results[i] = [id, status, path, finish, delay, drop, hops, reroutes]
+    results = [[pid, None, [], None, None, None, [], 0]
+               for pid, _, _, _, _ in packets]
+    # Current planned suffix and the hop index about to be crossed; only
+    # meaningful while the packet is queued or sending.
+    path_cur = [None] * n
+    hop_k = [0] * n
+
+    def check_time(value):
+        if value > MAX_TIME:
+            fail(5)
+        return value
+
+    def finish_packet(i, now, status, drop):
+        results[i][1] = status
+        results[i][3] = now
+        results[i][4] = now - packets[i][1]
+        results[i][5] = drop
+
+    def select(i, now, src, flush_hop):
+        # (Re)select the lowest-cost path from src and admit onto its
+        # first hop. flush_hop marks a down-event requeue, which drops the
+        # tentative prior hop record and counts one reroute. src == dst
+        # delivers at once; no path ends unreachable with the prefix.
+        dst = packets[i][3]
+        prefix = results[i][2]
+        if flush_hop:
+            results[i][6].pop()
+            results[i][7] += 1
+        if src == dst:
+            # A fresh injection reports the singleton prefix; a mid-route
+            # requeue already carries the reached node.
+            if not prefix:
+                prefix.append(src)
+            finish_packet(i, now, "delivered", None)
+            return
+        dist = _netqueue_dijkstra(nodes, current_adj(), src)
+        entry = dist.get(dst)
+        if entry is None:
+            # An injection-time miss keeps the empty prefix, matching
+            # netqueue; a mid-route miss keeps the actual prefix.
+            finish_packet(i, now, "unreachable", None)
+            return
+        if not prefix:
+            prefix.append(src)
+        path_cur[i] = list(entry[1])
+        hop_k[i] = 0
+        admit(i, now)
+
+    def admit(i, now):
+        # Whole at its current hop's head node: test capacity once.
+        path = path_cur[i]
+        k = hop_k[i]
+        frm, to = path[k], path[k + 1]
+        li = link_index[(frm, to)]
+        hop = {"from": frm, "to": to, "arrive": now, "start": None,
+               "depart": None, "receive": None, "wait": None}
+        results[i][6].append(hop)
+        size = packets[i][4]
+        if occupancy[li] + size > cap[li]:
+            finish_packet(i, now, "overflow", [frm, to])
+            overflows[li] += 1
+            return
+        occupancy[li] += size
+        if occupancy[li] > peak[li]:
+            peak[li] = occupancy[li]
+        admitted[li] += 1
+        queues[li].append(i)
+        if not busy[li]:
+            heapq.heappush(idle_heap, li)
+
+    def fault_send(i, now, li, drop):
+        # A real down event catches this packet mid-transmission. The
+        # send never completes: depart/receive stay null, the bytes come
+        # back immediately, and its completion heap entry is left stale.
+        occupancy[li] -= packets[i][4]
+        busy[li] = False
+        send_of[li] = -1
+        hop = results[i][6][-1]
+        hop["depart"] = None
+        hop["receive"] = None
+        finish_packet(i, now, "fault", drop)
+
+    def fault_links(now, indices, drop):
+        count = 0
+        for li in indices:
+            if busy[li]:
+                fault_send(send_of[li], now, li, drop)
+                count += 1
+        return count
+
+    def flush_links(now, indices):
+        # Remove every waiting packet, release its bytes, then reselect
+        # and re-enqueue all of them in DATA order. Returns the number of
+        # packets removed (the event's requeued count).
+        collected = []
+        for li in indices:
+            q = queues[li]
+            while q:
+                i = q.popleft()
+                occupancy[li] -= packets[i][4]
+                fault_removed[li] += 1
+                collected.append(i)
+        for i in sorted(collected):
+            src = results[i][2][-1]
+            select(i, now, src, True)
+        return len(collected)
+
+    completion_heap = []   # (depart, fileIndex, packet)
+    reception_heap = []    # (receive, packet, receiver)
+    idle_heap = []
+
+    def release(now, i, li):
+        occupancy[li] -= packets[i][4]
+        busy[li] = False
+        send_of[li] = -1
+        last_depart[li] = now
+        if queues[li]:
+            heapq.heappush(idle_heap, li)
+        hop = results[i][6][-1]
+        receive = check_time(now + lat[li])
+        hop["receive"] = receive
+        heapq.heappush(reception_heap, (receive, i, hop["to"]))
+
+    def receive_packet(i, now, node):
+        results[i][2].append(node)
+        if not node_up[node]:
+            # The wire delivery survived the link's own down event, but
+            # the receiver is closed: fault at the arrival instant.
+            finish_packet(i, now, "fault", node)
+            return
+        select(i, now, node, False)
+
+    def start_heads(now):
+        while idle_heap:
+            li = heapq.heappop(idle_heap)
+            if busy[li] or not queues[li]:
+                continue
+            i = queues[li].popleft()
+            size = packets[i][4]
+            depart = check_time(now + (size + bw[li] - 1) // bw[li])
+            busy[li] = True
+            send_of[li] = i
+            hop = results[i][6][-1]
+            hop["start"] = now
+            hop["depart"] = depart
+            hop["wait"] = now - hop["arrive"]
+            heapq.heappush(completion_heap, (depart, li, i))
+
+    event_rows = []
+    event_at = 0
+    inject_at = 0
+
+    def apply_event(now):
+        nonlocal event_at
+        ev = events[event_at]
+        event_at += 1
+        kind = ev[1]
+        requeued = 0
+        faulted = 0
+        if kind == 0:
+            node = ev[2]
+            asked = ev[3]
+            target = node
+            changed = node_up[node] != asked
+            if changed:
+                node_up[node] = asked
+                if not asked:
+                    indices = incident[node]
+                    faulted = fault_links(now, indices, node)
+                    requeued = flush_links(now, indices)
+        else:
+            u, v, asked = ev[2], ev[3], ev[4]
+            li = link_index[(u, v)]
+            target = [u, v]
+            changed = link_up[li] != asked
+            if changed:
+                link_up[li] = asked
+                if not asked:
+                    faulted = fault_links(now, [li], [u, v])
+                    requeued = flush_links(now, [li])
+        event_rows.append([ev[0], kind, target, asked, changed,
+                           requeued, faulted])
+
+    def next_time():
+        t = events[event_at][0] if event_at < m else None
+        if inject_at < n:
+            cand = packets[inject_at][1]
+            if t is None or cand < t:
+                t = cand
+        if completion_heap:
+            cand = completion_heap[0][0]
+            if t is None or cand < t:
+                t = cand
+        if reception_heap:
+            cand = reception_heap[0][0]
+            if t is None or cand < t:
+                t = cand
+        return t
+
+    while True:
+        now = next_time()
+        if now is None:
+            break
+        check_time(now)
+        moved = True
+        while moved:
+            moved = False
+            # Phase 1: events and their reroutes, in input order.
+            while event_at < m and events[event_at][0] == now:
+                apply_event(now)
+                moved = True
+            # Phase 2: send completions release capacity. Entries whose
+            # packet a down event faulted first are stale.
+            while completion_heap and completion_heap[0][0] == now:
+                _, li, i = heapq.heappop(completion_heap)
+                if results[i][1] is not None:
+                    continue
+                release(now, i, li)
+                moved = True
+            # Phase 3: receptions merged with fresh injections by DATA
+            # index. Injection times are non-decreasing, so consuming the
+            # prefix yields the due entries in DATA order.
+            due = []
+            while reception_heap and reception_heap[0][0] == now:
+                _, i, node = heapq.heappop(reception_heap)
+                due.append((i, node))
+            injected = []
+            while inject_at < n and packets[inject_at][1] == now:
+                injected.append(inject_at)
+                inject_at += 1
+            a = b = 0
+            while a < len(due) or b < len(injected):
+                if b >= len(injected) or (a < len(due)
+                                          and due[a][0] < injected[b]):
+                    i, node = due[a]
+                    if results[i][1] is None:
+                        receive_packet(i, now, node)
+                    a += 1
+                else:
+                    i = injected[b]
+                    # select seeds the prefix: [src] when reachable,
+                    # singleton when src == dst, empty when unreachable.
+                    select(i, now, packets[i][2], False)
+                    b += 1
+            if due or injected:
+                moved = True
+            # Phase 4: one FILE-order start pass over idle links.
+            if idle_heap:
+                start_heads(now)
+                moved = True
+
+    return {"packets": results,
+            "events": event_rows,
+            "links": [[links[i]["from"], links[i]["to"], admitted[i],
+                       overflows[i], peak[i], last_depart[i],
+                       fault_removed[i], link_up[i]]
                       for i in range(E)]}
 
 
@@ -9548,6 +9941,123 @@ def main():
             packets.append((pid, time, source, destination, size,
                             class_index[klass]))
         result = compute_netqdisc(nodes, links, classes, cap_of, packets)
+    elif argv[1] == "netfail":
+        if len(argv) != 6:
+            fail(2)
+        file_path, queues_text, events_text, data_text = (argv[2],
+                                                          argv[3],
+                                                          argv[4],
+                                                          argv[5])
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        link_pairs_set = {(l["from"], l["to"]) for l in links}
+        # QUEUES keeps netqueue's exact complete 1:1 link coverage.
+        try:
+            raw_queues = json.loads(queues_text,
+                                    parse_constant=_reject_constant,
+                                    parse_float=_finite_float,
+                                    object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(raw_queues, list):
+            fail(5)
+        cap_of_pair = {}
+        for item in raw_queues:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            frm, to, capacity = item
+            if type(frm) is not str or type(to) is not str:
+                fail(5)
+            pair = (frm, to)
+            if pair not in link_pairs_set or pair in cap_of_pair:
+                fail(5)
+            if type(capacity) is not int or not 1 <= capacity <= MAX_COST:
+                fail(5)
+            cap_of_pair[pair] = capacity
+        if set(cap_of_pair) != link_pairs_set:
+            fail(5)
+        cap_of = [cap_of_pair[(l["from"], l["to"])] for l in links]
+        # EVENTS is a non-empty array of [t,0,node,up] or
+        # [t,1,from,to,up]; t is a non-boolean integer in 0..MAX_TIME,
+        # non-decreasing in input order; up is boolean; every referenced
+        # node and every referenced directed FILE link must exist.
+        try:
+            raw_events = json.loads(events_text,
+                                    parse_constant=_reject_constant,
+                                    parse_float=_finite_float,
+                                    object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(raw_events, list) or not raw_events:
+            fail(5)
+        events = []
+        previous_time = None
+        for item in raw_events:
+            if not isinstance(item, list) or len(item) not in (4, 5):
+                fail(5)
+            t, kind = item[0], item[1]
+            if type(t) is not int or not 0 <= t <= MAX_TIME:
+                fail(5)
+            if previous_time is not None and t < previous_time:
+                fail(5)
+            previous_time = t
+            if type(kind) is not int or kind not in (0, 1):
+                fail(5)
+            if kind == 0:
+                if len(item) != 4:
+                    fail(5)
+                _, _, node, up = item
+                if type(node) is not str or node not in node_set:
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                events.append((t, 0, node, up))
+            else:
+                if len(item) != 5:
+                    fail(5)
+                _, _, frm, to, up = item
+                if (type(frm) is not str or type(to) is not str
+                        or (frm, to) not in link_pairs_set):
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                events.append((t, 1, frm, to, up))
+        # DATA keeps netqueue's exact packet schema and ordering.
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        packets = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 5:
+                fail(5)
+            pid, time, source, destination, size = item
+            if (type(pid) is not str or pid == ""
+                    or not 1 <= len(pid) <= MAX_FLOW_LEN
+                    or pid in seen_ids):
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_ids.add(pid)
+            if type(time) is not int or not 0 <= time <= MAX_TIME:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if source not in node_set or destination not in node_set:
+                fail(5)
+            if type(size) is not int or not 1 <= size <= MAX_COST:
+                fail(5)
+            packets.append((pid, time, source, destination, size))
+        result = compute_netfail(nodes, links, cap_of, events, packets)
     elif argv[1] == "converge":
         if len(argv) != 8:
             fail(2)
