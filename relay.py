@@ -1,6 +1,7 @@
 """relay: single-source lowest-cost routing.
 
 Usage: python relay.py route FILE SOURCE
+       python relay.py rolepath FILE SOURCE DESTINATION LIMIT
        python relay.py ecmp FILE SOURCE FLOW
        python relay.py metric FILE SOURCE ORDER
        python relay.py wm FILE S W
@@ -526,6 +527,37 @@ difference basis pooled over that summary (its du over scenario count
 * D). The JSON byte and exit-code 2..5 contracts follow failreport; a
 FILE read error is code 3 and a cross-topology invalidity is code 5.
 The old entry points are unchanged and out of scope here.
+rolepath takes FILE SOURCE DESTINATION LIMIT and does not change the
+route topology format: the route entry points still accept only the
+old {nodes, links} form, and rolepath accepts only its role form, in
+which nodes is an array of {"name", "kind"} objects (exact key set,
+name a non-empty unique string, kind one of "relay", "terminal",
+"pseudo") while links keep route's directed {from, to, cost, up}
+semantics (cost a non-boolean integer in 1..MAX_COST, up a boolean,
+no duplicate or self pairs, both endpoints naming nodes). SOURCE and
+DESTINATION must name nodes and may not be pseudo; equal endpoints are
+a legal zero-hop query. LIMIT is a decimal integer in 0..MAX_COST.
+Only up links are used: relay nodes may be endpoints or intermediates,
+terminal nodes may appear only at the two ends, and pseudo nodes may
+appear only internally and are invisible to the hop clock. Among all
+legal role paths, the candidate is unique by ascending total cost,
+then ascending forwarding hop count with pseudo nodes removed, then
+the full node sequence in Unicode code point order. A selected total
+cost above MAX_TIME is code 5. Forwarding follows the selected path up
+to LIMIT: the clock starts at 0 and gains 1 per non-pseudo node
+entered; reaching LIMIT short of the destination is hop_limit. On
+success key order is source,destination,status,cost,topologyPath,
+forwardPath,hops,trace: delivered returns the full path in both path
+fields and the full trace; hop_limit keeps the selected path and its
+total cost but trace holds only the actual clocked prefix (no pseudo
+entries); unreachable returns null cost, two empty paths, 0 hops, and
+the start-only trace. trace starts at [0,SOURCE] and never lists a
+pseudo node; hops is the number of trace advances. FILE is parsed
+strictly like forward's (duplicate keys and non-finite numbers code
+4): a FILE read error is code 3, UTF-8/JSON syntax errors code 4, and
+every structure, role, reference, range, overflow, or query semantic
+error code 5; a wrong argument count is code 2. Worst case is
+O(V**2 + E) time and O(V + E) space.
 """
 
 import hashlib
@@ -644,6 +676,75 @@ def _validate_topology(data, metrics=False):
         seen_pairs.add(pair)
 
     return nodes, links, node_set
+
+
+def load_role_network(path):
+    # rolepath's FILE shares route's links but replaces the string
+    # nodes array with {"name", "kind"} objects. Parsed strictly, so
+    # duplicate keys and non-finite numbers are code 4 like forward.
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        fail(3)
+    except UnicodeDecodeError:
+        fail(4)
+
+    try:
+        data = json.loads(text, parse_constant=_reject_constant,
+                          parse_float=_finite_float,
+                          object_pairs_hook=_object_no_dup)
+    except (ValueError, RecursionError):
+        fail(4)
+
+    if not isinstance(data, dict) or set(data) != {"nodes", "links"}:
+        fail(5)
+    raw_nodes = data["nodes"]
+    links = data["links"]
+
+    if not isinstance(raw_nodes, list):
+        fail(5)
+    names = []
+    kind_of = {}
+    seen = set()
+    for node in raw_nodes:
+        if not isinstance(node, dict) or set(node) != {"name", "kind"}:
+            fail(5)
+        name = node["name"]
+        kind = node["kind"]
+        if type(name) is not str or name == "" or name in seen:
+            fail(5)
+        if kind not in ("relay", "terminal", "pseudo"):
+            fail(5)
+        seen.add(name)
+        names.append(name)
+        kind_of[name] = kind
+
+    if not isinstance(links, list):
+        fail(5)
+    seen_pairs = set()
+    for link in links:
+        if not isinstance(link, dict) \
+                or set(link) != {"from", "to", "cost", "up"}:
+            fail(5)
+        frm = link["from"]
+        to = link["to"]
+        cost = link["cost"]
+        up = link["up"]
+        if type(frm) is not str or type(to) is not str:
+            fail(5)
+        if frm not in seen or to not in seen or frm == to:
+            fail(5)
+        if type(cost) is not int or not 1 <= cost <= MAX_COST:
+            fail(5)
+        if type(up) is not bool:
+            fail(5)
+        pair = (frm, to)
+        if pair in seen_pairs:
+            fail(5)
+        seen_pairs.add(pair)
+
+    return names, links, kind_of
 
 
 def shortest_paths(nodes, links, source):
@@ -1205,6 +1306,105 @@ def compute_forward(links, source, destination, limit, table):
         trace.append([time, current])
     return {"source": source, "destination": destination, "limit": limit,
             "status": status, "time": time, "trace": trace}
+
+
+def role_shortest_path(names, links, kind_of, source, destination):
+    # Dijkstra over up links with the role rules: terminals may only be
+    # an endpoint, pseudo nodes may only be internal and cost no clock
+    # hops. Labels are (total cost, forwarding hops with pseudos removed,
+    # full node sequence); selection is O(V**2) like shortest_paths.
+    adj = {n: [] for n in names}
+    for link in links:
+        if link["up"]:
+            adj[link["from"]].append((link["to"], link["cost"]))
+
+    cost_of = {n: None for n in names}
+    fhops_of = {n: None for n in names}
+    path_of = {n: None for n in names}
+    cost_of[source] = 0
+    fhops_of[source] = 0
+    path_of[source] = [source]
+    settled = set()
+
+    while True:
+        u = None
+        ukey = None
+        for n in names:
+            if n in settled or cost_of[n] is None:
+                continue
+            key = (cost_of[n], fhops_of[n], path_of[n])
+            if ukey is None or key < ukey:
+                u = n
+                ukey = key
+        if u is None:
+            break
+        settled.add(u)
+        if u == destination:
+            break
+        ucost, ufhops, upath = ukey
+        for to, w in adj[u]:
+            # No path re-enters the source, and a terminal may only be
+            # the destination, never an intermediate.
+            if to in settled or to == source:
+                continue
+            if kind_of[to] == "terminal" and to != destination:
+                continue
+            nc = ucost + w
+            nf = ufhops + (0 if kind_of[to] == "pseudo" else 1)
+            npath = upath + [to]
+            nkey = (nc, nf, npath)
+            if cost_of[to] is None:
+                take = True
+            else:
+                take = nkey < (cost_of[to], fhops_of[to], path_of[to])
+            if take:
+                cost_of[to] = nc
+                fhops_of[to] = nf
+                path_of[to] = npath
+
+    return cost_of[destination], path_of[destination]
+
+
+def compute_rolepath(names, links, kind_of, source, destination, limit):
+    cost, topology_path = role_shortest_path(
+        names, links, kind_of, source, destination)
+
+    if topology_path is None:
+        return {"source": source, "destination": destination,
+                "status": "unreachable", "cost": None,
+                "topologyPath": [], "forwardPath": [], "hops": 0,
+                "trace": [[0, source]]}
+
+    if cost > MAX_TIME:
+        fail(5)
+
+    # Follow the selected path. The clock advances only on entering a
+    # non-pseudo node; once LIMIT clock hops are spent short of the
+    # destination, no further node (pseudo included) is entered.
+    trace = [[0, source]]
+    forward_path = [source]
+    clock = 0
+    hops = 0
+    status = "delivered" if source == destination else None
+    for node in topology_path[1:]:
+        if hops == limit:
+            status = "hop_limit"
+            break
+        if kind_of[node] == "pseudo":
+            continue
+        clock += 1
+        hops += 1
+        trace.append([clock, node])
+        forward_path.append(node)
+        if node == destination:
+            status = "delivered"
+            break
+    if status is None:
+        status = "hop_limit"
+
+    return {"source": source, "destination": destination, "status": status,
+            "cost": cost, "topologyPath": topology_path,
+            "forwardPath": forward_path, "hops": hops, "trace": trace}
 
 
 def _bounded_int_arg(text):
@@ -7390,6 +7590,27 @@ def main():
         if source not in node_set:
             fail(5)
         result = compute_routes(nodes, links, source)
+    elif argv[1] == "rolepath":
+        if len(argv) != 6:
+            fail(2)
+        file_path, source, destination, limit_text = (
+            argv[2], argv[3], argv[4], argv[5])
+        names, links, kind_of = load_role_network(file_path)
+        if source not in kind_of or destination not in kind_of:
+            fail(5)
+        if kind_of[source] == "pseudo" or kind_of[destination] == "pseudo":
+            fail(5)
+        if (not limit_text
+                or any(c not in "0123456789" for c in limit_text)):
+            fail(5)
+        limit_digits = limit_text.lstrip("0") or "0"
+        if len(limit_digits) > 10:
+            fail(5)
+        limit = int(limit_digits)
+        if limit > MAX_COST:
+            fail(5)
+        result = compute_rolepath(names, links, kind_of, source,
+                                  destination, limit)
     elif argv[1] == "ecmp":
         if len(argv) != 5:
             fail(2)
