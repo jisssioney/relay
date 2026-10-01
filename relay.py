@@ -18,6 +18,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py reorder FILE FROM TO BASE WINDOW DATA
        python relay.py tbucket FILE FROM TO BURST CAP DATA
        python relay.py netqueue FILE QUEUES DATA
+       python relay.py netqdisc FILE CONFIG DATA
        python relay.py converge FILE SRC DST D R EVENTS
        python relay.py policy FILE S D P C RULES
        python relay.py policytx FILE STATE OP
@@ -60,8 +61,8 @@ for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
 policytx op 4 also OUT),
 4 JSON syntax
 (for forward/loopsafe also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/qdisc/reorder/tbucket/netqueue/converge/policy/reserve/rebalance/retune also those in
-FILE/DATA/CLASSES/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
+for queue/qdisc/reorder/tbucket/netqueue/netqdisc/converge/policy/reserve/rebalance/retune also those in
+FILE/DATA/CLASSES/CONFIG/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
 compound/audit/failstat those in DATA, for failreport that in
@@ -662,6 +663,52 @@ admissions, overflow the failed ones, peak the highest simultaneous
 occupancy, and lastDepart the last send completion time (0 for a link
 that never sent). Worst case is O(S((V+E) log V) + H log(P+E)) for S
 distinct sources and H actual hops, with O(V+E+P+H) extra space.
+netqdisc takes FILE CONFIG DATA and combines netqueue's deterministic
+multi-hop store-and-forward with qdisc's deficit round-robin, one
+independent qdisc per directed FILE link with no scheduling state
+shared across links. FILE is the metric topology parsed exactly like
+netqueue's. CONFIG is a JSON object with exactly the keys classes and links:
+classes is a non-empty array of [name,quantum,classCapacity] triples
+with distinct non-empty UTF-8 names whose array order defines the DRR
+class order; links is an array of [from,to,totalCapacity] triples
+covering every directed FILE link exactly once (an unknown/self pair,
+a duplicate, or a missing/extra pair is code 5); quantum and both
+capacities are non-boolean integers in 1..MAX_COST. DATA is a JSON
+array, possibly empty, of [id,time,source,destination,size,class] with
+netqueue's exact id/time/source/destination/size contract plus a class
+name that must occur in CONFIG.classes, and times non-decreasing in
+array order. Static path selection, one Dijkstra per distinct source,
+source == destination delivery, and unreachable handling reuse
+netqueue verbatim. On each link the DRR mechanics are qdisc's: C FIFO
+class queues, per-class deficits and cursor, a fresh scan after idle
+admissions and the residual-quantum retry after a completion; a packet
+is admitted on whole arrival only if BOTH the link total waiting bytes
+plus size fit totalCapacity AND that class's waiting bytes plus size
+fit classCapacity, and otherwise that hop overflows, occupies and
+enqueues nothing, and leaves every deficit and the cursor untouched;
+starting the send releases the waiting bytes for the link total and
+the class at once, the non-preemptible send takes
+ceil(size/bandwidth), and reception adds latency. The event phases and
+same-instant ordering follow netqueue: at each distinct time,
+repeatedly until stable, completions free their links, then
+receptions and fresh injections due at the time are admitted in DATA
+order (merged by packet index), then each idle marked link makes one
+DRR decision in FILE order with the completion links' residual retry
+landing after same-instant arrivals; zero-latency receptions repeat
+the instant until stable. A computed time above MAX_TIME is code 5
+with no partial output. Result top-level key order is packets,links.
+Each packet row is [id,class,status,path,finish,delay,dropLink,hops]
+in DATA order: class is the CONFIG name, status delivered,
+unreachable, or overflow; path/finish/delay/dropLink/hops follow
+netqueue's exact fields and null conventions, and an overflow hop
+carries only its arrive. links follows FILE order as
+[from,to,enqueued,overflow,peak,lastDepart,classes]: the first six
+fields follow netqueue's link counters, and classes follows CONFIG
+order as [name,enqueued,overflow,peak,sent] (peak the highest
+simultaneous waiting bytes in that class, sent the started sends).
+Worst case is O(S((V+E) log V) + H(C + log(P+E)) + Q) for S distinct
+sources, C classes, H actual hops, and Q total DRR class visits, with
+O(V+E+P+H+EC) extra space.
 loopsafe takes FILE DESTINATION TABLE and is read-only: FILE uses
 forward's strict topology (duplicate keys and non-finite numbers code
 4), DESTINATION must name a node, and TABLE is a JSON object whose key
@@ -2508,6 +2555,315 @@ def compute_netqueue(nodes, links, cap_of, packets):
             "links": [[links[i]["from"], links[i]["to"], admitted[i],
                        overflows[i], peak[i], last_depart[i]]
                       for i in range(E)]}
+
+
+def compute_netqdisc(nodes, links, class_specs, cap_of, packets):
+    # Deterministic multi-hop store-and-forward with an independent
+    # deficit round-robin qdisc on every directed link. Routing, the
+    # global clock, and the per-time phase order follow compute_netqueue
+    # exactly; only the per-link server differs.
+    #
+    # Each link keeps the DRR state of compute_qdisc verbatim: C FIFO
+    # class queues, per-class waiting-byte occupancy and deficit, and a
+    # cursor. A whole-arriving packet tests BOTH the link capacity and
+    # that class's waiting bytes against the link/class capacities; an
+    # overflow on either test ends the packet on that hop, occupies
+    # nothing, enqueues nothing, and leaves every DRR counter untouched.
+    # Starting a send frees the packet's waiting bytes (for both the
+    # link total and its class), so packets in transmission no longer
+    # wait; the send itself holds no bytes. Sending is non-preemptible
+    # and takes ceil(size/bandwidth); reception follows latency units
+    # later. DRR state is never shared across links.
+    #
+    # Within one instant completions (at most one per busy link) free
+    # the link first in FILE order and mark its qdisc for a decision;
+    # then receptions and fresh injections due at the time are admitted
+    # in DATA order (the two streams merged by DATA index), every
+    # admitted packet reaching the tail of one class queue; then every
+    # still-idle link marked runnable makes one DRR decision in FILE
+    # order, the completed links applying their residual-deficit retry
+    # only after same-instant arrivals have joined the queues, and a
+    # scan blocked solely by expensive heads simply sends nothing.
+    # The fixed phase order repeats at the same instant until nothing
+    # can move, which zero-latency receptions require. Any computed time
+    # above MAX_TIME fails with code 5 and no output is written.
+    adj_of = {u: [] for u in nodes}
+    link_index = {}
+    for i, link in enumerate(links):
+        link_index[(link["from"], link["to"])] = i
+        if link["up"]:
+            adj_of[link["from"]].append((link["to"], link["cost"]))
+
+    C = len(class_specs)
+    names = [c[0] for c in class_specs]
+    quanta = [c[1] for c in class_specs]
+    class_caps = [c[2] for c in class_specs]
+
+    n = len(packets)
+    paths = [None] * n
+    # One Dijkstra per distinct source, as in compute_netqueue.
+    by_source = {}
+    for i, (_, _, source, _, _, _) in enumerate(packets):
+        by_source.setdefault(source, []).append(i)
+    for source, indices in by_source.items():
+        dist = _netqueue_dijkstra(nodes, adj_of, source)
+        for i in indices:
+            entry = dist.get(packets[i][3])
+            if entry is not None and len(entry[1]) >= 2:
+                paths[i] = list(entry[1])
+        del dist
+
+    E = len(links)
+    bw = [l["bandwidth"] for l in links]
+    lat = [l["latency"] for l in links]
+    link_cap = [cap_of[i] for i in range(E)]
+    # Per-link DRR state, fully independent between links.
+    queues = [[deque() for _ in range(C)] for _ in range(E)]
+    link_used = [0] * E                  # waiting bytes, all classes
+    class_used = [[0] * C for _ in range(E)]
+    deficit = [[0] * C for _ in range(E)]
+    cursor = [0] * E
+    busy = [False] * E
+    admitted = [0] * E
+    overflows = [0] * E
+    peak = [0] * E
+    last_depart = [0] * E
+    cls_enq = [[0] * C for _ in range(E)]
+    cls_ovf = [[0] * C for _ in range(E)]
+    cls_peak = [[0] * C for _ in range(E)]
+    cls_sent = [[0] * C for _ in range(E)]
+
+    # results[i] = [id, class, status, path, finish, delay, dropLink, hops]
+    results = [[pid, names[klass], None, None, None, None, None, []]
+               for pid, _, _, _, _, klass in packets]
+    hop_at = [0] * n
+
+    for i, (_, ptime, source, destination, _, _) in enumerate(packets):
+        path = paths[i]
+        if path is not None:
+            results[i][3] = path
+            continue
+        if source == destination:
+            results[i][2] = "delivered"
+            results[i][3] = [source]
+            results[i][4] = ptime
+            results[i][5] = 0
+        else:
+            results[i][2] = "unreachable"
+            results[i][3] = []
+
+    def check_time(value):
+        if value > MAX_TIME:
+            fail(5)
+        return value
+
+    completion_heap = []   # (depart, fileIndex, packet)
+    reception_heap = []    # (time, packet)
+    # FILE indices of idle links due one DRR decision in the schedule
+    # phase; stale duplicates are discarded on pop. after_completion[li]
+    # marks that the decision must use compute_qdisc's post-completion
+    # rule (residual retry of the served class first, then scan from the
+    # following class); admits on an already-idle link use a fresh scan.
+    runnable_heap = []
+    after_completion = [False] * E
+
+    def admit(i, now):
+        # Packet i is whole at its hop_at[i] link: test the link total
+        # and its own class capacity together, before anything changes.
+        path = paths[i]
+        k = hop_at[i]
+        frm, to = path[k], path[k + 1]
+        li = link_index[(frm, to)]
+        cidx = packets[i][5]
+        hop = {"from": frm, "to": to, "arrive": now, "start": None,
+               "depart": None, "receive": None, "wait": None}
+        results[i][7].append(hop)
+        size = packets[i][4]
+        if (link_used[li] + size > link_cap[li]
+                or class_used[li][cidx] + size > class_caps[cidx]):
+            # Overflow occupies nothing, enqueues nothing, and leaves
+            # the cursor and every deficit untouched.
+            results[i][2] = "overflow"
+            results[i][6] = [frm, to]
+            overflows[li] += 1
+            cls_ovf[li][cidx] += 1
+            return
+        link_used[li] += size
+        if link_used[li] > peak[li]:
+            peak[li] = link_used[li]
+        class_used[li][cidx] += size
+        if class_used[li][cidx] > cls_peak[li][cidx]:
+            cls_peak[li][cidx] = class_used[li][cidx]
+        admitted[li] += 1
+        cls_enq[li][cidx] += 1
+        queues[li][cidx].append(i)
+        if not busy[li]:
+            heapq.heappush(runnable_heap, li)
+
+    def drr_pick(li, start):
+        # DRR scan beginning at start, mirroring compute_qdisc.pick: a
+        # full sweep of empty queues returns None; heads merely too
+        # expensive run another round, so a nonempty schedule always
+        # returns a head after finitely many positive quanta.
+        c = start
+        nonempty_seen = False
+        visited = 0
+        while True:
+            q = queues[li][c]
+            if q:
+                nonempty_seen = True
+                deficit[li][c] += quanta[c]
+                head = q[0]
+                if deficit[li][c] >= packets[head][4]:
+                    return c, head
+            else:
+                deficit[li][c] = 0
+            c = (c + 1) % C
+            visited += 1
+            if visited == C:
+                if not nonempty_seen:
+                    return None
+                nonempty_seen = False
+                visited = 0
+
+    def send_head(li, cidx, i, now):
+        size = packets[i][4]
+        queues[li][cidx].popleft()
+        # Starting the send releases every waiting byte at once: the
+        # packet's own class share and the link total.
+        link_used[li] -= size
+        class_used[li][cidx] -= size
+        deficit[li][cidx] -= size
+        cursor[li] = cidx
+        busy[li] = True
+        depart = check_time(now + (size + bw[li] - 1) // bw[li])
+        hop = results[i][7][-1]
+        hop["start"] = now
+        hop["depart"] = depart
+        hop["wait"] = now - hop["arrive"]
+        cls_sent[li][cidx] += 1
+        heapq.heappush(completion_heap, (depart, li, i))
+
+    def schedule_link(li, now):
+        # One DRR decision on idle link li, applying exactly
+        # compute_qdisc's fresh vs. post-completion distinction.
+        if after_completion[li]:
+            after_completion[li] = False
+            cidx = cursor[li]
+            q = queues[li][cidx]
+            # Residual-deficit retry with no new quantum first.
+            if q and deficit[li][cidx] >= packets[q[0]][4]:
+                send_head(li, cidx, q[0], now)
+                return
+            if not q:
+                deficit[li][cidx] = 0
+            chosen = drr_pick(li, (cidx + 1) % C)
+        else:
+            chosen = drr_pick(li, cursor[li])
+        if chosen is not None:
+            send_head(li, chosen[0], chosen[1], now)
+
+    def release(now, li, i):
+        # Completion frees the link before anything else at this time;
+        # the actual DRR decision waits for the schedule phase, which is
+        # when same-instant arrivals have already been admitted.
+        busy[li] = False
+        last_depart[li] = now
+        receive = check_time(now + lat[li])
+        results[i][7][-1]["receive"] = receive
+        path = paths[i]
+        if hop_at[i] + 1 == len(path) - 1:
+            results[i][2] = "delivered"
+            results[i][4] = receive
+            results[i][5] = receive - packets[i][1]
+        else:
+            hop_at[i] += 1
+            heapq.heappush(reception_heap, (receive, i))
+        after_completion[li] = True
+        heapq.heappush(runnable_heap, li)
+
+    def run_due_links(now):
+        # One FILE-order pass; each idle link makes at most one decision,
+        # and a scan that finds every queue empty simply sends nothing.
+        while runnable_heap:
+            li = heapq.heappop(runnable_heap)
+            if busy[li]:
+                continue
+            schedule_link(li, now)
+
+    inject_at = 0
+
+    def prime_inject():
+        j = inject_at
+        while j < n and paths[j] is None:
+            j += 1
+        return packets[j][1] if j < n else None
+
+    def advance_inject(now):
+        nonlocal inject_at
+        due_list = []
+        while inject_at < n and packets[inject_at][1] <= now:
+            if paths[inject_at] is not None:
+                due_list.append(inject_at)
+            inject_at += 1
+        return due_list
+
+    next_inject = prime_inject()
+
+    def next_time():
+        t = next_inject
+        if completion_heap:
+            ct = completion_heap[0][0]
+            if t is None or ct < t:
+                t = ct
+        if reception_heap:
+            rt = reception_heap[0][0]
+            if t is None or rt < t:
+                t = rt
+        return t
+
+    while True:
+        now = next_time()
+        if now is None:
+            break
+        check_time(now)
+        moved = True
+        while moved:
+            moved = False
+            while completion_heap and completion_heap[0][0] == now:
+                _, li, i = heapq.heappop(completion_heap)
+                release(now, li, i)
+                moved = True
+            due = []
+            while reception_heap and reception_heap[0][0] == now:
+                _, i = heapq.heappop(reception_heap)
+                due.append(i)
+            injected = advance_inject(now)
+            next_inject = prime_inject()
+            a = b = 0
+            while a < len(due) or b < len(injected):
+                if b >= len(injected) or (a < len(due)
+                                          and due[a] < injected[b]):
+                    admit(due[a], now)
+                    a += 1
+                else:
+                    admit(injected[b], now)
+                    b += 1
+            if due or injected:
+                moved = True
+            if runnable_heap:
+                run_due_links(now)
+                moved = True
+
+    link_rows = []
+    for li in range(E):
+        class_rows = [[names[c], cls_enq[li][c], cls_ovf[li][c],
+                       cls_peak[li][c], cls_sent[li][c]]
+                      for c in range(C)]
+        link_rows.append([links[li]["from"], links[li]["to"],
+                          admitted[li], overflows[li], peak[li],
+                          last_depart[li], class_rows])
+    return {"packets": results, "links": link_rows}
 
 
 def compute_converge(nodes, links, source, destination, delay, run, events):
@@ -9094,6 +9450,104 @@ def main():
                 fail(5)
             packets.append((pid, time, source, destination, size))
         result = compute_netqueue(nodes, links, cap_of, packets)
+    elif argv[1] == "netqdisc":
+        if len(argv) != 5:
+            fail(2)
+        file_path, config_text, data_text = argv[2], argv[3], argv[4]
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        link_pairs_set = {(l["from"], l["to"]) for l in links}
+        try:
+            config = json.loads(config_text,
+                                parse_constant=_reject_constant,
+                                parse_float=_finite_float,
+                                object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(config, dict) or set(config) != {"classes",
+                                                           "links"}:
+            fail(5)
+        raw_classes = config["classes"]
+        if not isinstance(raw_classes, list) or not raw_classes:
+            fail(5)
+        classes = []
+        seen_names = set()
+        for item in raw_classes:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            name, quantum, capacity = item
+            if type(name) is not str or name == "" or name in seen_names:
+                fail(5)
+            try:
+                name.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_names.add(name)
+            if type(quantum) is not int or not 1 <= quantum <= MAX_COST:
+                fail(5)
+            if type(capacity) is not int or not 1 <= capacity <= MAX_COST:
+                fail(5)
+            classes.append((name, quantum, capacity))
+        class_index = {name: i for i, (name, _, _) in enumerate(classes)}
+        # links overrides every FILE link capacity exactly once, the
+        # same complete 1:1 coverage netqueue's QUEUES enforces.
+        raw_link_caps = config["links"]
+        if not isinstance(raw_link_caps, list):
+            fail(5)
+        cap_of_pair = {}
+        for item in raw_link_caps:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            frm, to, capacity = item
+            if type(frm) is not str or type(to) is not str:
+                fail(5)
+            pair = (frm, to)
+            if pair not in link_pairs_set or pair in cap_of_pair:
+                fail(5)
+            if type(capacity) is not int or not 1 <= capacity <= MAX_COST:
+                fail(5)
+            cap_of_pair[pair] = capacity
+        if set(cap_of_pair) != link_pairs_set:
+            fail(5)
+        cap_of = [cap_of_pair[(l["from"], l["to"])] for l in links]
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        packets = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 6:
+                fail(5)
+            pid, time, source, destination, size, klass = item
+            if (type(pid) is not str or pid == ""
+                    or not 1 <= len(pid) <= MAX_FLOW_LEN
+                    or pid in seen_ids):
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_ids.add(pid)
+            if type(time) is not int or not 0 <= time <= MAX_TIME:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if source not in node_set or destination not in node_set:
+                fail(5)
+            if type(size) is not int or not 1 <= size <= MAX_COST:
+                fail(5)
+            if type(klass) is not str or klass not in class_index:
+                fail(5)
+            packets.append((pid, time, source, destination, size,
+                            class_index[klass]))
+        result = compute_netqdisc(nodes, links, classes, cap_of, packets)
     elif argv[1] == "converge":
         if len(argv) != 8:
             fail(2)
