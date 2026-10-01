@@ -10,6 +10,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
        python relay.py queue FILE FROM TO CAP STEP DATA
        python relay.py qdisc FILE FROM TO STEP CLASSES DATA
+       python relay.py tbucket FILE FROM TO BURST CAP DATA
        python relay.py fragment DATA
        python relay.py reassemble DATA
        python relay.py rewrite R D
@@ -55,7 +56,7 @@ for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
 policytx op 4 also OUT),
 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/qdisc/reorder/converge/policy/reserve/rebalance/retune also those in
+for queue/qdisc/tbucket/reorder/converge/policy/reserve/rebalance/retune also those in
 FILE/DATA/CLASSES/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
@@ -68,7 +69,7 @@ those in OLD/NEW/EVENTS/DATA, for slogate those in
 CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA, for
 snapshot those in STATE/OP/IN, for config those in PACK/OP/IN, for
 policytx those in STATE/OP, for policyreplay those in PACK/STATE/DATA),
-5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/CLASSES/D/R/
+5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/BURST/DATA/CLASSES/D/R/
 P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
 unknown-node/overflow/re-failure error; for hotload code 5 also covers
 a STATE whose v/p/h structure, version continuity, or version conflict
@@ -1672,6 +1673,95 @@ def compute_qdisc(frm, to, step, classes, packets):
 
     return {"from": frm, "to": to, "step": step, "packets": results,
             "endTime": end_time}
+
+
+def compute_tbucket(frm, to, rate, burst, capacity, latency, packets):
+    # Token-bucket shaper on a single directed up link. The bucket is
+    # full (burst tokens) at time 0 and refills at `rate` tokens per
+    # elapsed clock unit, capped at burst; every event happens at an
+    # integer time, so the token count stays integral. The wait queue
+    # preserves DATA FIFO order and its byte occupancy is the sum of
+    # the sizes of packets not yet sent. A packet larger than burst is
+    # rejected "oversize" at arrival (it could never be sent), and any
+    # other packet whose admission would push occupancy past capacity
+    # is rejected "overflow"; neither kind consumes a token.
+    #
+    # At each event instant the queued head is sent as far as the
+    # current tokens allow (sending releases its capacity), then all of
+    # the instant's arrivals are admitted in DATA order, then sending
+    # resumes. Same-instant sends precede arrivals. With the queue
+    # still non-empty the clock jumps to the earlier of the next
+    # arrival and the first instant the head becomes affordable,
+    # ceil((head_size - tokens) / rate) away; an empty queue jumps
+    # straight to the next arrival. Sends are instantaneous, reception
+    # is latency later, and a send or receive past MAX_TIME is code 5.
+    times = [p[1] for p in packets]
+    sizes = [p[2] for p in packets]
+    results = [[packets[i][0], None, times[i], None, None, None]
+               for i in range(len(packets))]
+
+    queue = deque()
+    occupancy = 0
+    tokens = burst
+    now = 0
+    index = 0
+    count = len(packets)
+    end_time = 0
+
+    def send_ready():
+        # Pop the FIFO head while the current tokens cover it.
+        nonlocal tokens, occupancy, end_time
+        while queue and tokens >= sizes[queue[0]]:
+            idx = queue.popleft()
+            size = sizes[idx]
+            tokens -= size
+            occupancy -= size
+            receive = now + latency
+            if now > MAX_TIME or receive > MAX_TIME:
+                fail(5)
+            entry = results[idx]
+            entry[1] = "ok"
+            entry[3] = now
+            entry[4] = receive
+            entry[5] = now - times[idx]
+            end_time = receive
+
+    while index < count or queue:
+        send_ready()
+        # Admit every arrival at this instant in DATA order.
+        while index < count and times[index] <= now:
+            idx = index
+            size = sizes[idx]
+            if size > burst:
+                results[idx][1] = "oversize"
+            elif occupancy + size > capacity:
+                results[idx][1] = "overflow"
+            else:
+                occupancy += size
+                queue.append(idx)
+            index += 1
+        # Newly admitted packets can leave immediately at this instant.
+        send_ready()
+        if not queue:
+            if index >= count:
+                break
+            # Idle link: refill until the next arrival (still capped).
+            elapsed = times[index] - now
+            tokens = min(burst, tokens + rate * elapsed)
+            now = times[index]
+            continue
+        need = sizes[queue[0]] - tokens  # the head blocks all behind it
+        fill_wait = (need + rate - 1) // rate
+        if index < count and times[index] - now <= fill_wait:
+            elapsed = times[index] - now
+            now = times[index]
+        else:
+            elapsed = fill_wait
+            now += fill_wait
+        tokens = min(burst, tokens + rate * elapsed)
+
+    return {"from": frm, "to": to, "rate": rate, "burst": burst,
+            "capacity": capacity, "packets": results, "endTime": end_time}
 
 
 def compute_fragment(ident, ttl, mtus, payload):
@@ -7927,6 +8017,59 @@ def main():
                 fail(5)
             packets.append((pid, time, size, class_index[klass]))
         result = compute_qdisc(frm, to, step, classes, packets)
+    elif argv[1] == "tbucket":
+        if len(argv) != 8:
+            fail(2)
+        file_path, frm, to = argv[2], argv[3], argv[4]
+        burst_text, cap_text, data_text = argv[5], argv[6], argv[7]
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        if frm not in node_set or to not in node_set:
+            fail(5)
+        chosen = [link for link in links
+                  if link["from"] == frm and link["to"] == to and link["up"]]
+        if not chosen:
+            fail(5)
+        rate = chosen[0]["bandwidth"]
+        latency = chosen[0]["latency"]
+        burst = _bounded_int_arg(burst_text)
+        if burst < 1:
+            fail(5)
+        cap = _bounded_int_arg(cap_text)
+        if cap < 1:
+            fail(5)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        packets = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            pid, time, size = item
+            if type(pid) is not str or pid == "" or pid in seen_ids:
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_ids.add(pid)
+            if type(time) is not int or not 0 <= time <= MAX_COST:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if type(size) is not int or not 1 <= size <= MAX_COST:
+                fail(5)
+            packets.append((pid, time, size))
+        result = compute_tbucket(frm, to, rate, burst, cap, latency,
+                                 packets)
     elif argv[1] == "fragment":
         if len(argv) != 3:
             fail(2)
