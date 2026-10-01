@@ -2,6 +2,7 @@
 
 Usage: python relay.py route FILE SOURCE
        python relay.py rolepath FILE SOURCE DESTINATION LIMIT
+       python relay.py roletable FILE SOURCE
        python relay.py ecmp FILE SOURCE FLOW
        python relay.py metric FILE SOURCE ORDER
        python relay.py wm FILE S W
@@ -559,6 +560,30 @@ strictly like forward's (duplicate keys and non-finite numbers code
 every structure, role, reference, range, overflow, or query semantic
 error code 5; a wrong argument count is code 2. Worst case is
 O(V**2 + E) time and O(V + E) space.
+roletable takes FILE SOURCE, reads rolepath's role topology only, and
+writes nothing else. SOURCE must name a relay or terminal node. One
+rolepath-labelled search produces a RIB and FIB for the source and
+every non-pseudo node; terminals may end a path but never carry one,
+pseudos stay internal and cost no forwarding hop, and only up links are
+used. Per destination the path is unique by ascending total cost, then
+forwarding hops with pseudos removed, then the full node sequence in
+Unicode code point order; the source itself is a cost-0 reachable
+entry. On success key order is source,rib,fib and entries are ordered
+by destination in Unicode code point order. Each rib entry has key
+order destination,status,cost,topologyPath,forwardPath with status
+reachable or unreachable; topologyPath is the full selected sequence
+and forwardPath removes the pseudo nodes. Each fib entry has key order
+destination,nextHop,cost; nextHop is the first node after SOURCE in
+forwardPath, the source's own nextHop is the source, and a pseudo is
+never a next hop. Unreachable destinations keep entries with null cost
+and nextHop and two empty paths. Any selected path whose accumulated
+cost exceeds MAX_TIME is code 5 with no partial output. FILE is parsed
+strictly like rolepath's: a wrong argument count is code 2, a FILE
+read error code 3, UTF-8/JSON syntax, duplicate key, or non-finite
+number errors code 4, and every structure, role, reference, range,
+SOURCE, or accumulated-overflow error code 5; on failure stdout is
+empty. The same input is byte-for-byte deterministic; worst case is
+O(V**3 + V*E) time, O(V**2 + E) space apart from the O(V**2) output.
 """
 
 import hashlib
@@ -1406,6 +1431,92 @@ def compute_rolepath(names, links, kind_of, source, destination, limit):
     return {"source": source, "destination": destination, "status": status,
             "cost": cost, "topologyPath": topology_path,
             "forwardPath": forward_path, "hops": hops, "trace": trace}
+
+
+def compute_roletable(names, links, kind_of, source):
+    # Role-aware RIB/FIB from one run of rolepath's labelled Dijkstra.
+    # Labels are (total cost, forwarding hops with pseudos removed, full
+    # node sequence); a terminal may be the source or a destination but
+    # never an intermediate, so only the source terminal is expanded and
+    # every other terminal is a dead end. This is equivalent to running
+    # rolepath's per-destination search for every non-pseudo node: a path
+    # to a non-terminal can never pass through a terminal either way, and
+    # a terminal's own label only depends on non-terminal predecessors.
+    adj = {n: [] for n in names}
+    for link in links:
+        if link["up"]:
+            adj[link["from"]].append((link["to"], link["cost"]))
+
+    cost_of = {n: None for n in names}
+    fhops_of = {n: None for n in names}
+    path_of = {n: None for n in names}
+    cost_of[source] = 0
+    fhops_of[source] = 0
+    path_of[source] = [source]
+    settled = set()
+
+    while True:
+        u = None
+        ukey = None
+        for n in names:
+            if n in settled or cost_of[n] is None:
+                continue
+            key = (cost_of[n], fhops_of[n], path_of[n])
+            if ukey is None or key < ukey:
+                u = n
+                ukey = key
+        if u is None:
+            break
+        settled.add(u)
+        ucost, ufhops, upath = ukey
+        if u != source and kind_of[u] == "terminal":
+            # A terminal may end a path but never carry one through.
+            continue
+        for to, w in adj[u]:
+            # No path re-enters the source.
+            if to in settled or to == source:
+                continue
+            nc = ucost + w
+            nf = ufhops + (0 if kind_of[to] == "pseudo" else 1)
+            npath = upath + [to]
+            nkey = (nc, nf, npath)
+            cur = cost_of[to]
+            if cur is None or nkey < (cur, fhops_of[to], path_of[to]):
+                cost_of[to] = nc
+                fhops_of[to] = nf
+                path_of[to] = npath
+
+    # Entries exist for the source and every relay/terminal; pseudos are
+    # internal only and never table destinations. Sorted by Unicode code
+    # point; fail before any output is written on a MAX_TIME overflow.
+    destinations = sorted(n for n in names if kind_of[n] != "pseudo")
+    rib = []
+    fib = []
+    for dest in destinations:
+        if dest == source:
+            rib.append({"destination": dest, "status": "reachable",
+                        "cost": 0, "topologyPath": [source],
+                        "forwardPath": [source]})
+            fib.append({"destination": dest, "nextHop": source, "cost": 0})
+            continue
+        cost = cost_of[dest]
+        if cost is None:
+            rib.append({"destination": dest, "status": "unreachable",
+                        "cost": None, "topologyPath": [],
+                        "forwardPath": []})
+            fib.append({"destination": dest, "nextHop": None, "cost": None})
+            continue
+        if cost > MAX_TIME:
+            fail(5)
+        topology_path = path_of[dest]
+        forward_path = [n for n in topology_path
+                        if kind_of[n] != "pseudo"]
+        rib.append({"destination": dest, "status": "reachable",
+                    "cost": cost, "topologyPath": topology_path,
+                    "forwardPath": forward_path})
+        fib.append({"destination": dest, "nextHop": forward_path[1],
+                    "cost": cost})
+    return {"source": source, "rib": rib, "fib": fib}
 
 
 def _bounded_int_arg(text):
@@ -7707,6 +7818,14 @@ def main():
             fail(5)
         result = compute_rolepath(names, links, kind_of, source,
                                   destination, limit)
+    elif argv[1] == "roletable":
+        if len(argv) != 4:
+            fail(2)
+        file_path, source = argv[2], argv[3]
+        names, links, kind_of = load_role_network(file_path)
+        if source not in kind_of or kind_of[source] == "pseudo":
+            fail(5)
+        result = compute_roletable(names, links, kind_of, source)
     elif argv[1] == "ecmp":
         if len(argv) != 5:
             fail(2)
