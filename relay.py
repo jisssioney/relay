@@ -9,6 +9,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py wmecmp FILE S FLOW W
        python relay.py protect FILE SOURCE DESTINATION DELAY EVENTS
        python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
+       python relay.py loopsafe FILE DESTINATION TABLE
        python relay.py queue FILE FROM TO CAP STEP DATA
        python relay.py qdisc FILE FROM TO STEP CLASSES DATA
        python relay.py fragment DATA
@@ -58,7 +59,7 @@ Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE,
 for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
 policytx op 4 also OUT),
 4 JSON syntax
-(for forward also duplicate keys or non-finite numbers in FILE/TABLE,
+(for forward and loopsafe also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/qdisc/reorder/tbucket/netqueue/converge/policy/reserve/rebalance/retune also those in
 FILE/DATA/CLASSES/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
@@ -661,6 +662,36 @@ admissions, overflow the failed ones, peak the highest simultaneous
 occupancy, and lastDepart the last send completion time (0 for a link
 that never sent). Worst case is O(S((V+E) log V) + H log(P+E)) for S
 distinct sources and H actual hops, with O(V+E+P+H) extra space.
+loopsafe takes FILE DESTINATION TABLE and is read-only: it audits the
+table and emits a fixed one but never writes FILE or any other file.
+FILE uses forward's strict topology, parsed exactly like forward's
+(duplicate keys and non-finite numbers code 4), and DESTINATION must
+name a node. TABLE is a JSON object whose key set equals the node set,
+each value null or an existing node name. The destination is a terminal
+whose own entry is never read. From every non-destination node the audit
+follows TABLE over up directed links only: null, a down link, or a
+missing directed pair ends the trace as unreachable, and re-entering a
+non-destination node before reaching the destination is a cycle. Each
+directed cycle is reported once: its member sequence is rotated to start
+at the smallest node in Unicode code point order and the distinct cycles
+are sorted by their full sequences. A cycle is broken by setting that
+smallest node's next hop to null, suppressed following cycle order as
+[node,oldNextHop]; every other entry is copied verbatim. Every source is
+then re-traced over the fixed table in code point order: every trace is
+delivered or unreachable and visits at most V nodes, the
+source==destination path holds only that node, and an unreachable path
+keeps the actual prefix through the node that could not continue. Result
+key order is destination,cycles,suppressed,table,results: cycles holds
+the canonical arrays, table is keyed in code point order, and results is
+source-sorted as [source,status,path]. Reusing the emitted table yields
+empty cycles and suppressed with table and results unchanged. Exit
+codes: 2 a wrong argument count, 3 a FILE read error, 4 a FILE
+UTF-8/JSON or TABLE JSON syntax error (duplicate keys or non-finite
+numbers included), and 5 a topology, destination, TABLE key set, or
+next-hop reference error; on failure stdout is empty and stderr is
+{"error":N} plus LF. Worst case is O(V**2 + E) time and O(V**2 + E)
+space including every result path; identical input bytes produce
+byte-identical output.
 """
 
 import hashlib
@@ -1410,6 +1441,92 @@ def compute_forward(links, source, destination, limit, table):
         trace.append([time, current])
     return {"source": source, "destination": destination, "limit": limit,
             "status": status, "time": time, "trace": trace}
+
+
+def compute_loopsafe(nodes, links, destination, table):
+    # Audit an explicit next-hop table against the destination and emit a
+    # table with every forwarding cycle broken. Traces use up directed
+    # links only; null, a down link, or a missing directed pair stops a
+    # trace as unreachable. The destination is a terminal: its entry is
+    # never read and a cycle requires re-entering a non-destination node
+    # before reaching it.
+    up_pairs = {(link["from"], link["to"]) for link in links if link["up"]}
+    ordered = sorted(nodes)
+
+    def _hop(tbl, node):
+        # One validated table step, or None when the entry is null or the
+        # pair is not an up directed link.
+        nxt = tbl[node]
+        if nxt is None or (node, nxt) not in up_pairs:
+            return None
+        return nxt
+
+    # Phase 1: trace every non-destination source until the destination,
+    # a stop, or a repeated non-destination node. Each directed cycle is
+    # met once per member but reported once; canonicalize each cycle as
+    # the rotation starting at its smallest node, then sort the distinct
+    # cycles by their full sequence in Unicode code point order.
+    found = {}
+    for source in ordered:
+        if source == destination:
+            continue
+        positions = {}
+        seq = []
+        current = source
+        while True:
+            if current == destination:
+                break
+            if current in positions:
+                cyc = tuple(seq[positions[current]:])
+                k = min(range(len(cyc)), key=cyc.__getitem__)
+                canon = cyc[k:] + cyc[:k]
+                found.setdefault(canon, None)
+                break
+            positions[current] = len(seq)
+            seq.append(current)
+            nxt = _hop(table, current)
+            if nxt is None:
+                break
+            current = nxt
+    cycles = sorted(found)
+
+    # Break each cycle at its smallest node; that node's old entry is
+    # exactly the next rotation member, an existing node name. Every
+    # other entry is copied verbatim.
+    new_table = dict(table)
+    suppressed = []
+    for cyc in cycles:
+        node = cyc[0]
+        suppressed.append([node, table[node]])
+        new_table[node] = None
+
+    # Phase 2: re-trace every source over the fixed table. No cycle can
+    # remain, so each trace ends delivered or unreachable within V node
+    # visits; the source==destination trace holds only that node, and an
+    # unreachable path keeps the actual prefix through the node that
+    # could not continue.
+    results = []
+    for source in ordered:
+        path = [source]
+        status = "delivered" if source == destination else None
+        current = source
+        while status is None:
+            if current == destination:
+                status = "delivered"
+                break
+            nxt = _hop(new_table, current)
+            if nxt is None:
+                status = "unreachable"
+                break
+            current = nxt
+            path.append(current)
+        results.append([source, status, path])
+
+    return {"destination": destination,
+            "cycles": [list(cyc) for cyc in cycles],
+            "suppressed": suppressed,
+            "table": {node: new_table[node] for node in ordered},
+            "results": results}
 
 
 def role_shortest_path(names, links, kind_of, source, destination):
@@ -8472,6 +8589,26 @@ def main():
                     and (type(value) is not str or value not in node_set)):
                 fail(5)
         result = compute_forward(links, source, destination, limit, table)
+    elif argv[1] == "loopsafe":
+        if len(argv) != 5:
+            fail(2)
+        file_path, destination, table_text = argv[2], argv[3], argv[4]
+        nodes, links, node_set = load_network(file_path, strict=True)
+        if destination not in node_set:
+            fail(5)
+        try:
+            table = json.loads(table_text, parse_constant=_reject_constant,
+                               parse_float=_finite_float,
+                               object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(table, dict) or set(table) != node_set:
+            fail(5)
+        for value in table.values():
+            if (value is not None
+                    and (type(value) is not str or value not in node_set)):
+                fail(5)
+        result = compute_loopsafe(nodes, links, destination, table)
     elif argv[1] == "queue":
         if len(argv) != 8:
             fail(2)
