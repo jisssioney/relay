@@ -14,6 +14,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py reassemble DATA
        python relay.py rewrite R D
        python relay.py reorder FILE FROM TO BASE WINDOW DATA
+       python relay.py tbucket FILE FROM TO BURST CAP DATA
        python relay.py converge FILE SRC DST D R EVENTS
        python relay.py policy FILE S D P C RULES
        python relay.py policytx FILE STATE OP
@@ -55,7 +56,7 @@ for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
 policytx op 4 also OUT),
 4 JSON syntax
 (for forward also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/qdisc/reorder/converge/policy/reserve/rebalance/retune also those in
+for queue/qdisc/reorder/tbucket/converge/policy/reserve/rebalance/retune also those in
 FILE/DATA/CLASSES/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
@@ -68,7 +69,7 @@ those in OLD/NEW/EVENTS/DATA, for slogate those in
 CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA, for
 snapshot those in STATE/OP/IN, for config those in PACK/OP/IN, for
 policytx those in STATE/OP, for policyreplay those in PACK/STATE/DATA),
-5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/CLASSES/D/R/
+5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/BURST/DATA/CLASSES/D/R/
 P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
 unknown-node/overflow/re-failure error; for hotload code 5 also covers
 a STATE whose v/p/h structure, version continuity, or version conflict
@@ -1804,6 +1805,101 @@ def compute_reorder(frm, to, base, window, packets):
             next_seq += 1
     return {"from": frm, "to": to, "base": base, "window": window,
             "packets": results}
+
+
+def compute_tbucket(frm, to, rate, burst, capacity, latency, packets):
+    # Token-bucket shaper on a single directed up link. The bucket fills
+    # at BURST at time 0 and thereafter gains rate tokens per elapsed
+    # clock unit, capped at BURST. Pending packets keep DATA FIFO order
+    # in one deque; occupancy is the size sum of packets not yet sent,
+    # so a deque plus a running total gives O(1) per admit/release.
+    #
+    # The clock is explicit: at every event instant the current tokens
+    # first send as much of the queued head as possible (sends at the
+    # same instant are consecutive and free capacity for the head
+    # behind), then every arrival with that time is admitted in DATA
+    # order, after which sending resumes. A size above BURST can never
+    # be sent and is dropped oversize at arrival; any other admission
+    # that would take occupancy past CAP is dropped overflow. Neither
+    # drop consumes tokens. When the queue stays nonempty the clock
+    # jumps to the earlier of the next input time and the instant the
+    # head first has enough tokens; sends precede arrivals at equal
+    # times. A send deducts its size, receive is send+latency and wait
+    # is send-time; receive past MAX_TIME is code 5.
+    times = [p[1] for p in packets]
+    sizes = [p[2] for p in packets]
+    results = [[packets[i][0], None, times[i], None, None, None]
+               for i in range(len(packets))]
+
+    queue = deque()
+    occupancy = 0
+    tokens = burst
+    now = 0
+    arrival_index = 0
+    n = len(packets)
+    end_time = 0
+
+    def advance(target):
+        nonlocal tokens, now
+        tokens = min(burst, tokens + (target - now) * rate)
+        now = target
+
+    def send_loop():
+        # Send the FIFO head whenever the current tokens cover it; a
+        # send frees capacity but admits nothing.
+        nonlocal tokens, occupancy, end_time
+        while queue and tokens >= sizes[queue[0]]:
+            idx = queue.popleft()
+            size = sizes[idx]
+            tokens -= size
+            occupancy -= size
+            receive = now + latency
+            if receive > MAX_TIME:
+                fail(5)
+            entry = results[idx]
+            entry[1] = "ok"
+            entry[3] = now
+            entry[4] = receive
+            entry[5] = now - times[idx]
+            end_time = receive
+
+    def admit_group():
+        # Admit every arrival with the current time in DATA order.
+        nonlocal arrival_index, occupancy
+        while arrival_index < n and times[arrival_index] == now:
+            idx = arrival_index
+            arrival_index += 1
+            size = sizes[idx]
+            if size > burst:
+                results[idx][1] = "oversize"
+            elif occupancy + size > capacity:
+                results[idx][1] = "overflow"
+            else:
+                occupancy += size
+                queue.append(idx)
+
+    # Time-0 arrivals are admitted after the time-0 send pass.
+    send_loop()
+    admit_group()
+    send_loop()
+    while queue or arrival_index < n:
+        candidates = []
+        if queue:
+            candidates.append(now + ((sizes[queue[0]] - tokens + rate - 1)
+                                     // rate))
+        if arrival_index < n:
+            candidates.append(times[arrival_index])
+        target = min(candidates)
+        if target > MAX_TIME:
+            fail(5)
+        advance(target)
+        # Sends at the new instant run before that instant's arrivals.
+        send_loop()
+        admit_group()
+        send_loop()
+
+    return {"from": frm, "to": to, "rate": rate, "burst": burst,
+            "capacity": capacity, "packets": results, "endTime": end_time}
 
 
 def compute_converge(nodes, links, source, destination, delay, run, events):
@@ -8132,6 +8228,62 @@ def main():
                 fail(5)
             packets.append((pid, seq, arrival))
         result = compute_reorder(frm, to, base, window, packets)
+    elif argv[1] == "tbucket":
+        if len(argv) != 8:
+            fail(2)
+        file_path, frm, to = argv[2], argv[3], argv[4]
+        burst_text, cap_text, data_text = argv[5], argv[6], argv[7]
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        if frm not in node_set or to not in node_set:
+            fail(5)
+        selected = None
+        for link in links:
+            if link["from"] == frm and link["to"] == to and link["up"]:
+                selected = link
+                break
+        if selected is None:
+            fail(5)
+        rate = selected["bandwidth"]
+        latency = selected["latency"]
+        burst = _bounded_int_arg(burst_text)
+        if burst < 1:
+            fail(5)
+        cap = _bounded_int_arg(cap_text)
+        if cap < 1:
+            fail(5)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        packets = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            pid, time, size = item
+            if type(pid) is not str or pid == "" or pid in seen_ids:
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_ids.add(pid)
+            if type(time) is not int or not 0 <= time <= MAX_COST:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if type(size) is not int or not 1 <= size <= MAX_COST:
+                fail(5)
+            packets.append((pid, time, size))
+        result = compute_tbucket(frm, to, rate, burst, cap, latency,
+                                 packets)
     elif argv[1] == "converge":
         if len(argv) != 8:
             fail(2)
