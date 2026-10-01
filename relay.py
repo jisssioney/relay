@@ -7,6 +7,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py wmecmp FILE S FLOW W
        python relay.py protect FILE SOURCE DESTINATION DELAY EVENTS
        python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
+       python relay.py rolepath FILE SOURCE DESTINATION LIMIT
        python relay.py queue FILE FROM TO CAP STEP DATA
        python relay.py qdisc FILE FROM TO STEP CLASSES DATA
        python relay.py fragment DATA
@@ -66,10 +67,16 @@ EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
 those in OLD/NEW/EVENTS/DATA, for slogate those in
 CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA, for
 snapshot those in STATE/OP/IN, for config those in PACK/OP/IN, for
-policytx those in STATE/OP, for policyreplay those in PACK/STATE/DATA),
+policytx those in STATE/OP, for policyreplay those in PACK/STATE/DATA,
+and for rolepath those in FILE),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/DATA/CLASSES/D/R/
 P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
-unknown-node/overflow/re-failure error; for hotload code 5 also covers
+unknown-node/overflow/re-failure error; for rolepath code 5 also covers
+a FILE whose nodes are not unique non-empty {name,kind} objects with
+kind in relay/terminal/pseudo, a link referencing a node, a SOURCE or
+DESTINATION absent from the nodes or carrying kind pseudo, a LIMIT
+outside 0..2147483647, and a selected path cost or forwarding clock
+past 9223372036854775807; for hotload code 5 also covers
 a STATE whose v/p/h structure, version continuity, or version conflict
 is invalid; for snapshot code 5 also covers an invalid OP shape, path,
 or BASE, a STATE/IN whose v/p/h structure, key order, or version
@@ -646,6 +653,72 @@ def _validate_topology(data, metrics=False):
     return nodes, links, node_set
 
 
+def load_role_network(path):
+    # rolepath's topology: the same directed links with cost/up semantics,
+    # but nodes are unique non-empty {name, kind} objects whose kind is
+    # relay, terminal, or pseudo. Strict JSON like forward's FILE.
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        fail(3)
+    except UnicodeDecodeError:
+        fail(4)
+
+    try:
+        data = json.loads(text, parse_constant=_reject_constant,
+                          parse_float=_finite_float,
+                          object_pairs_hook=_object_no_dup)
+    except (ValueError, RecursionError):
+        fail(4)
+
+    if not isinstance(data, dict) or set(data) != {"nodes", "links"}:
+        fail(5)
+    nodes = data["nodes"]
+    links = data["links"]
+
+    if not isinstance(nodes, list):
+        fail(5)
+    kinds = {}
+    node_list = []
+    for node in nodes:
+        if not isinstance(node, dict) or set(node) != {"name", "kind"}:
+            fail(5)
+        name = node["name"]
+        kind = node["kind"]
+        if type(name) is not str or name == "" or name in kinds:
+            fail(5)
+        if kind not in ("relay", "terminal", "pseudo"):
+            fail(5)
+        kinds[name] = kind
+        node_list.append(name)
+
+    if not isinstance(links, list):
+        fail(5)
+    seen_pairs = set()
+    for link in links:
+        if not isinstance(link, dict) \
+                or set(link) != {"from", "to", "cost", "up"}:
+            fail(5)
+        frm = link["from"]
+        to = link["to"]
+        cost = link["cost"]
+        if type(frm) is not str or type(to) is not str:
+            fail(5)
+        if frm not in kinds or to not in kinds or frm == to:
+            fail(5)
+        if type(cost) is not int or not 1 <= cost <= MAX_COST:
+            fail(5)
+        if type(link["up"]) is not bool:
+            fail(5)
+        pair = (frm, to)
+        if pair in seen_pairs:
+            fail(5)
+        seen_pairs.add(pair)
+
+    return node_list, links, kinds
+
+
 def shortest_paths(nodes, links, source):
     # Directed adjacency over up links only.
     adj = {n: [] for n in nodes}
@@ -1205,6 +1278,125 @@ def compute_forward(links, source, destination, limit, table):
         trace.append([time, current])
     return {"source": source, "destination": destination, "limit": limit,
             "status": status, "time": time, "trace": trace}
+
+
+def compute_rolepath(nodes, links, kinds, source, destination, limit):
+    # Role-aware single query: pick the unique best path over up links,
+    # then forward along it under LIMIT with a clock that advances only
+    # on non-pseudo nodes. relay may be an endpoint or transit node, a
+    # terminal may only be an endpoint, and a pseudo may only be internal
+    # and never appears in the trace.
+    if source == destination:
+        # Same endpoints are a legal zero-hop query at clock 0.
+        return {"source": source, "destination": destination,
+                "status": "delivered", "cost": 0,
+                "topologyPath": [source], "forwardPath": [source],
+                "hops": 0, "trace": [[0, source]]}
+
+    # Directed adjacency over up links only.
+    adj = {n: [] for n in nodes}
+    for link in links:
+        if link["up"]:
+            adj[link["from"]].append((link["to"], link["cost"]))
+
+    # Dijkstra with O(V^2) selection. Labels compare total cost first,
+    # then the hop count with pseudo nodes removed, then the full node
+    # sequence in Unicode code point order. All link costs are >= 1, so a
+    # predecessor of a best path settles at strictly smaller cost first
+    # and full sequences are compared only on equal-cost relaxations.
+    # A terminal other than the source can never be internal, so no edge
+    # leaves it; a non-destination terminal is thus always a dead end.
+    cost_of = {n: None for n in nodes}
+    hops_of = {n: None for n in nodes}
+    path_of = {n: None for n in nodes}
+    cost_of[source] = 0
+    hops_of[source] = 0
+    path_of[source] = [source]
+    settled = set()
+
+    while True:
+        u = None
+        ukey = None
+        for n in nodes:
+            if n in settled or cost_of[n] is None:
+                continue
+            key = (cost_of[n], hops_of[n], path_of[n])
+            if ukey is None or key < ukey:
+                u = n
+                ukey = key
+        if u is None:
+            break
+        settled.add(u)
+        if u == destination:
+            break
+        if kinds[u] == "terminal" and u != source:
+            continue
+        ucost, uhops, upath = ukey
+        for to, w in adj[u]:
+            if to in settled:
+                continue
+            nc = ucost + w
+            nh = uhops + (0 if kinds[to] == "pseudo" else 1)
+            cc = cost_of[to]
+            if cc is None or nc < cc:
+                better = True
+            elif nc == cc and (nh < hops_of[to]
+                               or (nh == hops_of[to]
+                                   and upath + [to] < path_of[to])):
+                better = True
+            else:
+                better = False
+            if better:
+                cost_of[to] = nc
+                hops_of[to] = nh
+                path_of[to] = upath + [to]
+
+    path = path_of[destination]
+    if path is None:
+        return {"source": source, "destination": destination,
+                "status": "unreachable", "cost": None,
+                "topologyPath": [], "forwardPath": [], "hops": 0,
+                "trace": [[0, source]]}
+
+    # Costs stay unbounded while routing; only the selected path is
+    # range-checked against MAX_TIME.
+    total_cost = cost_of[destination]
+    if total_cost > MAX_TIME:
+        fail(5)
+
+    # Forward along the selected path. The clock and trace advance only
+    # when entering a non-pseudo node; reaching LIMIT short of the
+    # destination is hop_limit, with topologyPath/cost retained and the
+    # trace limited to the prefix actually traversed.
+    trace = [[0, source]]
+    time = 0
+    hops = 0
+    index = 1
+    current = source
+    while True:
+        if current == destination:
+            status = "delivered"
+            break
+        if hops == limit:
+            status = "hop_limit"
+            break
+        current = path[index]
+        index += 1
+        if kinds[current] != "pseudo":
+            time += 1
+            if time > MAX_TIME:
+                fail(5)
+            hops += 1
+            trace.append([time, current])
+
+    if status == "delivered":
+        forward_path = path
+    else:
+        forward_path = path[:index]
+    return {"source": source, "destination": destination,
+            "status": status, "cost": total_cost,
+            "topologyPath": path, "forwardPath": forward_path,
+            "hops": hops, "trace": trace}
 
 
 def _bounded_int_arg(text):
@@ -7580,6 +7772,29 @@ def main():
                     and (type(value) is not str or value not in node_set)):
                 fail(5)
         result = compute_forward(links, source, destination, limit, table)
+    elif argv[1] == "rolepath":
+        if len(argv) != 6:
+            fail(2)
+        file_path, source, destination, limit_text = (
+            argv[2], argv[3], argv[4], argv[5])
+        nodes, links, kinds = load_role_network(file_path)
+        if source not in kinds or destination not in kinds:
+            fail(5)
+        if kinds[source] == "pseudo" or kinds[destination] == "pseudo":
+            fail(5)
+        if (not limit_text
+                or any(c not in "0123456789" for c in limit_text)):
+            fail(5)
+        # Strip leading zeros before int() so absurdly long digit strings
+        # cannot trip Python's integer conversion digit limit.
+        limit_digits = limit_text.lstrip("0") or "0"
+        if len(limit_digits) > 10:
+            fail(5)
+        limit = int(limit_digits)
+        if limit > MAX_COST:
+            fail(5)
+        result = compute_rolepath(nodes, links, kinds, source,
+                                  destination, limit)
     elif argv[1] == "queue":
         if len(argv) != 8:
             fail(2)
