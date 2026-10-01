@@ -9,6 +9,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py wmecmp FILE S FLOW W
        python relay.py protect FILE SOURCE DESTINATION DELAY EVENTS
        python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
+       python relay.py loopsafe FILE DESTINATION TABLE
        python relay.py queue FILE FROM TO CAP STEP DATA
        python relay.py qdisc FILE FROM TO STEP CLASSES DATA
        python relay.py fragment DATA
@@ -58,7 +59,7 @@ Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE,
 for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
 policytx op 4 also OUT),
 4 JSON syntax
-(for forward also duplicate keys or non-finite numbers in FILE/TABLE,
+(for forward/loopsafe also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/qdisc/reorder/tbucket/netqueue/converge/policy/reserve/rebalance/retune also those in
 FILE/DATA/CLASSES/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
@@ -661,6 +662,35 @@ admissions, overflow the failed ones, peak the highest simultaneous
 occupancy, and lastDepart the last send completion time (0 for a link
 that never sent). Worst case is O(S((V+E) log V) + H log(P+E)) for S
 distinct sources and H actual hops, with O(V+E+P+H) extra space.
+loopsafe takes FILE DESTINATION TABLE and is read-only: FILE uses
+forward's strict topology (duplicate keys and non-finite numbers code
+4), DESTINATION must name a node, and TABLE is a JSON object whose key
+set equals the node set and whose values are existing node names or
+null. The destination is the terminal and its own next hop is never
+read. From every non-destination node the trace follows TABLE across up
+directed links only; null, a down link, or a directed link absent from
+FILE ends the trace as unreachable, and only re-entering a
+non-destination node before reaching the destination forms a cycle.
+Each cycle is reported once: its sequence is rotated so the smallest
+Unicode code point node leads, and cycles are ordered by the full
+rotated sequence. The minimum node of each cycle gets its next hop set
+to null (every other entry is kept verbatim); suppressed lists the
+cycles in that order as [node, oldNextHop]. Every source is then traced
+over the resulting table in code point order: outcomes are only
+delivered or unreachable with at most as many node visits as there are
+nodes, a source equal to the destination has the singleton path, and an
+unreachable path keeps the actual prefix up to and including the node
+that cannot continue. Result key order is destination, cycles,
+suppressed, table, results; table keys are in code point order and each
+result is [source, status, path] by source order. Reusing the output
+table reports empty cycles and suppressed and a table consistent with
+results. A FILE read error is code 3, UTF-8/JSON syntax errors
+(including duplicate keys and non-finite numbers in FILE or TABLE) code
+4, the argument count code 2, and topology, destination, TABLE key set,
+or next-hop reference errors code 5; on failure stdout is empty and
+stderr is {"error":N} plus LF. Worst case is O(V**2 + E) time and
+O(V**2 + E) space including all result paths, and identical input bytes
+produce byte-identical output.
 """
 
 import hashlib
@@ -1410,6 +1440,122 @@ def compute_forward(links, source, destination, limit, table):
         trace.append([time, current])
     return {"source": source, "destination": destination, "limit": limit,
             "status": status, "time": time, "trace": trace}
+
+
+def compute_loopsafe(links, node_set, destination, table):
+    # Read-only whole-table audit. The next-hop map defines a functional
+    # graph over the nodes; the destination is a sink whose next hop is
+    # never read, and only up directed links may be traversed. From each
+    # non-destination node the trace ends in exactly one of: the
+    # destination, a null next hop, or a missing/down directed link
+    # (unreachable), or a repeated non-destination node (a cycle). Nodes
+    # whose trace reaches one of these outcomes inherit it, so each node
+    # is walked at most once and every cycle is found once.
+    up_pairs = {(link["from"], link["to"]) for link in links if link["up"]}
+
+    def step(node):
+        # The next node when the hop is an up directed link, else None.
+        nxt = table[node]
+        if nxt is not None and (node, nxt) in up_pairs:
+            return nxt
+        return None
+
+    # outcome: None undecided, "u" unreachable, "d" delivered, or an
+    # int cycle id (the trace reaches that cycle).
+    outcome = {}
+    path_index = {}        # node -> position in the current walk
+    cycles = []            # member lists in the order first encountered
+    for start in node_set:
+        if start == destination or start in outcome:
+            continue
+        walk = []
+        node = start
+        while True:
+            if node == destination:
+                verdict, cycle_id = "d", None
+                break
+            if node in outcome:
+                prior = outcome[node]
+                if prior == "u" or prior == "d":
+                    verdict, cycle_id = prior, None
+                else:
+                    verdict, cycle_id = prior, prior
+                break
+            if node in path_index:
+                # A repeated non-destination node: the segment from its
+                # first occurrence in this walk is the one new cycle.
+                verdict = cycle_id = len(cycles)
+                cycles.append(walk[path_index[node]:])
+                break
+            path_index[node] = len(walk)
+            walk.append(node)
+            nxt = step(node)
+            if nxt is None:
+                verdict, cycle_id = "u", None
+                break
+            node = nxt
+        # Settle this walk. A reached cycle may be new (its members are
+        # still unsettled) or one found earlier (its members already
+        # carry the id); either way the in-bound tail shares the id.
+        if cycle_id is not None:
+            members = set(cycles[cycle_id])
+            for member in cycles[cycle_id]:
+                outcome[member] = cycle_id
+            for walked in walk:
+                if walked not in members and walked not in outcome:
+                    outcome[walked] = cycle_id
+        else:
+            for walked in walk:
+                if walked not in outcome:
+                    outcome[walked] = verdict
+        for walked in walk:
+            path_index.pop(walked, None)
+
+    # Canonicalize each cycle: rotate so the smallest Unicode code point
+    # node leads, then order the cycles by their full sequences.
+    canonical = []
+    for members in cycles:
+        lead = min(members)
+        k = members.index(lead)
+        canonical.append(members[k:] + members[:k])
+    order = sorted(range(len(canonical)),
+                   key=lambda i: canonical[i])
+    cycles_out = [canonical[i] for i in order]
+
+    # Suppress each cycle at its minimum node (its canonical lead); the
+    # cycles' order is the suppression order, recording the old next hop.
+    new_table = dict(table)
+    suppressed = []
+    for seq in cycles_out:
+        node = seq[0]
+        suppressed.append([node, new_table[node]])
+        new_table[node] = None
+
+    # Re-trace every source over the suppressed table. No cycle remains,
+    # so each walk is a simple sequence with at most V node visits.
+    results = []
+    for source in sorted(node_set):
+        if source == destination:
+            results.append([source, "delivered", [source]])
+            continue
+        path = [source]
+        node = source
+        status = "unreachable"
+        while True:
+            nxt = new_table[node]
+            if nxt is None or (node, nxt) not in up_pairs:
+                break
+            path.append(nxt)
+            if nxt == destination:
+                status = "delivered"
+                break
+            node = nxt
+        results.append([source, status, path])
+
+    return {"destination": destination, "cycles": cycles_out,
+            "suppressed": suppressed,
+            "table": {n: new_table[n] for n in sorted(node_set)},
+            "results": results}
 
 
 def role_shortest_path(names, links, kind_of, source, destination):
@@ -8472,6 +8618,26 @@ def main():
                     and (type(value) is not str or value not in node_set)):
                 fail(5)
         result = compute_forward(links, source, destination, limit, table)
+    elif argv[1] == "loopsafe":
+        if len(argv) != 5:
+            fail(2)
+        file_path, destination, table_text = argv[2], argv[3], argv[4]
+        nodes, links, node_set = load_network(file_path, strict=True)
+        if destination not in node_set:
+            fail(5)
+        try:
+            table = json.loads(table_text, parse_constant=_reject_constant,
+                               parse_float=_finite_float,
+                               object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(table, dict) or set(table) != node_set:
+            fail(5)
+        for value in table.values():
+            if (value is not None
+                    and (type(value) is not str or value not in node_set)):
+                fail(5)
+        result = compute_loopsafe(links, node_set, destination, table)
     elif argv[1] == "queue":
         if len(argv) != 8:
             fail(2)
