@@ -51,6 +51,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py failstat FILE S D W A B DATA
        python relay.py failreport FILE S D W A B SCENARIOS
        python relay.py failcmp OLD NEW S D W A B SCENARIOS
+       python relay.py meshreport FILE W A B PAIRS SCENARIOS
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE,
 for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
@@ -62,7 +63,8 @@ FILE/DATA/CLASSES/EVENTS/RULES, and for loadshift/flowshift also those in FILE/F
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
 compound/audit/failstat those in DATA, for failreport that in
-SCENARIOS, for failcmp that in OLD/NEW and SCENARIOS, for compoundcp
+SCENARIOS, for failcmp that in OLD/NEW and SCENARIOS, for meshreport
+that in PAIRS/SCENARIOS, for compoundcp
 those in STATE/DATA, for
 branch those in DB/OP, for wm/wmecmp those in FILE/W, for drill/multidrill/convstat/slosum
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
@@ -71,7 +73,7 @@ CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA, for
 snapshot those in STATE/OP/IN, for config those in PACK/OP/IN, for
 policytx those in STATE/OP, for policyreplay those in PACK/STATE/DATA),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/BURST/DATA/CLASSES/D/R/
-P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
+P/C/RULES/A/B/W/PAIRS/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
 unknown-node/overflow/re-failure error; for hotload code 5 also covers
 a STATE whose v/p/h structure, version continuity, or version conflict
 is invalid; for snapshot code 5 also covers an invalid OP shape, path,
@@ -528,6 +530,40 @@ are the two sides' failreport summary x objects and d uses the same
 difference basis pooled over that summary (its du over scenario count
 * D). The JSON byte and exit-code 2..5 contracts follow failreport; a
 FILE read error is code 3 and a cross-topology invalidity is code 5.
+The old entry points are unchanged and out of scope here.
+meshreport takes FILE W A B PAIRS SCENARIOS: FILE/W/A/B reuse
+failreport's contract (strict A < B) and SCENARIOS reuses failreport's
+named scenarios and per-scenario atomic-batch DATA semantics exactly
+(same name rules, same batch validation, times in [A, B]). PAIRS is a
+non-empty JSON array of [name, source, destination, weight] entries;
+names are distinct 1..64 code point UTF-8 strings, source and
+destination name two different nodes of FILE, and weight is a
+non-boolean integer in 1..MAX_COST. Every argument, pair and scenario
+is fully validated before any run; the command is read-only and a
+validation failure outputs nothing. The same failure state machine
+then runs independently for every scenario in scenario order and,
+within it, every business pair in PAIRS order, each run starting from
+FILE's initial state. The success object's key order is a,b,pairs,
+scenarios,summary; pairs echoes PAIRS verbatim. Each scenario entry is
+[name, c, u, Lw, worst, switches] in scenario order: c follows PAIRS
+order with each entry [pair name, r, u, q] exactly like failreport's
+(r the failstat object, u the six-decimal (D-L)/D, D = B-A,
+L = r.x[4], q the [n,min,max,p50,p95] completion-delay summary with
+the same percentile and empty-set conventions), the scenario u is the
+weighted (sum(w*D)-sum(w*L))/sum(w*D) six-decimal string, Lw is
+sum(w*L), worst is the pair with the largest w*L (PAIRS order winning
+ties), and switches the sum of r.x[2] over pairs. summary is [pair
+count, scenario count, overall u, total w*L, worst pair, worst
+scenario, total switches, merged q]: the overall u and total pool
+every scenario with sum(w*D) over scenarios as the denominator, worst
+pair uses the accumulated w*L across scenarios (PAIRS order tie-break),
+worst scenario uses that scenario's Lw (scenario input order
+tie-break), and merged q pools every run's completion delays. Every
+weighted multiply-add past MAX_TIME is code 5 with no output. The JSON
+byte and exit-code 2..5 contracts follow failreport: a PAIRS or
+SCENARIOS syntax error is code 4 and every other new-form error
+(shape, type, unknown node, range or overflow) is code 5. The time
+bound is O(P*S*B*(V*V+E)); work and output space are O(P*S*B+V+E).
 The old entry points are unchanged and out of scope here.
 rolepath takes FILE SOURCE DESTINATION LIMIT and does not change the
 route topology format: the route entry points still accept only the
@@ -5453,6 +5489,109 @@ def compute_failcmp(old_nodes, old_links, new_nodes, new_links,
                   [improved, tied, degraded]]}
 
 
+def _mesh_add(total, addend):
+    # Bounded accumulator for the weighted time sums: a multiply-add
+    # past MAX_TIME is a code-5 overflow checked exactly in integers,
+    # matching the time bound elsewhere.
+    total += addend
+    if total > MAX_TIME:
+        fail(5)
+    return total
+
+
+def compute_meshreport(nodes, links, pairs, wait, window_a, window_b,
+                       scenarios):
+    # Multi-pair, multi-scenario deterministic availability evaluation.
+    # pairs holds validated [name, source, destination, weight] entries
+    # in input order and scenarios validated (name, batches) pairs in
+    # scenario order; the same failure state machine is run independently
+    # for every (scenario, business pair) combination, each run starting
+    # from FILE's initial state (compute_failstat rebuilds all of its own
+    # state, so the runs never share anything mutable). Scenario order is
+    # the outer axis and business-pair order the inner axis. D = B-A is
+    # positive (A < B is validated).
+    #
+    # Per combination the entry is [name, r, u, q] exactly like a
+    # failreport c entry: r the failstat object, u the six-decimal
+    # (D-L)/D with L = r.x[4], q the completion-delay summary. Each
+    # scenario is then aggregated by pair weight: weighted unavailable
+    # duration sum(w*L), weighted availability (sum(w*D) - sum(w*L)) /
+    # sum(w*D), total completion switches, and a worst pair selected by
+    # the largest w*L with PAIRS order breaking ties toward the earlier
+    # pair. The summary pools every scenario the same way; its worst
+    # pair uses the accumulated sum of w*L (PAIRS order tie-break) and
+    # its worst scenario uses per-scenario weighted unavailable duration
+    # (scenario input order tie-break). Every weighted multiply-add is
+    # bounded by MAX_TIME. Percentiles and the empty-set case reuse
+    # _failreport_delay_q, with one pooled q over every run's completion
+    # delays.
+    window_d = window_b - window_a
+    pair_count = len(pairs)
+    scenario_entries = []
+    pooled_delays = []
+    weighted_total = 0          # sum over scenarios and pairs of w*D
+    weighted_unavailable = 0    # sum over scenarios and pairs of w*L
+    total_switches = 0
+    pair_wl = [0] * pair_count  # accumulated w*L per pair, PAIRS order
+
+    def worst_index(values):
+        # Largest value with the earliest input index winning ties.
+        best = 0
+        for index in range(1, len(values)):
+            if values[index] > values[best]:
+                best = index
+        return best
+
+    for name, batches in scenarios:
+        entries = []
+        scenario_wd = 0
+        scenario_wl = 0
+        scenario_switches = 0
+        wl_values = []
+        delays = []
+        for index, (pair_name, source, destination, weight) in enumerate(
+                pairs):
+            result = compute_failstat(nodes, links, source, destination,
+                                      wait, batches, window_a, window_b)
+            unavailable = result["x"][4]
+            switches = result["x"][2]
+            pair_delays = [event[4] for event in result["e"]
+                           if event[1] == 1]
+            weighted_d = weight * window_d
+            weighted_l = weight * unavailable
+            weighted_total = _mesh_add(weighted_total, weighted_d)
+            weighted_unavailable = _mesh_add(weighted_unavailable,
+                                             weighted_l)
+            scenario_wd = _mesh_add(scenario_wd, weighted_d)
+            scenario_wl = _mesh_add(scenario_wl, weighted_l)
+            pair_wl[index] = _mesh_add(pair_wl[index], weighted_l)
+            scenario_switches += switches
+            total_switches += switches
+            wl_values.append(weighted_l)
+            delays.extend(pair_delays)
+            pooled_delays.extend(pair_delays)
+            u = _format_peak(window_d - unavailable, window_d)
+            entries.append([pair_name, result, u,
+                            _failreport_delay_q(pair_delays)])
+        worst = worst_index(wl_values)
+        weighted_u = _format_peak(scenario_wd - scenario_wl, scenario_wd)
+        scenario_entries.append([name, entries, weighted_u, scenario_wl,
+                                 pairs[worst][0], scenario_switches])
+
+    worst_pair = worst_index(pair_wl)
+    scenario_totals = [entry[3] for entry in scenario_entries]
+    worst_scenario = worst_index(scenario_totals)
+    overall_u = _format_peak(weighted_total - weighted_unavailable,
+                             weighted_total)
+    summary = [pair_count, len(scenarios), overall_u,
+               weighted_unavailable, pairs[worst_pair][0],
+               scenario_entries[worst_scenario][0], total_switches,
+               _failreport_delay_q(pooled_delays)]
+
+    return {"a": window_a, "b": window_b, "pairs": pairs,
+            "scenarios": scenario_entries, "summary": summary}
+
+
 def compute_impair(nodes, links, source, destination, items):
     # Impairment replay on a static up-graph. Config items (0, t, u, v,
     # n, j) set the drop modulus n and latency jitter j of the directed
@@ -10267,6 +10406,84 @@ def main():
         result = compute_failcmp(old_nodes, old_links, new_nodes,
                                  new_links, source, destination, wait,
                                  window_a, window_b, scenarios)
+    elif argv[1] == "meshreport":
+        if len(argv) != 8:
+            fail(2)
+        file_path = argv[2]
+        wait_text, a_text, b_text = argv[3], argv[4], argv[5]
+        pairs_text, scenarios_text = argv[6], argv[7]
+        nodes, links, node_set = load_network(file_path, metrics=True)
+        wait = _bounded_int_arg(wait_text)
+        window_a = _bounded_int_arg(a_text)
+        window_b = _bounded_int_arg(b_text)
+        if window_a >= window_b:
+            # meshreport inherits failreport's strict, positive D = B-A.
+            fail(5)
+        try:
+            raw_pairs = json.loads(pairs_text,
+                                   parse_constant=_reject_constant,
+                                   parse_float=_finite_float,
+                                   object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        try:
+            raw_scenarios = json.loads(scenarios_text,
+                                       parse_constant=_reject_constant,
+                                       parse_float=_finite_float,
+                                       object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        # Fully validate every pair and every scenario before any run;
+        # a failure at any point outputs nothing.
+        if not isinstance(raw_pairs, list) or not raw_pairs:
+            fail(5)
+        pairs = []
+        seen_pair_names = set()
+        for entry in raw_pairs:
+            if not isinstance(entry, list) or len(entry) != 4:
+                fail(5)
+            name, source, destination, weight = entry
+            if type(name) is not str or not 1 <= len(name) <= 64:
+                fail(5)
+            try:
+                name.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if name in seen_pair_names:
+                fail(5)
+            seen_pair_names.add(name)
+            if (type(source) is not str or type(destination) is not str
+                    or source not in node_set
+                    or destination not in node_set
+                    or source == destination):
+                fail(5)
+            if type(weight) is not int or type(weight) is bool \
+                    or not 1 <= weight <= MAX_COST:
+                fail(5)
+            pairs.append([name, source, destination, weight])
+        if not isinstance(raw_scenarios, list) or not raw_scenarios:
+            fail(5)
+        scenarios = []
+        seen_scenario_names = set()
+        for entry in raw_scenarios:
+            if not isinstance(entry, list) or len(entry) != 2:
+                fail(5)
+            name, data = entry
+            if type(name) is not str or not 1 <= len(name) <= 64:
+                fail(5)
+            try:
+                name.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if name in seen_scenario_names:
+                fail(5)
+            seen_scenario_names.add(name)
+            batches = _parse_failstat_batches(data, node_set, pair_set,
+                                              window_a, window_b)
+            scenarios.append((name, batches))
+        result = compute_meshreport(nodes, links, pairs, wait,
+                                    window_a, window_b, scenarios)
     elif argv[1] == "impair":
         if len(argv) != 6:
             fail(2)
