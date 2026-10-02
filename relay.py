@@ -7,6 +7,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py metric FILE SOURCE ORDER
        python relay.py wm FILE S W
        python relay.py wmecmp FILE S FLOW W
+       python relay.py wmconverge FILE S D W DELAY RUN EVENTS
        python relay.py protect FILE SOURCE DESTINATION DELAY EVENTS
        python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
        python relay.py loopsafe FILE DESTINATION TABLE
@@ -74,7 +75,7 @@ SCENARIOS, for failcmp that in OLD/NEW and SCENARIOS, for meshreport
 that in PAIRS and SCENARIOS, for meshcmp that in OLD/NEW, PAIRS and
 SCENARIOS, for compoundcp
 those in STATE/DATA, for
-branch those in DB/OP, for wm/wmecmp those in FILE/W, for drill/multidrill/convstat/slosum
+branch those in DB/OP, for wmconverge those in FILE/W/EVENTS, for wm/wmecmp those in FILE/W, for drill/multidrill/convstat/slosum
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
 those in OLD/NEW/EVENTS/DATA, for slogate those in
 CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA, for
@@ -418,6 +419,47 @@ key order s,f,w,r; r is sorted by destination and each item is
 h/x/y/z/path those of the selected first hop's representative path.
 The source item is [S,[S],S,0,0,0,null,0,[S]] and an unreachable
 destination's item is [destination,[],null,null,null,null,null,null,[]].
+wmconverge takes FILE S D W DELAY RUN EVENTS and is read-only: FILE, S,
+D, and W follow wm exactly (FILE parsed strictly, W a non-all-zero
+4-tuple of non-boolean integers in 0..MAX_COST) with S != D, and DELAY
+and RUN are non-boolean decimal integers in 0..MAX_COST; a real change
+at t rearming an install past t+DELAY+RUN > MAX_TIME is code 5, while
+an all-repeat batch never arms or checks the sum. EVENTS is a non-empty strict JSON
+array with strictly increasing t (a non-boolean integer in
+0..MAX_COST); each item is [t,changes] with changes a non-empty array
+whose entries are one of [0,u,v,cost], [1,u,v,bandwidth],
+[2,u,v,latency], [3,u,v,up]: the field selector is a non-boolean
+integer 0..3, u->v names a FILE edge, a cost/bandwidth is a
+non-boolean integer in 1..MAX_COST, a latency in 0..MAX_COST, and up a
+boolean; one batch may not set the same directed edge field twice.
+All validation completes before the clock starts. The clock starts at
+0 with the wm route to D installed. A batch applies atomically at its
+t; entries that repeat the current value change nothing, and a batch
+whose entries are all repeats is idempotent, keeps any outstanding
+cycle, and reports changed 0. A batch with a real change cancels the
+unfinished cycle (trigger fired or not) and rearms the trigger at
+t+DELAY and the install at t+DELAY+RUN; an overflow past MAX_TIME is
+code 5. Batches at a tick run in input order before either timer, and
+at the same tick the trigger fires before an install; a batch landing
+on a pending candidate's install tick cancels that old candidate. The
+trigger recomputes wm's four-weight scoring over the currently up
+edges and the latest three metrics (same enumeration, overflow, and
+Unicode code point tie-break as wm) and produces the candidate route
+to D; the install only then replaces the installed route, so until an
+install the old route stays in place even when a down edge makes it
+unreachable, and metric changes never replace it early. Result key
+order is s,d,w,timeline,final. The timeline starts with the initial
+install row at t=0 and then follows processing order with one row per
+batch, trigger, and install; every row is
+[t,kind,changed,installed,pending,reachable,triggerAt,installAt] with
+kind 0 the initial install, 1 a batch, 2 a trigger, and 3 an install.
+changed is the real-change field count on kind-1 rows and null
+otherwise. installed/pending are the route currently installed and the
+candidate a pending install would put in, each
+[q,hopCount,cost,bandwidth,latency,path], or [null,null,null,null,null,[]]
+when absent; reachable is whether the installed route's edges are all
+currently up (false when no route exists); triggerAt/installAt are the
+currently armed times or null. final is the final installed route.
 lrepair takes FILE S D W DATA: FILE/S/D/W follow lfail, and DATA is a
 JSON array, possibly empty, of [t,u,v,up] link items only (t a
 non-boolean integer in 0..MAX_COST, non-decreasing with equal t kept in
@@ -4200,6 +4242,135 @@ def compute_converge(nodes, links, source, destination, delay, run, events):
             timeline.append(entry(now, 3))
 
     return {"timeline": timeline}
+
+
+def compute_wmconverge(nodes, links, source, destination, weights,
+                       delay, run, events):
+    # wm-scored counterpart of compute_converge. The clock starts at 0
+    # with the wm route to D installed; a real metric/up change cancels
+    # any unfinished cycle and rearms the trigger at t+DELAY and the
+    # install at t+DELAY+RUN, while an all-repeat batch leaves the
+    # timers alone. Batches run before either timer at a tick and the
+    # trigger fires before an install. The candidate is computed once
+    # at trigger time over the then-up edges and latest metrics and is
+    # only exposed at install time, so a down edge may make the old
+    # installed route unreachable without replacing it early.
+    up_of = {}
+    cost_of = {}
+    bw_of = {}
+    lat_of = {}
+    for link in links:
+        pair = (link["from"], link["to"])
+        up_of[pair] = link["up"]
+        cost_of[pair] = link["cost"]
+        bw_of[pair] = link["bandwidth"]
+        lat_of[pair] = link["latency"]
+
+    def live_links():
+        # compute_wm reads each dict's fields, so mirror the current
+        # state into fresh dicts in FILE order.
+        return [{"from": link["from"], "to": link["to"],
+                 "up": up_of[(link["from"], link["to"])],
+                 "cost": cost_of[(link["from"], link["to"])],
+                 "bandwidth": bw_of[(link["from"], link["to"])],
+                 "latency": lat_of[(link["from"], link["to"])]}
+                for link in links]
+
+    def route_to_d():
+        # Reuse compute_wm verbatim: same DFS enumeration, four-weight
+        # q, MAX_TIME overflow, and Unicode code point tie-break.
+        wm = compute_wm(nodes, live_links(), source, weights)
+        for item in wm["r"]:
+            if item[0] == destination:
+                if item[2] is None:
+                    return None
+                # item = [destination, nextHop, q, hop, cost, bw, lat,
+                # path]; the reported route drops the next hop.
+                return [item[2], item[3], item[4], item[5], item[6],
+                        item[7]]
+        fail(5)
+
+    def reachable(route):
+        if route is None:
+            return False
+        path = route[5]
+        return all(up_of[pair] for pair in zip(path, path[1:]))
+
+    def route_json(route):
+        if route is None:
+            return [None, None, None, None, None, []]
+        return route
+
+    installed = route_to_d()
+
+    trigger_at = None
+    complete_at = None
+    pending = None
+
+    def entry(now, kind, changed=None, pending_arg=None):
+        return [now, kind, changed, route_json(installed),
+                route_json(pending_arg), reachable(installed),
+                trigger_at, complete_at]
+
+    timeline = [entry(0, 0)]
+
+    i = 0
+    n = len(events)
+    while i < n or trigger_at is not None or complete_at is not None:
+        wakes = []
+        if i < n:
+            wakes.append(events[i][0])
+        if trigger_at is not None:
+            wakes.append(trigger_at)
+        if complete_at is not None:
+            wakes.append(complete_at)
+        now = min(wakes)
+        # Event times are strictly increasing, so at most one batch is
+        # due at a tick; it applies atomically before either timer.
+        if i < n and events[i][0] == now:
+            t, changes = events[i]
+            i += 1
+            changed_count = 0
+            for kind, frm, to, value in changes:
+                pair = (frm, to)
+                if kind == 0:
+                    if cost_of[pair] != value:
+                        cost_of[pair] = value
+                        changed_count += 1
+                elif kind == 1:
+                    if bw_of[pair] != value:
+                        bw_of[pair] = value
+                        changed_count += 1
+                elif kind == 2:
+                    if lat_of[pair] != value:
+                        lat_of[pair] = value
+                        changed_count += 1
+                else:
+                    if up_of[pair] != value:
+                        up_of[pair] = value
+                        changed_count += 1
+            if changed_count:
+                # A real change cancels the unfinished cycle (trigger
+                # fired or not), dropping any old candidate, and rearms
+                # both timers.
+                pending = None
+                trigger_at = now + delay
+                complete_at = trigger_at + run
+                if complete_at > MAX_TIME:
+                    fail(5)
+            timeline.append(entry(now, 1, changed_count, pending))
+        if trigger_at is not None and trigger_at == now:
+            pending = route_to_d()
+            trigger_at = None
+            timeline.append(entry(now, 2, None, pending))
+        if complete_at is not None and complete_at == now:
+            installed = pending
+            pending = None
+            complete_at = None
+            timeline.append(entry(now, 3, None, None))
+
+    return {"s": source, "d": destination, "w": list(weights),
+            "timeline": timeline, "final": route_json(installed)}
 
 
 def _priority_order(rules):
@@ -10335,6 +10506,87 @@ def main():
         if source not in node_set:
             fail(5)
         result = compute_wmecmp(nodes, links, source, flow, weights)
+    elif argv[1] == "wmconverge":
+        if len(argv) != 9:
+            fail(2)
+        file_path, source, destination, weights_text = (
+            argv[2], argv[3], argv[4], argv[5])
+        delay_text, run_text, events_text = (
+            argv[6], argv[7], argv[8])
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        try:
+            weights = json.loads(weights_text,
+                                 parse_constant=_reject_constant,
+                                 parse_float=_finite_float,
+                                 object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if (not isinstance(weights, list) or len(weights) != 4
+                or any(type(w) is not int or not 0 <= w <= MAX_COST
+                       for w in weights)
+                or all(w == 0 for w in weights)):
+            fail(5)
+        if source not in node_set or destination not in node_set \
+                or source == destination:
+            fail(5)
+        delay = _bounded_int_arg(delay_text)
+        run = _bounded_int_arg(run_text)
+        try:
+            raw_events = json.loads(events_text,
+                                   parse_constant=_reject_constant,
+                                   parse_float=_finite_float,
+                                   object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(raw_events, list) or not raw_events:
+            fail(5)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        events = []
+        previous_time = None
+        for batch in raw_events:
+            if not isinstance(batch, list) or len(batch) != 2:
+                fail(5)
+            time, changes = batch
+            if (type(time) is not int or isinstance(time, bool)
+                    or not 0 <= time <= MAX_COST):
+                fail(5)
+            if previous_time is not None and time <= previous_time:
+                fail(5)
+            previous_time = time
+            if not isinstance(changes, list) or not changes:
+                fail(5)
+            seen_fields = set()
+            parsed_changes = []
+            for item in changes:
+                if not isinstance(item, list) or len(item) != 4:
+                    fail(5)
+                kind, frm, to, value = item
+                if (type(kind) is not int or isinstance(kind, bool)
+                        or not 0 <= kind <= 3):
+                    fail(5)
+                if (type(frm) is not str or type(to) is not str
+                        or (frm, to) not in pair_set):
+                    fail(5)
+                field_key = (frm, to, kind)
+                if field_key in seen_fields:
+                    fail(5)
+                seen_fields.add(field_key)
+                if kind == 3:
+                    if type(value) is not bool:
+                        fail(5)
+                elif kind == 2:
+                    if (type(value) is not int or isinstance(value, bool)
+                            or not 0 <= value <= MAX_COST):
+                        fail(5)
+                else:
+                    if (type(value) is not int or isinstance(value, bool)
+                            or not 1 <= value <= MAX_COST):
+                        fail(5)
+                parsed_changes.append((kind, frm, to, value))
+            events.append((time, parsed_changes))
+        result = compute_wmconverge(nodes, links, source, destination,
+                                   weights, delay, run, events)
     elif argv[1] == "dispatch":
         if len(argv) != 7:
             fail(2)
