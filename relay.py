@@ -8,6 +8,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py wm FILE S W
        python relay.py wmecmp FILE S FLOW W
        python relay.py wmconverge FILE S D W DELAY RUN EVENTS
+       python relay.py ecmpconverge FILE SOURCE DESTINATION DELAY RUN FLOWS EVENTS
        python relay.py protect FILE SOURCE DESTINATION DELAY EVENTS
        python relay.py forward FILE SOURCE DESTINATION LIMIT TABLE
        python relay.py loopsafe FILE DESTINATION TABLE
@@ -68,6 +69,7 @@ policytx op 4 also OUT),
 (for forward/loopsafe also duplicate keys or non-finite numbers in FILE/TABLE,
 for queue/qdisc/reorder/tbucket/netqueue/netshape/netfail/netimpair/netqdisc/converge/policy/reserve/rebalance/retune also those in
 FILE/DATA/QUEUES/SHAPERS/CLASSES/CONFIG/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
+ecmpconverge also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
 compound/audit/failstat those in DATA, for failreport that in
@@ -1593,6 +1595,153 @@ def compute_dispatch(nodes, links, source, destination, mode, packets):
         rows.append([pid, flow, index, hops[index], rep_paths[index]])
     return {"source": source, "destination": destination, "mode": mode,
             "nextHops": hops, "cost": total, "packets": rows}
+
+
+def _ecmpconverge_plan(nodes, links, source, destination):
+    # One dispatch_candidates recomputation shared by every flow: the
+    # lowest cost, candidate first hops in Unicode code point order, and
+    # their representative paths. Unreachable yields (None, [], []).
+    total, hops, rep_paths = dispatch_candidates(
+        nodes, links, source, destination)
+    if total is None:
+        return None, [], []
+    return total, hops, rep_paths
+
+
+def _ecmpconverge_pick(hops, rep_paths, source, destination, flow):
+    # Unlike dispatch's modulo hash, each candidate gets its own score:
+    # the first eight bytes (big-endian) of the SHA-256 of the compact
+    # UTF-8 JSON [flow, source, destination, nextHop]. The highest score
+    # wins, with ties broken toward the smaller next hop in Unicode code
+    # point order. Candidates arrive already ordered that way, so a
+    # strictly greater score is the only reason to switch the leader.
+    best_index = 0
+    best_score = -1
+    for index, hop in enumerate(hops):
+        key = json.dumps([flow, source, destination, hop],
+                         ensure_ascii=False,
+                         separators=(",", ":")).encode("utf-8")
+        score = int.from_bytes(hashlib.sha256(key).digest()[:8], "big")
+        if score > best_score:
+            best_score = score
+            best_index = index
+    return hops[best_index], rep_paths[best_index]
+
+
+def compute_ecmpconverge(nodes, links, source, destination,
+                         delay, run, flows, events):
+    # Multi-flow counterpart of compute_converge over dispatch's
+    # equal-cost candidates. The clock installs the initial mapping at 0.
+    # A batch that really changes a cost/up value cancels any unfinished
+    # cycle (dropping the pending plan) and rearms the trigger at
+    # t+DELAY and the install at t+DELAY+RUN; batches whose values all
+    # repeat leave the timers alone. At a tick the batch applies first,
+    # then the trigger fires, then the plan installs atomically. The
+    # installed mapping is retained until an install; a down edge on an
+    # installed path only flips that flow's reachable flag.
+    state = {(link["from"], link["to"]): [link["cost"], link["up"]]
+             for link in links}
+
+    def live_links():
+        # dispatch_candidates reads each dict's cost/up fields, so mirror
+        # the current state into fresh dicts in FILE order.
+        return [{"from": link["from"], "to": link["to"],
+                 "cost": state[(link["from"], link["to"])][0],
+                 "up": state[(link["from"], link["to"])][1]}
+                for link in links]
+
+    def build_plan():
+        return _ecmpconverge_plan(nodes, live_links(), source, destination)
+
+    def flow_states(plan):
+        cost, hops, rep_paths = plan
+        rows = []
+        for fid, flow in flows:
+            if cost is None:
+                rows.append([fid, flow, None, [], False])
+            else:
+                hop, path = _ecmpconverge_pick(
+                    hops, rep_paths, source, destination, flow)
+                reachable = all(
+                    state[pair][1] for pair in zip(path, path[1:]))
+                rows.append([fid, flow, hop, path, reachable])
+        return [cost, hops, rows]
+
+    initial_plan = build_plan()
+    installed = flow_states(initial_plan)
+    pending = None
+
+    trigger_at = None
+    install_at = None
+
+    def entry(now, kind, changed=None, shown_pending=False):
+        # The installed rows are refreshed from the current up state each
+        # time, so a broken installed path reads reachable=false without
+        # otherwise changing the retained mapping; a pending plan (only
+        # shown at its trigger) is immutable once computed.
+        inst_rows = []
+        for row in installed[2]:
+            fid, flow, hop, path, _ = row
+            if hop is None:
+                reachable = False
+            else:
+                reachable = all(
+                    state[pair][1] for pair in zip(path, path[1:]))
+            inst_rows.append([fid, flow, hop, path, reachable])
+        inst_state = [installed[0], installed[1], inst_rows]
+        pend_state = [pending[0], pending[1], pending[2]] \
+            if shown_pending else [None, [], []]
+        return [now, kind, changed, inst_state, pend_state,
+                trigger_at, install_at]
+
+    timeline = [entry(0, 0)]
+
+    i = 0
+    n = len(events)
+    while i < n or trigger_at is not None or install_at is not None:
+        wakes = []
+        if i < n:
+            wakes.append(events[i][0])
+        if trigger_at is not None:
+            wakes.append(trigger_at)
+        if install_at is not None:
+            wakes.append(install_at)
+        now = min(wakes)
+        # Event times are strictly increasing, so at most one batch is
+        # due at a tick; it applies atomically before either timer.
+        if i < n and events[i][0] == now:
+            t, changes = events[i]
+            i += 1
+            changed_count = 0
+            for field, frm, to, value in changes:
+                slot = state[(frm, to)]
+                index = 1 if field == "up" else 0
+                if slot[index] != value:
+                    slot[index] = value
+                    changed_count += 1
+            if changed_count:
+                # A real change cancels the unfinished cycle (trigger
+                # fired or not), dropping any old plan, and rearms both
+                # timers.
+                pending = None
+                trigger_at = now + delay
+                install_at = trigger_at + run
+                if install_at > MAX_TIME:
+                    fail(5)
+            timeline.append(entry(now, 1, changed_count))
+        if trigger_at is not None and trigger_at == now:
+            pending = flow_states(build_plan())
+            trigger_at = None
+            timeline.append(entry(now, 2, None, True))
+        if install_at is not None and install_at == now:
+            installed = pending
+            pending = None
+            install_at = None
+            timeline.append(entry(now, 3))
+
+    return {"source": source, "destination": destination,
+            "delay": delay, "run": run, "timeline": timeline,
+            "final": installed}
 
 
 def compute_protect(nodes, links, source, destination, delay, events):
@@ -10626,6 +10775,96 @@ def main():
             packets.append((pid, flow))
         result = compute_dispatch(nodes, links, source, destination,
                                   mode, packets)
+    elif argv[1] == "ecmpconverge":
+        if len(argv) != 9:
+            fail(2)
+        file_path, source, destination = argv[2], argv[3], argv[4]
+        delay_text, run_text, flows_text, events_text = (
+            argv[5], argv[6], argv[7], argv[8])
+        nodes, links, node_set = load_network(file_path, strict=True)
+        if source not in node_set or destination not in node_set \
+                or source == destination:
+            fail(5)
+        delay = _bounded_int_arg(delay_text)
+        run = _bounded_int_arg(run_text)
+        try:
+            raw_flows = json.loads(
+                flows_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+            raw_events = json.loads(
+                events_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        # FLOWS is a non-empty [id, flow] array: unique ids, both strings
+        # of 1..MAX_FLOW_LEN UTF-8-encodable code points; flows repeat.
+        if not isinstance(raw_flows, list) or not raw_flows:
+            fail(5)
+        flows = []
+        seen_ids = set()
+        for item in raw_flows:
+            if not isinstance(item, list) or len(item) != 2:
+                fail(5)
+            fid, flow = item
+            for value in (fid, flow):
+                if type(value) is not str \
+                        or not 1 <= len(value) <= MAX_FLOW_LEN:
+                    fail(5)
+                try:
+                    value.encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(5)
+            if fid in seen_ids:
+                fail(5)
+            seen_ids.add(fid)
+            flows.append((fid, flow))
+        # EVENTS is a strictly increasing, non-empty batch list; each
+        # batch is [t, changes] with non-empty changes of
+        # ["cost"/"up", from, to, value], no field repeated for an edge
+        # within the batch.
+        if not isinstance(raw_events, list) or not raw_events:
+            fail(5)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        events = []
+        previous_time = None
+        for batch in raw_events:
+            if not isinstance(batch, list) or len(batch) != 2:
+                fail(5)
+            time, changes = batch
+            if (type(time) is not int or isinstance(time, bool)
+                    or not 0 <= time <= MAX_COST):
+                fail(5)
+            if previous_time is not None and time <= previous_time:
+                fail(5)
+            previous_time = time
+            if not isinstance(changes, list) or not changes:
+                fail(5)
+            seen_fields = set()
+            parsed_changes = []
+            for item in changes:
+                if not isinstance(item, list) or len(item) != 4:
+                    fail(5)
+                field, frm, to, value = item
+                if field not in ("cost", "up"):
+                    fail(5)
+                if (type(frm) is not str or type(to) is not str
+                        or (frm, to) not in pair_set):
+                    fail(5)
+                field_key = (frm, to, field)
+                if field_key in seen_fields:
+                    fail(5)
+                seen_fields.add(field_key)
+                if field == "up":
+                    if type(value) is not bool:
+                        fail(5)
+                else:
+                    if (type(value) is not int or isinstance(value, bool)
+                            or not 1 <= value <= MAX_COST):
+                        fail(5)
+                parsed_changes.append((field, frm, to, value))
+            events.append((time, parsed_changes))
+        result = compute_ecmpconverge(nodes, links, source, destination,
+                                      delay, run, flows, events)
     elif argv[1] == "protect":
         if len(argv) != 7:
             fail(2)
