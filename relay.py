@@ -18,6 +18,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py reorder FILE FROM TO BASE WINDOW DATA
        python relay.py tbucket FILE FROM TO BURST CAP DATA
        python relay.py netqueue FILE QUEUES DATA
+       python relay.py netshape FILE SHAPERS DATA
        python relay.py netfail FILE QUEUES EVENTS DATA
        python relay.py netimpair FILE QUEUES EVENTS DATA
        python relay.py netqdisc FILE CONFIG DATA
@@ -64,8 +65,8 @@ for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
 policytx op 4 also OUT),
 4 JSON syntax
 (for forward/loopsafe also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/qdisc/reorder/tbucket/netqueue/netfail/netimpair/netqdisc/converge/policy/reserve/rebalance/retune also those in
-FILE/DATA/QUEUES/CLASSES/CONFIG/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
+for queue/qdisc/reorder/tbucket/netqueue/netshape/netfail/netimpair/netqdisc/converge/policy/reserve/rebalance/retune also those in
+FILE/DATA/QUEUES/SHAPERS/CLASSES/CONFIG/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
 compound/audit/failstat those in DATA, for failreport that in
@@ -79,7 +80,7 @@ those in OLD/NEW/EVENTS/DATA, for slogate those in
 CUR/NEW/EVENTS/DATA, for hotload those in STATE/OP/EVENTS/DATA, for
 snapshot those in STATE/OP/IN, for config those in PACK/OP/IN/OUT, for
 policytx those in STATE/OP, for policyreplay those in PACK/STATE/DATA),
-5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/BURST/DATA/CLASSES/D/R/
+5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/BURST/SHAPERS/DATA/CLASSES/D/R/
 P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
 unknown-node/overflow/re-failure error; for hotload code 5 also covers
 a STATE whose v/p/h structure, version continuity, or version conflict
@@ -718,6 +719,46 @@ admissions, overflow the failed ones, peak the highest simultaneous
 occupancy, and lastDepart the last send completion time (0 for a link
 that never sent). Worst case is O(S((V+E) log V) + H log(P+E)) for S
 distinct sources and H actual hops, with O(V+E+P+H) extra space.
+netshape is read-only and takes FILE SHAPERS DATA, applying tbucket's
+token bucket to netqueue's deterministic multi-hop store-and-forward
+while keeping netqueue's entry behavior. FILE is metric's topology
+parsed exactly like netqueue's. SHAPERS is a JSON array of
+[from,to,rate,burst,capacity] quintuples covering every directed FILE
+link exactly once (an unknown or self pair, a duplicate, or a
+missing/extra pair is code 5); rate, burst, and capacity are
+non-boolean integers in 1..MAX_COST. DATA follows netqueue's exact
+[id,time,source,destination,size] contract, including unique ids and
+the empty-array case. Each link starts clock 0 with burst tokens and
+refills at rate per elapsed unit capped at burst; starting a send
+deducts the head's size. A packet whose size exceeds burst ends as
+oversize on arrival, consuming no tokens and occupying no capacity;
+any other packet whose admission would take occupied bytes plus size
+past capacity ends as overflow there instead. An admitted packet holds
+its bytes from admission through send completion. An idle link serves
+only its FIFO head; when tokens cannot cover the head it waits until
+the first integer time with enough tokens, the send then takes
+ceil(size/bandwidth) and reception follows latency units later.
+Routing (one lowest-cost Dijkstra per distinct source with the
+Unicode node sequence tie-break), source == destination delivery, and
+unreachable handling reuse netqueue verbatim. At each distinct time,
+repeatedly until stable, send completions release first, then
+receptions and fresh injections due at the time are admitted in DATA
+order (merged by packet index), and finally each idle link whose head
+is now token-covered starts it once in FILE order; token-ready
+deadlines at the time join this final pass and zero-latency work
+repeats the instant. A computed time above MAX_TIME is code 5 with no
+partial output. Result top-level key order is packets,links. Packet
+rows are [id,status,path,finish,delay,dropLink,hops] in DATA order:
+status is delivered, unreachable, oversize, or overflow; hops and the
+null conventions follow netqueue exactly (an oversize or overflow hop
+carries only its arrive), and dropLink is the offending [from,to].
+links follows FILE order as
+[from,to,enqueued,oversize,overflow,peak,lastDepart]: enqueued counts
+successful admissions, oversize and overflow the failed ones, peak
+the highest simultaneous occupied bytes, and lastDepart the last send
+completion time (0 for a link that never sent). Worst case is
+O(S((V+E) log V) + H log(P+E)) for S distinct sources and H actual
+hops, with O(V+E+P+H) extra space.
 netfail is read-only and takes FILE QUEUES EVENTS DATA on one explicit
 event clock. FILE/QUEUES/DATA and the per-link FIFO capacity, send
 (ceil(size/bandwidth)), latency, and overflow mechanics are netqueue's;
@@ -2682,6 +2723,267 @@ def compute_netqueue(nodes, links, cap_of, packets):
     return {"packets": results,
             "links": [[links[i]["from"], links[i]["to"], admitted[i],
                        overflows[i], peak[i], last_depart[i]]
+                      for i in range(E)]}
+
+
+def compute_netshape(nodes, links, rate_of, burst_of, cap_of, packets):
+    # Deterministic multi-hop store-and-forward with tbucket's token
+    # bucket gating each link. Routing, static paths, the FIFO byte
+    # queue, capacity/peak accounting, ceil(size/bandwidth) sends,
+    # latency receptions, and the global clock with its per-time phase
+    # order all follow compute_netqueue; the only server addition is the
+    # per-link token bucket.
+    #
+    # A link holds burst tokens at clock 0 and refills at rate per
+    # elapsed unit, capped at burst; starting a send deducts the head's
+    # size. A whole-arriving packet larger than burst ends as oversize
+    # and any other admission past capacity ends as overflow; neither
+    # occupies a byte or consumes a token. An idle link serves only its
+    # FIFO head: if the bucket cannot cover it, the link waits until the
+    # first integer time with enough tokens (a ready event on the clock),
+    # then starts in the FILE-order start phase.
+    adj_of = {u: [] for u in nodes}
+    link_index = {}
+    for i, link in enumerate(links):
+        link_index[(link["from"], link["to"])] = i
+        if link["up"]:
+            adj_of[link["from"]].append((link["to"], link["cost"]))
+
+    n = len(packets)
+    paths = [None] * n
+    # One Dijkstra per distinct source, as in compute_netqueue.
+    by_source = {}
+    for i, (_, _, source, _, _) in enumerate(packets):
+        by_source.setdefault(source, []).append(i)
+    for source, indices in by_source.items():
+        dist = _netqueue_dijkstra(nodes, adj_of, source)
+        for i in indices:
+            entry = dist.get(packets[i][3])
+            if entry is not None and len(entry[1]) >= 2:
+                paths[i] = list(entry[1])
+        del dist
+
+    E = len(links)
+    bw = [l["bandwidth"] for l in links]
+    lat = [l["latency"] for l in links]
+    rate = [rate_of[i] for i in range(E)]
+    burst = [burst_of[i] for i in range(E)]
+    cap = [cap_of[i] for i in range(E)]
+    occupancy = [0] * E
+    queues = [deque() for _ in range(E)]   # admitted packet indices
+    busy = [False] * E
+    admitted = [0] * E
+    oversize = [0] * E
+    overflows = [0] * E
+    peak = [0] * E
+    last_depart = [0] * E
+    # Token state: tokens[li] is the bucket level at clock last_tok[li].
+    tokens = list(burst)
+    last_tok = [0] * E
+
+    # results[i] = [id, status, path, finish, delay, dropLink, hops]
+    results = [[pid, None, None, None, None, None, []]
+               for pid, _, _, _, _ in packets]
+    hop_at = [0] * n
+
+    # Packets that never touch the clock resolve exactly as netqueue.
+    for i, (_, ptime, source, destination, _) in enumerate(packets):
+        path = paths[i]
+        if path is not None:
+            results[i][2] = path
+            continue
+        if source == destination:
+            results[i][1] = "delivered"
+            results[i][2] = [source]
+            results[i][3] = ptime
+            results[i][4] = 0
+        else:
+            results[i][1] = "unreachable"
+            results[i][2] = []
+
+    def check_time(value):
+        if value > MAX_TIME:
+            fail(5)
+        return value
+
+    completion_heap = []   # (depart, fileIndex, packet)
+    reception_heap = []    # (time, packet)
+    idle_heap = []         # FILE indices token-ready and startable
+    ready_heap = []        # (readyTime, fileIndex): waiting for tokens
+
+    def refill(li, now):
+        # Bring the bucket forward to the integer clock now.
+        if now > last_tok[li]:
+            level = tokens[li] + (now - last_tok[li]) * rate[li]
+            tokens[li] = min(burst[li], level)
+            last_tok[li] = now
+
+    def arm(li, now):
+        # An idle link with a queued head becomes startable either now
+        # (enough tokens) or at the first integer time the refill covers
+        # the head; the bucket cannot change while the link is idle.
+        if busy[li] or not queues[li]:
+            return
+        size = packets[queues[li][0]][4]
+        refill(li, now)
+        if tokens[li] >= size:
+            heapq.heappush(idle_heap, li)
+        else:
+            ready = now + ((size - tokens[li] + rate[li] - 1)
+                           // rate[li])
+            check_time(ready)
+            heapq.heappush(ready_heap, (ready, li))
+
+    def admit(i, now):
+        # Packet i is whole at its hop_at[i] link: oversize beats the
+        # capacity test; both end the packet without occupying bytes.
+        path = paths[i]
+        k = hop_at[i]
+        frm, to = path[k], path[k + 1]
+        li = link_index[(frm, to)]
+        hop = {"from": frm, "to": to, "arrive": now, "start": None,
+               "depart": None, "receive": None, "wait": None}
+        results[i][6].append(hop)
+        size = packets[i][4]
+        if size > burst[li]:
+            results[i][1] = "oversize"
+            results[i][5] = [frm, to]
+            oversize[li] += 1
+            return
+        if occupancy[li] + size > cap[li]:
+            results[i][1] = "overflow"
+            results[i][5] = [frm, to]
+            overflows[li] += 1
+            return
+        occupancy[li] += size
+        if occupancy[li] > peak[li]:
+            peak[li] = occupancy[li]
+        admitted[li] += 1
+        was_empty = not queues[li]
+        queues[li].append(i)
+        # Only a fresh head needs arming; a head already queued on an
+        # idle link has its ready/idle entry outstanding, and a busy
+        # link arms its successor at completion.
+        if not busy[li] and was_empty:
+            arm(li, now)
+
+    def release(now, i, li):
+        occupancy[li] -= packets[i][4]
+        busy[li] = False
+        last_depart[li] = now
+        receive = check_time(now + lat[li])
+        results[i][6][-1]["receive"] = receive
+        path = paths[i]
+        if hop_at[i] + 1 == len(path) - 1:
+            results[i][1] = "delivered"
+            results[i][3] = receive
+            results[i][4] = receive - packets[i][1]
+        else:
+            hop_at[i] += 1
+            heapq.heappush(reception_heap, (receive, i))
+        # The successor head waits for the same bucket at depart time.
+        if queues[li]:
+            arm(li, now)
+
+    def start_heads(now):
+        while idle_heap:
+            li = heapq.heappop(idle_heap)
+            if busy[li] or not queues[li]:
+                continue
+            refill(li, now)
+            i = queues[li].popleft()
+            size = packets[i][4]
+            tokens[li] -= size
+            depart = check_time(now + (size + bw[li] - 1) // bw[li])
+            busy[li] = True
+            hop = results[i][6][-1]
+            hop["start"] = now
+            hop["depart"] = depart
+            hop["wait"] = now - hop["arrive"]
+            heapq.heappush(completion_heap, (depart, li, i))
+
+    inject_at = 0
+
+    def prime_inject():
+        j = inject_at
+        while j < n and paths[j] is None:
+            j += 1
+        return packets[j][1] if j < n else None
+
+    def advance_inject(now):
+        nonlocal inject_at
+        due_list = []
+        while inject_at < n and packets[inject_at][1] <= now:
+            if paths[inject_at] is not None:
+                due_list.append(inject_at)
+            inject_at += 1
+        return due_list
+
+    next_inject = prime_inject()
+
+    def next_time():
+        t = next_inject
+        if completion_heap:
+            ct = completion_heap[0][0]
+            if t is None or ct < t:
+                t = ct
+        if reception_heap:
+            rt = reception_heap[0][0]
+            if t is None or rt < t:
+                t = rt
+        if ready_heap:
+            qt = ready_heap[0][0]
+            if t is None or qt < t:
+                t = qt
+        return t
+
+    while True:
+        now = next_time()
+        if now is None:
+            break
+        check_time(now)
+        moved = True
+        while moved:
+            moved = False
+            while completion_heap and completion_heap[0][0] == now:
+                _, li, i = heapq.heappop(completion_heap)
+                release(now, i, li)
+                moved = True
+            due = []
+            while reception_heap and reception_heap[0][0] == now:
+                _, i = heapq.heappop(reception_heap)
+                due.append(i)
+            injected = advance_inject(now)
+            next_inject = prime_inject()
+            a = b = 0
+            while a < len(due) or b < len(injected):
+                if b >= len(injected) or (a < len(due)
+                                          and due[a] < injected[b]):
+                    admit(due[a], now)
+                    a += 1
+                else:
+                    admit(injected[b], now)
+                    b += 1
+            if due or injected:
+                moved = True
+            # Token deadlines due at now join the FILE-order start pass.
+            while ready_heap and ready_heap[0][0] <= now:
+                _, li = heapq.heappop(ready_heap)
+                if busy[li] or not queues[li]:
+                    continue
+                refill(li, now)
+                size = packets[queues[li][0]][4]
+                if tokens[li] >= size:
+                    heapq.heappush(idle_heap, li)
+                else:
+                    arm(li, now)
+            if idle_heap:
+                start_heads(now)
+                moved = True
+
+    return {"packets": results,
+            "links": [[links[i]["from"], links[i]["to"], admitted[i],
+                       oversize[i], overflows[i], peak[i], last_depart[i]]
                       for i in range(E)]}
 
 
@@ -10623,6 +10925,79 @@ def main():
                 fail(5)
             packets.append((pid, time, source, destination, size))
         result = compute_netqueue(nodes, links, cap_of, packets)
+    elif argv[1] == "netshape":
+        if len(argv) != 5:
+            fail(2)
+        file_path, shapers_text, data_text = argv[2], argv[3], argv[4]
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        link_pairs_set = {(l["from"], l["to"]) for l in links}
+        try:
+            raw_shapers = json.loads(shapers_text,
+                                     parse_constant=_reject_constant,
+                                     parse_float=_finite_float,
+                                     object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(raw_shapers, list):
+            fail(5)
+        # SHAPERS maps every directed FILE link 1:1 to its
+        # [rate, burst, capacity], each a non-boolean 1..MAX_COST int.
+        shape_of_pair = {}
+        for item in raw_shapers:
+            if not isinstance(item, list) or len(item) != 5:
+                fail(5)
+            frm, to, srate, sburst, capacity = item
+            if type(frm) is not str or type(to) is not str:
+                fail(5)
+            pair = (frm, to)
+            if pair not in link_pairs_set or pair in shape_of_pair:
+                fail(5)
+            for value in (srate, sburst, capacity):
+                if type(value) is not int or not 1 <= value <= MAX_COST:
+                    fail(5)
+            shape_of_pair[pair] = (srate, sburst, capacity)
+        if set(shape_of_pair) != link_pairs_set:
+            fail(5)
+        rate_of = [shape_of_pair[(l["from"], l["to"])][0] for l in links]
+        burst_of = [shape_of_pair[(l["from"], l["to"])][1] for l in links]
+        cap_of = [shape_of_pair[(l["from"], l["to"])][2] for l in links]
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        packets = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 5:
+                fail(5)
+            pid, time, source, destination, size = item
+            if (type(pid) is not str or pid == ""
+                    or not 1 <= len(pid) <= MAX_FLOW_LEN
+                    or pid in seen_ids):
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_ids.add(pid)
+            if type(time) is not int or not 0 <= time <= MAX_TIME:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if source not in node_set or destination not in node_set:
+                fail(5)
+            if type(size) is not int or not 1 <= size <= MAX_COST:
+                fail(5)
+            packets.append((pid, time, source, destination, size))
+        result = compute_netshape(nodes, links, rate_of, burst_of,
+                                  cap_of, packets)
     elif argv[1] == "netfail":
         if len(argv) != 6:
             fail(2)
