@@ -19,6 +19,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py reorder FILE FROM TO BASE WINDOW DATA
        python relay.py tbucket FILE FROM TO BURST CAP DATA
        python relay.py netqueue FILE QUEUES DATA
+       python relay.py netfragment FILE QUEUES MTUS DATA
        python relay.py policyqueue FILE QUEUES RULES DATA
        python relay.py ecmpqueue FILE QUEUES MODE DATA
        python relay.py netshape FILE SHAPERS DATA
@@ -71,8 +72,8 @@ for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
 policytx op 4 also OUT),
 4 JSON syntax
 (for forward/loopsafe also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/qdisc/reorder/tbucket/netqueue/policyqueue/ecmpqueue/netshape/netfail/policyfail/netimpair/netreorder/netqdisc/converge/ecmpconverge/policy/reserve/rebalance/retune also those in
-FILE/DATA/QUEUES/SHAPERS/CLASSES/CONFIG/EVENTS/FLOWS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
+for queue/qdisc/reorder/tbucket/netqueue/netfragment/policyqueue/ecmpqueue/netshape/netfail/policyfail/netimpair/netreorder/netqdisc/converge/ecmpconverge/policy/reserve/rebalance/retune also those in
+FILE/DATA/QUEUES/MTUS/SHAPERS/CLASSES/CONFIG/EVENTS/FLOWS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
 compound/audit/failstat those in DATA, for failreport that in
@@ -848,6 +849,58 @@ admissions, overflow the failed ones, peak the highest simultaneous
 occupancy, and lastDepart the last send completion time (0 for a link
 that never sent). Worst case is O(S((V+E) log V) + H log(P+E)) for S
 distinct sources and H actual hops, with O(V+E+P+H) extra space.
+netfragment takes FILE QUEUES MTUS DATA and performs per-fragment
+multi-hop MTU fragmentation, fragment-level FIFO transport, and
+destination reassembly on netqueue's one explicit event clock; FILE
+and QUEUES reuse netqueue's exact topology and per-link capacity rules.
+MTUS is a JSON array of [from,to,mtu] triples covering every directed
+FILE link exactly once the way QUEUES does (an unknown or self pair, a
+duplicate, or a missing/extra pair is code 5); mtu is a non-boolean
+integer in 25..MAX_COST. DATA is a JSON array, possibly empty, of
+[id,time,source,destination,ttl,payload] items: id, time,
+source/destination, uniqueness, order, types, and ranges follow
+netqueue's DATA (and fragment's id/ttl/hex conventions), ttl a
+non-boolean integer in 1..MAX_COST, and payload a non-empty
+even-length lowercase hexadecimal string of at most MAX_COST decoded
+bytes. Routing is fixed at injection to netqueue's lowest-cost up path
+with the Unicode node-sequence tie-break; source == destination and an
+unreachable destination behave exactly like netqueue. Before a fragment
+crosses a link its ttl is decremented: at zero the item ends on that
+link (a ttl item) without being split; otherwise the arriving pieces
+are re-split for that link with c=mtu-24 under fragment's floor(c/8)*8
+rule, keeping absolute offsets. The produced items are enqueued
+independently in ascending offset order; each occupies capacity and
+sends with size payload bytes + 24 (send ceil(size/bandwidth),
+reception latency units later, same FIFO and release semantics as
+netqueue). An item whose admission would exceed capacity ends as an
+overflow item on that link, occupying and enqueuing nothing, while its
+sibling items continue; a next hop is processed only after every
+admitted sibling has arrived whole. Same-instant phases follow
+netqueue, with receptions and injections merged in DATA order and items
+ordered by offset; zero-delay events repeat until stable, and a
+computed time above MAX_TIME is code 5 with no partial output. Result
+top-level key order is packets,links. Each packet row is
+[id,status,path,finish,delay,fragments,payload] in DATA order: status
+is delivered, unreachable, or incomplete -- delivered when every final
+fragment arrived and the pieces re-cover the payload under reassemble's
+contiguity rule, incomplete when any item ended ttl or overflow;
+payload is the reassembled hex only when delivered and null otherwise,
+and an unreachable row has null finish/delay/payload, [] path/fragments.
+finish is the maximum end time over the packet's items and delay
+finish-injection. fragments lists the final items by offset, each
+[offset,more,data,checksum,status,finish,dropLink,hops] reusing
+fragment's offset/more/data/checksum, with status delivered, ttl, or
+overflow, finish that item's end time, dropLink the [from,to] it ended
+on (null for delivered), and hops the per-link records with netqueue's
+from,to,arrive,start,depart,receive,wait key order (a drop carries the
+arrive with the remaining fields null). links follows FILE order and
+netqueue's [from,to,enqueued,overflow,peak,lastDepart] statistics, but
+counts fragment items rather than packets and measures peak
+occupancy in on-the-wire bytes. Exit codes follow netqueue: wrong
+argument count 2, FILE unreadable 3, strict JSON errors in
+FILE/QUEUES/MTUS/DATA 4, every other validation or clock error 5;
+failure leaves stdout empty and success writes compact UTF-8 JSON plus
+LF, byte-identical for identical input, writing no files.
 policyqueue is read-only and takes FILE QUEUES RULES DATA, merging
 policytx policy routing with netqueue's deterministic multi-hop
 store-and-forward FIFO clock on one explicit event clock. FILE/QUEUES
@@ -2991,6 +3044,399 @@ def compute_netqueue(nodes, links, cap_of, packets):
             if idle_heap:
                 start_heads(now)
                 moved = True
+
+    return {"packets": results,
+            "links": [[links[i]["from"], links[i]["to"], admitted[i],
+                       overflows[i], peak[i], last_depart[i]]
+                      for i in range(E)]}
+
+
+def compute_netfragment(nodes, links, cap_of, mtu_of, packets):
+    # Per-fragment multi-hop store-and-forward on compute_netqueue's
+    # explicit event clock. Routing is identical: one lowest-cost
+    # Dijkstra per distinct source over up links, (cost, Unicode node
+    # sequence) as the key; source == destination delivers at injection
+    # time and an unreachable destination never enters any queue.
+    #
+    # Instead of one unit per packet, a packet is a set of payload
+    # pieces. A piece crosses one path link per step. Before the hop the
+    # ttl is decremented; at 0 the piece ends (ttl drop) and is not
+    # split. Otherwise the piece is re-split under that link's MTU with
+    # the 24-byte header and fragment's 8-byte alignment rule
+    # (c = mtu - 24, take floor(c/8)*8 while the remainder exceeds c,
+    # else the whole remainder), keeping absolute offsets. The produced
+    # fragments, in ascending offset order, each independently request
+    # admission as a fragment-level FIFO item: occupancy and send size
+    # are payload bytes + 24. An item that does not fit is an overflow
+    # item -- it occupies and enqueues nothing, but its sibling items
+    # still proceed. Send time is ceil(wire/bandwidth) and reception is
+    # latency units later; arrived siblings merge for the next hop.
+    #
+    # At each distinct time the phases repeat until stable exactly as
+    # in netqueue: completions release capacity, then receptions and
+    # fresh injections due at the time are handled in DATA order with
+    # pieces ordered by absolute offset, then idle links start their
+    # queued head once in FILE order. A computed time above MAX_TIME
+    # fails with code 5.
+    adj_of = {u: [] for u in nodes}
+    link_index = {}
+    for i, link in enumerate(links):
+        link_index[(link["from"], link["to"])] = i
+        if link["up"]:
+            adj_of[link["from"]].append((link["to"], link["cost"]))
+
+    n = len(packets)
+    paths = [None] * n
+    by_source = {}
+    for i, (_, _, source, _, _, _) in enumerate(packets):
+        by_source.setdefault(source, []).append(i)
+    for source, indices in by_source.items():
+        dist = _netqueue_dijkstra(nodes, adj_of, source)
+        for i in indices:
+            entry = dist.get(packets[i][3])
+            if entry is not None and len(entry[1]) >= 2:
+                paths[i] = list(entry[1])
+        del dist
+
+    E = len(links)
+    bw = [l["bandwidth"] for l in links]
+    lat = [l["latency"] for l in links]
+    cap = [cap_of[i] for i in range(E)]
+    mtu = [mtu_of[i] for i in range(E)]
+    occupancy = [0] * E
+    queues = [deque() for _ in range(E)]   # admitted item ids
+    busy = [False] * E
+    admitted = [0] * E
+    overflows = [0] * E
+    peak = [0] * E
+    last_depart = [0] * E
+
+    # Every independently admitted, dropped, or delivered unit is one
+    # item, created by a split event. Its data never changes after
+    # creation; arrival/hop/end fields are set as it travels.
+    items = []
+    ttl_drop = set()
+    over_drop = set()
+    # packet index -> hop -> {"items": arrived item ids, "wait": number
+    # of admitted siblings still expected}. A hop fires only once every
+    # sibling produced for it has arrived whole: FIFO service makes the
+    # last arrival the maximum reception time.
+    pending = {}
+
+    # Packet results: [id,status,path,finish,delay,fragments,payload];
+    # finish[i] accumulates the maximum item end time, ttl/overflow
+    # flags force the packet to incomplete.
+    status_of = [None] * n
+    path_of = [None] * n
+    finish_of = [None] * n
+    bad_ttl = [False] * n
+    bad_over = [False] * n
+    # The surviving pieces at the destination, by item id.
+    dest_pieces = [[] for _ in range(n)]
+    payload_of = [p[5] for p in packets]
+    plen_of = [len(p[5]) for p in packets]
+
+    for i, (_, ptime, source, destination, _, _) in enumerate(packets):
+        path = paths[i]
+        if path is not None:
+            path_of[i] = path
+            continue
+        if source == destination:
+            status_of[i] = "delivered"
+            path_of[i] = [source]
+            finish_of[i] = ptime
+        else:
+            status_of[i] = "unreachable"
+            path_of[i] = []
+
+    def check_time(value):
+        if value > MAX_TIME:
+            fail(5)
+        return value
+
+    def new_item(pkt, off, blob, frm, to, arrive, hop):
+        idx = len(items)
+        items.append({"pkt": pkt, "off": off, "blob": blob,
+                      "from": frm, "to": to, "arrive": arrive,
+                      "hop": hop, "start": None, "depart": None,
+                      "receive": None, "wait": None, "end": None,
+                      "dropLink": None, "hops": []})
+        return idx
+
+    def end_item(idx, end, drop_link):
+        it = items[idx]
+        it["end"] = end
+        if drop_link is not None:
+            it["dropLink"] = [drop_link[0], drop_link[1]]
+        pkt = it["pkt"]
+        if finish_of[pkt] is None or end > finish_of[pkt]:
+            finish_of[pkt] = end
+
+    def process(pkt, hop, group, now):
+        # TTL step applies once for the packet before this hop; every
+        # sibling shares the value.
+        ttl = packets[pkt][4] - hop - 1
+        path = paths[pkt]
+        frm, to = path[hop], path[hop + 1]
+        li = link_index[(frm, to)]
+        if ttl <= 0:
+            bad_ttl[pkt] = True
+            for idx in group:
+                # The attempted hop carries an arrive-only record, the
+                # same null-field convention netqueue uses on overflow.
+                items[idx]["hops"].append(
+                    {"from": frm, "to": to, "arrive": now, "start": None,
+                     "depart": None, "receive": None, "wait": None})
+                ttl_drop.add(idx)
+                end_item(idx, now, (frm, to))
+            return
+        c = mtu[li] - 24
+        # Splitting the group in ascending offset order reproduces
+        # fragment's re-split of the contiguous piece list exactly.
+        produced = []
+        for src in sorted(group, key=lambda j: items[j]["off"]):
+            blob = items[src]["blob"]
+            length = len(blob)
+            base = items[src]["off"]
+            pos = 0
+            while pos < length:
+                remaining = length - pos
+                if remaining > c:
+                    take = (c // 8) * 8
+                else:
+                    take = remaining
+                if take == 0:
+                    fail(5)
+                idx = new_item(pkt, base + pos, blob[pos:pos + take],
+                               frm, to, now, hop)
+                # The child inherits every link already traversed by
+                # its parent lineage.
+                items[idx]["hops"] = list(items[src]["hops"])
+                produced.append(idx)
+                pos += take
+        wire_of = {}
+        for idx in produced:
+            wire_of[idx] = len(items[idx]["blob"]) + 24
+        # Independent admission in offset order: an overflowing item
+        # ends here while its siblings still test and proceed. Only
+        # admitted siblings can arrive at the next hop, so its bucket
+        # waits for exactly that many receptions.
+        admitted_here = []
+        for idx in sorted(produced, key=lambda j: items[j]["off"]):
+            wire = wire_of[idx]
+            hoprec = {"from": frm, "to": to, "arrive": now,
+                      "start": None, "depart": None, "receive": None,
+                      "wait": None}
+            items[idx]["hops"].append(hoprec)
+            if occupancy[li] + wire > cap[li]:
+                bad_over[pkt] = True
+                over_drop.add(idx)
+                overflows[li] += 1
+                end_item(idx, now, (frm, to))
+                continue
+            occupancy[li] += wire
+            if occupancy[li] > peak[li]:
+                peak[li] = occupancy[li]
+            admitted[li] += 1
+            queues[li].append(idx)
+            admitted_here.append(idx)
+            if not busy[li]:
+                heapq.heappush(idle_heap, li)
+        if admitted_here and hop + 1 < len(path) - 1:
+            bucket = pending.setdefault(pkt, {})
+            bucket[hop + 1] = {"items": [], "wait": len(admitted_here)}
+
+    def release(now, idx, li):
+        wire = len(items[idx]["blob"]) + 24
+        occupancy[li] -= wire
+        busy[li] = False
+        last_depart[li] = now
+        if queues[li]:
+            heapq.heappush(idle_heap, li)
+        receive = check_time(now + lat[li])
+        items[idx]["hops"][-1]["receive"] = receive
+        pkt = items[idx]["pkt"]
+        next_hop = items[idx]["hop"] + 1
+        if next_hop == len(paths[pkt]) - 1:
+            # Reception reaches the destination: the item is final.
+            end_item(idx, receive, None)
+            dest_pieces[pkt].append(idx)
+        else:
+            slot = pending[pkt][next_hop]
+            slot["items"].append(idx)
+            slot["wait"] -= 1
+            # The last sibling reception is the group's whole-arrival
+            # time, which is when this next hop becomes processable.
+            if slot["wait"] == 0:
+                heapq.heappush(reception_heap, (receive, pkt, next_hop))
+
+    def start_heads(now):
+        while idle_heap:
+            li = heapq.heappop(idle_heap)
+            if busy[li] or not queues[li]:
+                continue
+            idx = queues[li].popleft()
+            wire = len(items[idx]["blob"]) + 24
+            depart = check_time(now + (wire + bw[li] - 1) // bw[li])
+            busy[li] = True
+            hop = items[idx]["hops"][-1]
+            hop["start"] = now
+            hop["depart"] = depart
+            hop["wait"] = now - hop["arrive"]
+            items[idx]["start"] = now
+            items[idx]["depart"] = depart
+            heapq.heappush(completion_heap, (depart, li, idx))
+
+    completion_heap = []
+    reception_heap = []
+    idle_heap = []
+
+    inject_at = 0
+
+    def prime_inject():
+        j = inject_at
+        while j < n and paths[j] is None:
+            j += 1
+        return packets[j][1] if j < n else None
+
+    def advance_inject(now):
+        nonlocal inject_at
+        due_list = []
+        while inject_at < n and packets[inject_at][1] <= now:
+            if paths[inject_at] is not None:
+                due_list.append(inject_at)
+            inject_at += 1
+        return due_list
+
+    next_inject = prime_inject()
+
+    def next_time():
+        t = next_inject
+        if completion_heap:
+            ct = completion_heap[0][0]
+            if t is None or ct < t:
+                t = ct
+        if reception_heap:
+            rt = reception_heap[0][0]
+            if t is None or rt < t:
+                t = rt
+        return t
+
+    while True:
+        now = next_time()
+        if now is None:
+            break
+        check_time(now)
+        moved = True
+        while moved:
+            moved = False
+            while completion_heap and completion_heap[0][0] == now:
+                _, li, idx = heapq.heappop(completion_heap)
+                release(now, idx, li)
+                moved = True
+            # Receptions are merged in DATA order; all arrivals for a
+            # packet's next hop are present before it is processed.
+            due = []
+            seen = set()
+            while reception_heap and reception_heap[0][0] == now:
+                _, pkt, hop = heapq.heappop(reception_heap)
+                key = (pkt, hop)
+                if key not in seen:
+                    seen.add(key)
+                    due.append(key)
+            due.sort()
+            injected = advance_inject(now)
+            next_inject = prime_inject()
+            a = b = 0
+            while a < len(due) or b < len(injected):
+                if b >= len(injected) or (a < len(due)
+                                          and due[a][0] < injected[b]):
+                    pkt, hop = due[a]
+                    slot = pending[pkt].pop(hop)
+                    if not pending[pkt]:
+                        del pending[pkt]
+                    process(pkt, hop, slot["items"], now)
+                    a += 1
+                else:
+                    pkt = injected[b]
+                    seed = new_item(pkt, 0, payload_of[pkt], None, None,
+                                    now, 0)
+                    process(pkt, 0, [seed], now)
+                    b += 1
+            if due or injected:
+                moved = True
+            if idle_heap:
+                start_heads(now)
+                moved = True
+
+    # Assemble packet rows in DATA order. A routed packet is delivered
+    # only when every final fragment arrived and its pieces re-cover the
+    # payload under reassemble's contiguity rule; any ttl or overflow
+    # item makes it incomplete. A routed packet still in flight cannot
+    # happen: the clock drains the bounded queues with no external
+    # events, so a missing piece means it ended on a drop.
+    results = []
+    for i, packet in enumerate(packets):
+        pid = packet[0]
+        ptime = packet[1]
+        st = status_of[i]
+        if st is not None:
+            if st == "delivered":
+                results.append([pid, "delivered", path_of[i],
+                                finish_of[i], finish_of[i] - ptime, [],
+                                payload_of[i].hex()])
+            else:
+                results.append([pid, "unreachable", path_of[i], None,
+                                None, [], None])
+            continue
+        frag_entries = []
+        covered = bytearray()
+        expected = 0
+        contiguous = True
+        for idx in sorted(dest_pieces[i], key=lambda j: items[j]["off"]):
+            it = items[idx]
+            blob = it["blob"]
+            off = it["off"]
+            if off != expected:
+                contiguous = False
+            expected = off + len(blob)
+            covered.extend(blob)
+            frag_entries.append([
+                off, off + len(blob) < plen_of[i], blob.hex(),
+                hashlib.sha256(blob).hexdigest(),
+                "delivered", it["end"], None, it["hops"]])
+        reassembles = (
+            contiguous and expected == plen_of[i]
+            and not bad_ttl[i] and not bad_over[i])
+        if reassembles:
+            status = "delivered"
+            payload_out = bytes(covered).hex()
+        else:
+            status = "incomplete"
+            payload_out = None
+            for idx in ttl_drop:
+                if items[idx]["pkt"] != i:
+                    continue
+                it = items[idx]
+                frag_entries.append([
+                    it["off"],
+                    it["off"] + len(it["blob"]) < plen_of[i],
+                    it["blob"].hex(),
+                    hashlib.sha256(it["blob"]).hexdigest(),
+                    "ttl", it["end"], it["dropLink"], it["hops"]])
+            for idx in over_drop:
+                if items[idx]["pkt"] != i:
+                    continue
+                it = items[idx]
+                frag_entries.append([
+                    it["off"],
+                    it["off"] + len(it["blob"]) < plen_of[i],
+                    it["blob"].hex(),
+                    hashlib.sha256(it["blob"]).hexdigest(),
+                    "overflow", it["end"], it["dropLink"], it["hops"]])
+            frag_entries.sort(key=lambda e: e[0])
+        results.append([pid, status, path_of[i], finish_of[i],
+                        finish_of[i] - ptime, frag_entries, payload_out])
 
     return {"packets": results,
             "links": [[links[i]["from"], links[i]["to"], admitted[i],
@@ -12812,6 +13258,116 @@ def main():
                 fail(5)
             packets.append((pid, time, source, destination, size))
         result = compute_netqueue(nodes, links, cap_of, packets)
+    elif argv[1] == "netfragment":
+        if len(argv) != 6:
+            fail(2)
+        file_path, queues_text, mtus_text, data_text = (
+            argv[2], argv[3], argv[4], argv[5])
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        link_pairs_set = {(l["from"], l["to"]) for l in links}
+        # Parse QUEUES, MTUS, and DATA strictly (code 4) before any
+        # structural check (code 5), in argument order.
+        try:
+            raw_queues = json.loads(queues_text,
+                                    parse_constant=_reject_constant,
+                                    parse_float=_finite_float,
+                                    object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        try:
+            raw_mtus = json.loads(mtus_text,
+                                  parse_constant=_reject_constant,
+                                  parse_float=_finite_float,
+                                  object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(raw_queues, list):
+            fail(5)
+        # QUEUES follows netqueue: every directed FILE link mapped once
+        # to a capacity in 1..MAX_COST.
+        cap_of_pair = {}
+        for item in raw_queues:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            frm, to, capacity = item
+            if type(frm) is not str or type(to) is not str:
+                fail(5)
+            pair = (frm, to)
+            if pair not in link_pairs_set or pair in cap_of_pair:
+                fail(5)
+            if type(capacity) is not int or not 1 <= capacity <= MAX_COST:
+                fail(5)
+            cap_of_pair[pair] = capacity
+        if set(cap_of_pair) != link_pairs_set:
+            fail(5)
+        cap_of = [cap_of_pair[(l["from"], l["to"])] for l in links]
+        # MTUS covers every directed FILE link exactly once the same
+        # way; mtu is a non-boolean integer in 25..MAX_COST.
+        if not isinstance(raw_mtus, list):
+            fail(5)
+        mtu_of_pair = {}
+        for item in raw_mtus:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            frm, to, mtu_value = item
+            if type(frm) is not str or type(to) is not str:
+                fail(5)
+            pair = (frm, to)
+            if pair not in link_pairs_set or pair in mtu_of_pair:
+                fail(5)
+            if type(mtu_value) is not int \
+                    or not 25 <= mtu_value <= MAX_COST:
+                fail(5)
+            mtu_of_pair[pair] = mtu_value
+        if set(mtu_of_pair) != link_pairs_set:
+            fail(5)
+        mtu_of = [mtu_of_pair[(l["from"], l["to"])] for l in links]
+        # DATA follows the two existing net entries' order, uniqueness,
+        # type, and range contracts, with ttl in place of size and a
+        # lowercase hex payload (empty allowed, at most MAX_COST bytes).
+        if not isinstance(data, list):
+            fail(5)
+        packets = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 6:
+                fail(5)
+            pid, time, source, destination, ttl, hex_text = item
+            if (type(pid) is not str or pid == ""
+                    or not 1 <= len(pid) <= MAX_FLOW_LEN
+                    or pid in seen_ids):
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_ids.add(pid)
+            if type(time) is not int or not 0 <= time <= MAX_TIME:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if source not in node_set or destination not in node_set:
+                fail(5)
+            if type(ttl) is not int or not 1 <= ttl <= MAX_COST:
+                fail(5)
+            if (type(hex_text) is not str or hex_text == ""
+                    or len(hex_text) % 2 != 0
+                    or any(ch not in "0123456789abcdef" for ch in hex_text)
+                    or len(hex_text) // 2 > MAX_COST):
+                fail(5)
+            payload = bytes.fromhex(hex_text)
+            packets.append((pid, time, source, destination, ttl, payload))
+        result = compute_netfragment(nodes, links, cap_of, mtu_of,
+                                     packets)
     elif argv[1] == "policyqueue":
         if len(argv) != 6:
             fail(2)
