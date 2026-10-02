@@ -23,6 +23,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py netimpair FILE QUEUES EVENTS DATA
        python relay.py netqdisc FILE CONFIG DATA
        python relay.py converge FILE SRC DST D R EVENTS
+       python relay.py wmconverge FILE S D W DELAY RUN EVENTS
        python relay.py policy FILE S D P C RULES
        python relay.py policytx FILE STATE OP
        python relay.py policyreplay PACK STATE TV PV DATA
@@ -65,7 +66,7 @@ for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
 policytx op 4 also OUT),
 4 JSON syntax
 (for forward/loopsafe also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/qdisc/reorder/tbucket/netqueue/netshape/netfail/netimpair/netqdisc/converge/policy/reserve/rebalance/retune also those in
+for queue/qdisc/reorder/tbucket/netqueue/netshape/netfail/netimpair/netqdisc/converge/wmconverge/policy/reserve/rebalance/retune also those in
 FILE/DATA/QUEUES/SHAPERS/CLASSES/CONFIG/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
@@ -4200,6 +4201,194 @@ def compute_converge(nodes, links, source, destination, delay, run, events):
             timeline.append(entry(now, 3))
 
     return {"timeline": timeline}
+
+
+def _wm_route_to(nodes, links, state, source, destination, weights):
+    # Best wm route to a single destination, reusing compute_wm's
+    # four-weight scoring, exact integer arithmetic, MAX_COST overflow
+    # rule, and Unicode code point tie-break. Only links whose current
+    # state is up are traversed. Returns the route tuple
+    # (q, hopCount, cost, bandwidth, latency, path), None when the
+    # destination is unreachable. The source route mirrors wm's own
+    # source entry: q = 0 and bandwidth reported as MAX_COST.
+    if source == destination:
+        return (0, 0, 0, MAX_COST, 0, [source])
+
+    a, b, c, d = weights
+    adj = {n: [] for n in nodes}
+    for link in links:
+        pair = (link["from"], link["to"])
+        if state[pair]["up"]:
+            metric = state[pair]
+            adj[link["from"]].append(
+                (link["to"], metric["cost"], metric["bandwidth"],
+                 metric["latency"]))
+
+    best_q = None
+    best_tuple = None
+
+    def consider(path, hop_count, cost, bandwidth, latency):
+        nonlocal best_q, best_tuple
+        q = (a * hop_count + b * cost + c * (MAX_COST - bandwidth)
+             + d * latency)
+        if best_q is None or q < best_q \
+                or (q == best_q and path < best_tuple[5]):
+            best_q = q
+            best_tuple = (q, hop_count, cost, bandwidth, latency,
+                          list(path))
+
+    path = [source]
+    visited = {source}
+    metrics = [(0, 0, MAX_COST, 0)]
+    stack = [iter(adj[source])]
+    while stack:
+        try:
+            to, w, bw, lat = next(stack[-1])
+        except StopIteration:
+            stack.pop()
+            if stack:
+                metrics.pop()
+                visited.remove(path.pop())
+            continue
+        if to in visited:
+            continue
+        visited.add(to)
+        path.append(to)
+        hop_count, cost, bandwidth, latency = metrics[-1]
+        entry = (hop_count + 1, cost + w, min(bandwidth, bw), latency + lat)
+        metrics.append(entry)
+        if to == destination:
+            consider(path, *entry)
+            # A simple path cannot revisit the destination after
+            # passing through it, so nothing beyond needs extending.
+            stack.append(iter(()))
+        else:
+            stack.append(iter(adj[to]))
+
+    if best_tuple is None:
+        return None
+    if best_tuple[0] > MAX_TIME:
+        fail(5)
+    return best_tuple
+
+
+def _wm_route_fields(route):
+    if route is None:
+        return [None, None, None, None, None, []]
+    q, hop_count, cost, bandwidth, latency, path = route
+    return [q, hop_count, cost, bandwidth, latency, path]
+
+
+def compute_wmconverge(nodes, links, source, destination, weights, delay,
+                       run, batches):
+    # Metric-aware debounced convergence on an explicit event clock.
+    # State holds the current up flag and three metrics of every
+    # directed link; batches at strictly increasing times apply
+    # atomically before timers at the same tick, triggers fire before
+    # same-tick installations, and a batch landing on an installation
+    # tick cancels the old candidate. A batch whose changes merely
+    # repeat stored values is idempotent and leaves any outstanding
+    # cycle untouched; any real change cancels both timers, arms a
+    # recompute at t+DELAY and an install at t+DELAY+RUN, and drops the
+    # pending candidate. The trigger reads the then-current up links
+    # and newest metrics; the installed route keeps its old path (and
+    # reported metrics) until installation, so a down link may make it
+    # unreachable, but other metric changes never replace it early.
+    state = {(link["from"], link["to"]): {
+        "up": link["up"], "cost": link["cost"],
+        "bandwidth": link["bandwidth"], "latency": link["latency"]}
+        for link in links}
+    weights = tuple(weights)
+
+    def reachable(path):
+        return all(state[pair]["up"]
+                   for pair in zip(path, path[1:]))
+
+    installed = _wm_route_to(nodes, links, state, source, destination,
+                             weights)
+
+    def entry(now, kind, changed=None, pending=None, trigger_at=None,
+              install_at=None):
+        # Fields: time, kind, batch change count (batch rows only),
+        # installed route, pending candidate, reachability of the
+        # installed route, and the two timer times (null when unarmed).
+        if installed is None:
+            live = False
+        else:
+            live = reachable(installed[5])
+        row = [now, kind]
+        if kind == 0:
+            row.append(None)
+        else:
+            row.append(changed)
+        row.append(_wm_route_fields(installed))
+        row.append(_wm_route_fields(pending))
+        row.append(live)
+        row.append(trigger_at)
+        row.append(install_at)
+        return row
+
+    timeline = [entry(0, 0, trigger_at=None, install_at=None)]
+
+    trigger_at = None
+    install_at = None
+    pending = None
+    i = 0
+    n = len(batches)
+    while i < n or trigger_at is not None or install_at is not None:
+        wakes = []
+        if i < n:
+            wakes.append(batches[i][0])
+        if trigger_at is not None:
+            wakes.append(trigger_at)
+        if install_at is not None:
+            wakes.append(install_at)
+        now = min(wakes)
+        # Every batch at this tick applies before either timer, and
+        # only the last batch in the tick reports the timer state left
+        # behind by the whole tick (repeats recorded at earlier ticks
+        # are not possible because batch times are strictly
+        # increasing).
+        batch_changed = None
+        while i < n and batches[i][0] == now:
+            t, changes = batches[i]
+            i += 1
+            real = 0
+            for field, u, v, value in changes:
+                metric = state[(u, v)]
+                if metric[field] != value:
+                    metric[field] = value
+                    real += 1
+            batch_changed = real
+            if real:
+                # Any real change cancels the unfinished cycle,
+                # including a candidate due to install at this very
+                # tick, and rearms both timers.
+                trigger_at = now + delay
+                install_at = trigger_at + run
+                if install_at > MAX_TIME:
+                    fail(5)
+                pending = None
+            timeline.append(entry(now, 1, changed=batch_changed,
+                                  pending=pending, trigger_at=trigger_at,
+                                  install_at=install_at))
+        if trigger_at is not None and trigger_at == now:
+            pending = _wm_route_to(nodes, links, state, source,
+                                   destination, weights)
+            trigger_at = None
+            timeline.append(entry(now, 2, pending=pending,
+                                  trigger_at=trigger_at,
+                                  install_at=install_at))
+        if install_at is not None and install_at == now:
+            installed = pending
+            install_at = None
+            pending = None
+            timeline.append(entry(now, 3, pending=pending,
+                                  trigger_at=trigger_at,
+                                  install_at=install_at))
+
+    return {"s": source, "d": destination, "w": list(weights),
+            "timeline": timeline, "final": _wm_route_fields(installed)}
 
 
 def _priority_order(rules):
@@ -11379,6 +11568,88 @@ def main():
                 fail(5)
         result = compute_converge(nodes, links, source, destination,
                                   delay, run, events)
+    elif argv[1] == "wmconverge":
+        if len(argv) != 9:
+            fail(2)
+        file_path, source, destination = argv[2], argv[3], argv[4]
+        weights_text, delay_text, run_text, events_text = (
+            argv[5], argv[6], argv[7], argv[8])
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        if source not in node_set or destination not in node_set \
+                or source == destination:
+            fail(5)
+        try:
+            weights = json.loads(weights_text,
+                                 parse_constant=_reject_constant,
+                                 parse_float=_finite_float,
+                                 object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if (not isinstance(weights, list) or len(weights) != 4
+                or any(type(w) is not int or not 0 <= w <= MAX_COST
+                       for w in weights)
+                or all(w == 0 for w in weights)):
+            fail(5)
+        delay = _bounded_int_arg(delay_text)
+        run = _bounded_int_arg(run_text)
+        try:
+            events = json.loads(events_text, parse_constant=_reject_constant,
+                                parse_float=_finite_float,
+                                object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(events, list) or not events:
+            fail(5)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        field_names = ("cost", "bandwidth", "latency", "up")
+        previous_time = None
+        batches = []
+        for item in events:
+            if not isinstance(item, list) or len(item) != 2:
+                fail(5)
+            time, changes = item
+            if type(time) is not int or not 0 <= time <= MAX_COST:
+                fail(5)
+            if previous_time is not None and time <= previous_time:
+                fail(5)
+            previous_time = time
+            if not isinstance(changes, list) or not changes:
+                fail(5)
+            seen_fields = set()
+            batch = []
+            for change in changes:
+                if not isinstance(change, list) or len(change) != 4:
+                    fail(5)
+                kind, frm, to, value = change
+                if type(kind) is not int or kind not in (0, 1, 2, 3):
+                    fail(5)
+                if (type(frm) is not str or type(to) is not str
+                        or (frm, to) not in pair_set):
+                    fail(5)
+                if kind == 0:
+                    if type(value) is not int \
+                            or not 1 <= value <= MAX_COST:
+                        fail(5)
+                elif kind == 1:
+                    if type(value) is not int \
+                            or not 1 <= value <= MAX_COST:
+                        fail(5)
+                elif kind == 2:
+                    if type(value) is not int \
+                            or not 0 <= value <= MAX_COST:
+                        fail(5)
+                else:
+                    if type(value) is not bool:
+                        fail(5)
+                field = field_names[kind]
+                if ((frm, to), field) in seen_fields:
+                    fail(5)
+                seen_fields.add(((frm, to), field))
+                batch.append((field, frm, to, value))
+            batches.append((time, batch))
+        result = compute_wmconverge(nodes, links, source, destination,
+                                    weights, delay, run, batches)
     elif argv[1] == "policy":
         if len(argv) != 8:
             fail(2)
