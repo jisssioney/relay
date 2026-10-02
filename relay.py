@@ -2998,6 +2998,276 @@ def compute_netqueue(nodes, links, cap_of, packets):
                       for i in range(E)]}
 
 
+def compute_netfragment(nodes, links, cap_of, mtu_of, packets):
+    # Deterministic multi-hop store-and-forward at fragment granularity,
+    # fusing compute_netqueue's explicit clock/FIFO machinery with
+    # compute_fragment's per-hop splitting. Routing is netqueue's exactly:
+    # one lowest-cost Dijkstra per distinct source over up links, keyed by
+    # (cost, Unicode node sequence); source == destination delivers at
+    # injection time without touching a link, an unreachable destination
+    # is reported without entering any queue.
+    #
+    # A packet is injected as one piece covering the whole payload.
+    # Immediately before a piece crosses a link its ttl is decremented;
+    # reaching 0 ends that fragment as a ttl leaf (recorded at the node,
+    # holding nothing). Otherwise the piece is re-split in ascending
+    # absolute-offset order with c = mtu - 24 and fragment's alignment:
+    # a remainder longer than c yields floor(c/8)*8 bytes, any other
+    # remainder is taken whole. Every resulting fragment is an independent
+    # FIFO job requesting len(data)+24 wire bytes; one that does not fit
+    # is an overflow leaf, occupies nothing, and enters no queue, while its
+    # siblings keep going. Sending takes ceil(wire/bandwidth); reception
+    # follows latency units later, where the last hop records a delivered
+    # leaf and any other hop re-enters the piece for the next decrement and
+    # possible re-split.
+    #
+    # Clock phases are netqueue's, repeated at each distinct time until
+    # the instant is stable (zero latency feeds the same slice): sends
+    # complete and release wire bytes; receptions and fresh injections due
+    # at the time are merged in DATA order and fragment offset order; then
+    # every idle link with a queued head starts it once, in FILE link
+    # order. Any computed time above MAX_TIME fails with code 5.
+    adj_of = {u: [] for u in nodes}
+    link_index = {}
+    for i, link in enumerate(links):
+        link_index[(link["from"], link["to"])] = i
+        if link["up"]:
+            adj_of[link["from"]].append((link["to"], link["cost"]))
+
+    n = len(packets)
+    paths = [None] * n
+    by_source = {}
+    for i, (_, _, source, _, _, _) in enumerate(packets):
+        by_source.setdefault(source, []).append(i)
+    for source, indices in by_source.items():
+        dist = _netqueue_dijkstra(nodes, adj_of, source)
+        for i in indices:
+            entry = dist.get(packets[i][3])
+            if entry is not None and len(entry[1]) >= 2:
+                paths[i] = list(entry[1])
+        del dist
+
+    E = len(links)
+    bw = [l["bandwidth"] for l in links]
+    lat = [l["latency"] for l in links]
+    cap = [cap_of[i] for i in range(E)]
+    mtu = [mtu_of[i] for i in range(E)]
+    occupancy = [0] * E
+    queues = [deque() for _ in range(E)]   # admitted job ids
+    busy = [False] * E
+    admitted = [0] * E
+    overflows = [0] * E
+    peak = [0] * E
+    last_depart = [0] * E
+
+    # jobs[j] = [packet, absOffset, blob, ttl, hopIndex, wireSize]
+    jobs = []
+    # leaves[i] keeps one dict per final fragment: keys off, blob (None is
+    # impossible: even a dropped leaf carried bytes), status, finish,
+    # drop, hops.
+    leaves = [[] for _ in range(n)]
+
+    # Terminal packets that never touch the clock, as in netqueue:
+    # [status, path, finish, delay]; zero-hop delivers, else unreachable.
+    presets = [None] * n
+    for i, (_, ptime, source, destination, _, _) in enumerate(packets):
+        path = paths[i]
+        if path is not None:
+            continue
+        if source == destination:
+            presets[i] = ("delivered", [source], ptime, 0)
+        else:
+            presets[i] = ("unreachable", [], None, None)
+
+    def check_time(value):
+        if value > MAX_TIME:
+            fail(5)
+        return value
+
+    def record_leaf(i, off, blob, status, now, drop_link, hops):
+        leaves[i].append({"off": off, "blob": blob, "status": status,
+                          "finish": now, "drop": drop_link, "hops": hops})
+
+    def admit_piece(i, now, off, blob, ttl, k):
+        # Piece (off, blob) is whole at path[k], about to cross hop k.
+        path = paths[i]
+        frm, to = path[k], path[k + 1]
+        li = link_index[(frm, to)]
+        ttl -= 1
+        if ttl == 0:
+            record_leaf(i, off, blob, "ttl", now, [frm, to], k)
+            return
+        c = mtu[li] - 24
+        length = len(blob)
+        pos = 0
+        while pos < length:
+            remaining = length - pos
+            if remaining > c:
+                take = (c // 8) * 8
+            else:
+                take = remaining
+            if take == 0:
+                fail(5)
+            coff = off + pos
+            cblob = blob[pos:pos + take]
+            size = take + 24
+            if occupancy[li] + size > cap[li]:
+                # Overflow occupies nothing and skips the queue; the
+                # remaining siblings are still admitted in order.
+                overflows[li] += 1
+                record_leaf(i, coff, cblob, "overflow", now,
+                            [frm, to], k)
+            else:
+                jobid = len(jobs)
+                jobs.append([i, coff, cblob, ttl, k, size])
+                occupancy[li] += size
+                if occupancy[li] > peak[li]:
+                    peak[li] = occupancy[li]
+                admitted[li] += 1
+                queues[li].append(jobid)
+                if not busy[li]:
+                    heapq.heappush(idle_heap, li)
+            pos += take
+
+    completion_heap = []
+    reception_heap = []
+    idle_heap = []
+
+    def release(now, jobid, li):
+        job = jobs[jobid]
+        i, off, blob, _ttl, k, size = job
+        occupancy[li] -= size
+        busy[li] = False
+        last_depart[li] = now
+        if queues[li]:
+            heapq.heappush(idle_heap, li)
+        receive = check_time(now + lat[li])
+        if k + 1 == len(paths[i]) - 1:
+            record_leaf(i, off, blob, "delivered", receive, None, k + 1)
+        else:
+            heapq.heappush(reception_heap, (receive, i, off, jobid))
+
+    def start_heads(now):
+        while idle_heap:
+            li = heapq.heappop(idle_heap)
+            if busy[li] or not queues[li]:
+                continue
+            jobid = queues[li].popleft()
+            size = jobs[jobid][5]
+            depart = check_time(now + (size + bw[li] - 1) // bw[li])
+            busy[li] = True
+            heapq.heappush(completion_heap, (depart, li, jobid))
+
+    inject_at = 0
+
+    def prime_inject():
+        j = inject_at
+        while j < n and paths[j] is None:
+            j += 1
+        return packets[j][1] if j < n else None
+
+    def advance_inject(now):
+        nonlocal inject_at
+        due_list = []
+        while inject_at < n and packets[inject_at][1] <= now:
+            if paths[inject_at] is not None:
+                due_list.append(inject_at)
+            inject_at += 1
+        return due_list
+
+    next_inject = prime_inject()
+
+    def next_time():
+        t = next_inject
+        if completion_heap:
+            ct = completion_heap[0][0]
+            if t is None or ct < t:
+                t = ct
+        if reception_heap:
+            rt = reception_heap[0][0]
+            if t is None or rt < t:
+                t = rt
+        return t
+
+    while True:
+        now = next_time()
+        if now is None:
+            break
+        check_time(now)
+        moved = True
+        while moved:
+            moved = False
+            while completion_heap and completion_heap[0][0] == now:
+                _, li, jobid = heapq.heappop(completion_heap)
+                release(now, jobid, li)
+                moved = True
+            # Merge due receptions with due injections: DATA index first,
+            # then fragment offset within a packet. A fresh injection is
+            # the single whole-payload piece at offset 0.
+            events = []
+            while reception_heap and reception_heap[0][0] == now:
+                _, i, off, jobid = heapq.heappop(reception_heap)
+                events.append((i, off, 1, jobid))
+            for i in advance_inject(now):
+                events.append((i, 0, 0, None))
+            next_inject = prime_inject()
+            events.sort(key=lambda e: (e[0], e[1], e[2]))
+            for i, _off, kind, jobid in events:
+                if kind == 0:
+                    admit_piece(i, now, 0, packets[i][5], packets[i][4], 0)
+                else:
+                    _pi, coff, cblob, cttl, k, _sz = jobs[jobid]
+                    admit_piece(i, now, coff, cblob, cttl, k + 1)
+            if events:
+                moved = True
+            if idle_heap:
+                start_heads(now)
+                moved = True
+
+    results = []
+    for i, (pid, ptime, _s, _d, _ttl, payload) in enumerate(packets):
+        preset = presets[i]
+        if preset is not None:
+            status, path, finish, delay = preset
+            item = [pid, status, path, finish, delay, []]
+            if status == "delivered":
+                item.append(payload.hex())
+            results.append(item)
+            continue
+        pieces = sorted(leaves[i], key=lambda z: z["off"])
+        payload_len = len(payload)
+        covered = True
+        assembled = bytearray()
+        expected = 0
+        for z in pieces:
+            if z["status"] != "delivered" or z["off"] != expected:
+                covered = False
+                break
+            assembled.extend(z["blob"])
+            expected += len(z["blob"])
+        if covered and (expected != payload_len
+                        or bytes(assembled) != payload):
+            covered = False
+        status = "delivered" if covered else "incomplete"
+        finish = max(z["finish"] for z in pieces)
+        fragments = []
+        for z in pieces:
+            blob = z["blob"]
+            fragments.append([
+                z["off"], z["off"] + len(blob) < payload_len,
+                blob.hex(), hashlib.sha256(blob).hexdigest(),
+                z["status"], z["finish"], z["drop"], z["hops"]])
+        item = [pid, status, paths[i], finish, finish - ptime, fragments]
+        if covered:
+            item.append(payload.hex())
+        results.append(item)
+
+    return {"packets": results,
+            "links": [[links[i]["from"], links[i]["to"], admitted[i],
+                       overflows[i], peak[i], last_depart[i]]
+                      for i in range(E)]}
+
+
 def compute_policyqueue(nodes, links, cap_of, packets, rules):
     # Policy routing merged with compute_netqueue's deterministic
     # multi-hop store-and-forward on one explicit event clock. Each
@@ -12812,6 +13082,112 @@ def main():
                 fail(5)
             packets.append((pid, time, source, destination, size))
         result = compute_netqueue(nodes, links, cap_of, packets)
+    elif argv[1] == "netfragment":
+        if len(argv) != 6:
+            fail(2)
+        file_path, queues_text, mtus_text, data_text = (
+            argv[2], argv[3], argv[4], argv[5])
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        link_pairs_set = {(l["from"], l["to"]) for l in links}
+        # Parse every inline JSON argument (code 4) before any structural
+        # check (code 5), so a syntax error in QUEUES, MTUS, or DATA is
+        # reported first.
+        try:
+            raw_queues = json.loads(queues_text,
+                                    parse_constant=_reject_constant,
+                                    parse_float=_finite_float,
+                                    object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        try:
+            raw_mtus = json.loads(mtus_text,
+                                  parse_constant=_reject_constant,
+                                  parse_float=_finite_float,
+                                  object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(raw_queues, list):
+            fail(5)
+        cap_of_pair = {}
+        for item in raw_queues:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            frm, to, capacity = item
+            if type(frm) is not str or type(to) is not str:
+                fail(5)
+            pair = (frm, to)
+            if pair not in link_pairs_set or pair in cap_of_pair:
+                fail(5)
+            if type(capacity) is not int or not 1 <= capacity <= MAX_COST:
+                fail(5)
+            cap_of_pair[pair] = capacity
+        if set(cap_of_pair) != link_pairs_set:
+            fail(5)
+        cap_of = [cap_of_pair[(l["from"], l["to"])] for l in links]
+        # MTUS exactly covers every directed FILE link, once each, with a
+        # non-boolean mtu in 25..MAX_COST (below 25 no payload fits next to
+        # the 24-byte header under the 8-byte alignment rule).
+        if not isinstance(raw_mtus, list):
+            fail(5)
+        mtu_of_pair = {}
+        for item in raw_mtus:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            frm, to, link_mtu = item
+            if type(frm) is not str or type(to) is not str:
+                fail(5)
+            pair = (frm, to)
+            if pair not in link_pairs_set or pair in mtu_of_pair:
+                fail(5)
+            if type(link_mtu) is not int \
+                    or not 25 <= link_mtu <= MAX_COST:
+                fail(5)
+            mtu_of_pair[pair] = link_mtu
+        if set(mtu_of_pair) != link_pairs_set:
+            fail(5)
+        mtu_of = [mtu_of_pair[(l["from"], l["to"])] for l in links]
+        if not isinstance(data, list):
+            fail(5)
+        packets = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 6:
+                fail(5)
+            pid, time, source, destination, ttl, hex_text = item
+            if (type(pid) is not str or pid == ""
+                    or not 1 <= len(pid) <= MAX_FLOW_LEN
+                    or pid in seen_ids):
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_ids.add(pid)
+            if type(time) is not int or not 0 <= time <= MAX_TIME:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if source not in node_set or destination not in node_set:
+                fail(5)
+            if type(ttl) is not int or not 1 <= ttl <= MAX_COST:
+                fail(5)
+            if (type(hex_text) is not str or hex_text == ""
+                    or len(hex_text) % 2 != 0
+                    or any(ch not in "0123456789abcdef" for ch in hex_text)
+                    or len(hex_text) // 2 > MAX_COST):
+                fail(5)
+            packets.append((pid, time, source, destination, ttl,
+                            bytes.fromhex(hex_text)))
+        result = compute_netfragment(nodes, links, cap_of, mtu_of, packets)
     elif argv[1] == "policyqueue":
         if len(argv) != 6:
             fail(2)
