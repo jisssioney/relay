@@ -146,7 +146,26 @@ atomic replace in the canonical compact UTF-8 form with one trailing
 LF (directly usable as a PACK), skipping the replace when OUT already
 holds those exact bytes (status 1), and on a write failure leaving
 PACK and OUT's bytes untouched and removing only its own staging temp
-file; for
+file; config op 15 code 5 also covers an m outside 0/1, an A that is
+not a non-empty path or that names PACK, a b that conflicts with the
+current v (mode 0) or the archive's v (mode 1), an archive pack whose
+v/t/p/h structure, key order, topology, or version continuity is
+invalid, an archive object that is not byte-equivalent to the current
+PACK, and an archive terminal t/p that does not match an already
+minimal PACK, and code 3 an A read error in mode 1 (an absent A is a
+read error) or an A/PACK write error and code 4 an A with invalid
+UTF-8/JSON syntax, duplicate keys, or non-finite numbers; op 15 mode 0
+archives the fully validated current PACK byte-for-byte into A in the
+canonical compact UTF-8 form with one trailing LF via one atomic
+replace, skipping it when A already holds those exact bytes (status 1)
+and never modifying PACK; op 15 mode 1 requires A.v == b and A's
+object to equal the current PACK exactly, then atomically replaces
+PACK with the minimal {"v":0,"t":t,"p":p,"h":[[0,t,p]]} pack using the
+archive's terminal t/p (status 0), and is idempotent (status 1, no
+write) when PACK is already that minimal form with the archive's
+terminal t/p and A.v == b; at most one of PACK/A is rewritten per
+call, and on any failure both keep their original bytes with only the
+call's staging temp file removed; for
 compoundcp code 3 also covers a STATE read/write error and code 5
 also covers a STATE whose key order, content, or h digest is invalid,
 an e/p entry that is not item-by-item what compound emits, e/p times
@@ -9966,6 +9985,32 @@ def _policytx_export_object(v, rules, history):
                   for hv, hr in history]}
 
 
+def _ensure_paths_distinct(path_a, path_b):
+    # Reject (code 5) when two non-empty NUL-free paths name the same
+    # file, compared both as abspath strings and, when both exist on
+    # disk, by os.path.samefile (so hard links collapse too). Any other
+    # stat problem on an existing path pair is code 3.
+    if type(path_a) is not str or path_a == "" or "\x00" in path_a \
+            or type(path_b) is not str or path_b == "" or "\x00" in path_b:
+        fail(5)
+    try:
+        norm_a = os.path.abspath(path_a)
+        norm_b = os.path.abspath(path_b)
+    except (OSError, ValueError):
+        fail(5)
+    if norm_a == norm_b:
+        fail(5)
+    try:
+        if os.path.samefile(norm_a, norm_b):
+            fail(5)
+    except FileNotFoundError:
+        # At least one side does not exist: they cannot be the same
+        # file on disk, and the normalized strings already differ.
+        pass
+    except OSError:
+        fail(3)
+
+
 def _write_distinct_atomic(dst_path, blocked_paths, payload):
     # Atomically write payload to dst_path via an exclusively created
     # sibling temp file, but only when dst does not already hold those
@@ -10471,6 +10516,73 @@ def _config_export_compact(pack_path, v, topo, policy, base, out_path):
     status = _write_distinct_atomic(out_path, [pack_path], payload)
     return {"op": 14, "status": status, "sourceVersion": v,
             "config": compact}
+
+
+def _config_archive(pack_path, pack, v, topo, policy, mode, base,
+                    archive_path):
+    # Archive-assisted history compaction (config op 15):
+    # [15, m, b, A]. The archive preserves the verifiable long history
+    # while the in-use PACK shrinks to the minimal version-zero form;
+    # topology, policy, and route computation are untouched.
+    #
+    # mode 0 (generate the archive) requires b == v and writes the
+    # fully validated current PACK byte-for-byte to A in the canonical
+    # compact UTF-8 form with one trailing LF via one atomic replace, or
+    # nothing when A already holds those exact bytes (status 1); PACK is
+    # never modified. mode 1 (commit the compaction) reads and fully
+    # validates A (absent or unreadable is code 3; UTF-8/JSON syntax,
+    # duplicate keys, and non-finite numbers code 4) and requires A.v ==
+    # b and A's object to equal the current PACK exactly; it then
+    # atomically replaces PACK with the minimal
+    # {"v":0,"t":t,"p":p,"h":[[0,t,p]]} pack whose t/p come from the
+    # archive's terminal state. Repeating the same commit against an
+    # already minimal PACK whose terminal t/p matches A and with A.v == b
+    # is idempotent (status 1, no write); every other version conflict,
+    # archive content difference, or terminal-state mismatch is code 5.
+    # A must be a non-empty path naming a different file than PACK in
+    # both modes. On any failure PACK and A keep their original bytes
+    # and only this call's staging temp file is removed; at most one of
+    # the two files is rewritten. O(|PACK| + |A|) time and space.
+    if mode == 0:
+        _ensure_paths_distinct(archive_path, pack_path)
+        if base != v:
+            fail(5)
+        payload = _state_payload(pack)
+        try:
+            with open(archive_path, "rb") as f:
+                existing = f.read()
+        except FileNotFoundError:
+            existing = None
+        except OSError:
+            fail(3)
+        if existing == payload:
+            # A already holds the canonical archive bytes: do not write.
+            return {"op": 15, "mode": 0, "status": 1,
+                    "sourceVersion": base, "config": pack}
+        _write_state_atomic(archive_path, pack)
+        return {"op": 15, "mode": 0, "status": 0,
+                "sourceVersion": base, "config": pack}
+    _ensure_paths_distinct(archive_path, pack_path)
+    raw_archive = _load_state(archive_path)
+    a_v, a_topo, a_policy, a_history = _validate_config_pack(raw_archive)
+    archive = {"v": a_v, "t": a_topo, "p": a_policy, "h": a_history}
+    compact = {"v": 0, "t": a_topo, "p": a_policy,
+               "h": [[0, a_topo, a_policy]]}
+    if v == 0:
+        # PACK is already the minimal form: the same commit is simply
+        # repeated when A.v == b and the archive's terminal t/p match
+        # PACK; any other version conflict or terminal mismatch rejects.
+        if a_v != base or a_topo != topo or a_policy != policy:
+            fail(5)
+        return {"op": 15, "mode": 1, "status": 1,
+                "sourceVersion": base, "config": pack}
+    if a_v != base or archive != pack:
+        # Version conflict with b, or the archive is not the exact
+        # pre-compaction PACK object.
+        fail(5)
+    _write_state_atomic(pack_path, compact)
+    return {"op": 15, "mode": 1, "status": 0,
+            "sourceVersion": base, "config": compact}
 
 
 def _config_rollback_log(pack_path, pack, v, history, mode, base, log,
@@ -15459,6 +15571,22 @@ def main():
                     or type(op[2]) is not str or len(op[2]) == 0:
                 fail(5)
             base, out_path = op[1], op[2]
+        elif kind == 15:
+            # [15, m, b, A]: archive-assisted compaction. m is 0
+            # (generate the archive into A, PACK untouched) or 1
+            # (read A and atomically compact PACK); b is a bounded
+            # non-boolean integer, the caller-observed pre-compaction
+            # version; A a non-empty path that must not name PACK. The
+            # b conflict with v (mode 0), the archive read/validation
+            # (mode 1), and the same-file check run after PACK
+            # validation in _config_archive.
+            if len(op) != 4 or type(op[1]) is not int \
+                    or op[1] not in (0, 1) \
+                    or type(op[2]) is not int \
+                    or not 0 <= op[2] <= MAX_COST \
+                    or type(op[3]) is not str or len(op[3]) == 0:
+                fail(5)
+            mode, base, archive_path = op[1], op[2], op[3]
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -15535,6 +15663,9 @@ def main():
         elif kind == 14:
             result = _config_export_compact(pack_path, v, topo, policy,
                                             base, out_path)
+        elif kind == 15:
+            result = _config_archive(pack_path, pack, v, topo, policy,
+                                     mode, base, archive_path)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
