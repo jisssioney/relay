@@ -19,6 +19,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py reorder FILE FROM TO BASE WINDOW DATA
        python relay.py tbucket FILE FROM TO BURST CAP DATA
        python relay.py netqueue FILE QUEUES DATA
+       python relay.py policyqueue FILE QUEUES RULES DATA
        python relay.py ecmpqueue FILE QUEUES MODE DATA
        python relay.py netshape FILE SHAPERS DATA
        python relay.py netfail FILE QUEUES EVENTS DATA
@@ -68,7 +69,7 @@ for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
 policytx op 4 also OUT),
 4 JSON syntax
 (for forward/loopsafe also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/qdisc/reorder/tbucket/netqueue/ecmpqueue/netshape/netfail/netimpair/netqdisc/converge/ecmpconverge/policy/reserve/rebalance/retune also those in
+for queue/qdisc/reorder/tbucket/netqueue/policyqueue/ecmpqueue/netshape/netfail/netimpair/netqdisc/converge/ecmpconverge/policy/reserve/rebalance/retune also those in
 FILE/DATA/QUEUES/SHAPERS/CLASSES/CONFIG/EVENTS/FLOWS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
@@ -85,7 +86,12 @@ snapshot those in STATE/OP/IN, for config those in PACK/OP/IN/OUT, for
 policytx those in STATE/OP, for policyreplay those in PACK/STATE/DATA),
 5 FLOW/ORDER/DELAY/EVENTS/LIMIT/TABLE/CAP/STEP/BASE/WINDOW/BURST/SHAPERS/DATA/CLASSES/D/R/
 P/C/RULES/A/B/W/POLICY/OLD/CUR/NEW/STATE/OP/schema/topology/
-unknown-node/overflow/re-failure error; for hotload code 5 also covers
+unknown-node/overflow/re-failure error; for policyqueue the code 5
+checks cover QUEUES's 1:1 link coverage and capacities, RULES's
+policytx rule shape (endpoint/path-node/edge existence, simple paths,
+first/last match, and every port/class/range field), DATA's
+[id,time,source,destination,size,port,class] contract, and any computed
+time above MAX_TIME; for hotload code 5 also covers
 a STATE whose v/p/h structure, version continuity, or version conflict
 is invalid; for snapshot code 5 also covers an invalid OP shape, path,
 or BASE, a STATE/IN whose v/p/h structure, key order, or version
@@ -817,6 +823,50 @@ admissions, overflow the failed ones, peak the highest simultaneous
 occupancy, and lastDepart the last send completion time (0 for a link
 that never sent). Worst case is O(S((V+E) log V) + H log(P+E)) for S
 distinct sources and H actual hops, with O(V+E+P+H) extra space.
+policyqueue is read-only and takes FILE QUEUES RULES DATA, merging
+policytx policy routing with netqueue's deterministic multi-hop
+store-and-forward FIFO clock on one explicit event clock. FILE/QUEUES
+reuse netqueue's exact topology and capacity rules, and RULES is a
+policytx rule set ([n,s,d,a,b,c,path] rules, c null acting as the
+class wildcard); a rule path may hold a down edge and such a rule
+simply never binds, but every endpoint and path node must exist, every
+directed path edge must name a FILE pair, the path must be simple, and
+path[0]/path[-1] must equal s/d or the RULES input is code 5. DATA is a
+JSON array, possibly empty, times non-decreasing in array order, of
+[id,time,source,destination,size,port,class] items: id, time,
+source/destination, and size follow netqueue's exact contract, port is
+a non-boolean integer in 0..65535, and class a 1..32 codepoint UTF-8
+string. Each packet's path is fixed at injection: rules are considered
+by ascending n with ties in array order (_priority_order), endpoint,
+port interval (a <= port <= b), and class matching as in policytx, and
+the first rule whose path is entirely up supplies the explicit path
+and is recorded by its array index. With no usable rule the packet
+falls back to netqueue's lowest-cost up path with the Unicode node
+sequence tie-break (one Dijkstra per distinct fallback source) and rule
+null; source == destination delivers immediately at the injection time
+with zero hops and rule null, and a fallback with no route reports
+unreachable. Congestion never reroutes. Whole-packet admission,
+capacity occupancy, non-preemptive FIFO service, ceil(size/bandwidth)
+sends, latency receptions, same-instant ordering, overflow, and time
+overflow all follow netqueue verbatim. Result top-level key order is
+packets,links. Each packet row is
+[id,class,status,rule,path,finish,delay,dropLink,hops] in DATA order:
+rule is the matched rule's original array index, null on fallback, for
+the zero-hop row, and for unreachable rows; path, finish, delay,
+dropLink, the per-hop objects, and all null conventions follow netqueue
+(a zero-hop row has finish equal to the injection time and delay 0; an
+unreachable row has null finish/delay/dropLink, path [], and no hops;
+an overflow hop carries only its arrive). links follows FILE order as
+[from,to,enqueued,overflow,peak,lastDepart]. Validation finishes before
+the clock starts: a wrong argument count exits 2, a FILE read error 3,
+a strict JSON syntax error in QUEUES/RULES/DATA (including duplicate
+keys and non-finite numbers) 4, and every other structural, range,
+reference, or computed-time overflow 5; on failure stdout is empty and
+stderr carries only {"error":N} plus LF. Success writes compact UTF-8
+JSON plus LF, byte-identical for identical input, and writes no files.
+Worst case is O(NKV + S((V+E) log V) + H log(N+E)) for N packets, K
+rules, S distinct fallback sources, and H actual hops, with
+O(V+E+KV+NV+H) extra space.
 ecmpqueue is read-only and takes FILE QUEUES MODE DATA, combining
 dispatch's equal-cost path sharing with netqueue's deterministic
 multi-hop store-and-forward FIFO clock on one explicit event clock.
@@ -3043,6 +3093,266 @@ def compute_ecmpqueue(nodes, links, cap_of, packets, mode):
         nonlocal inject_at
         due_list = []
         while inject_at < n and packets[inject_at][2] <= now:
+            if paths[inject_at] is not None:
+                due_list.append(inject_at)
+            inject_at += 1
+        return due_list
+
+    next_inject = prime_inject()
+
+    def next_time():
+        t = next_inject
+        if completion_heap:
+            ct = completion_heap[0][0]
+            if t is None or ct < t:
+                t = ct
+        if reception_heap:
+            rt = reception_heap[0][0]
+            if t is None or rt < t:
+                t = rt
+        return t
+
+    while True:
+        now = next_time()
+        if now is None:
+            break
+        check_time(now)
+        moved = True
+        while moved:
+            moved = False
+            while completion_heap and completion_heap[0][0] == now:
+                _, li, i = heapq.heappop(completion_heap)
+                release(now, i, li)
+                moved = True
+            due = []
+            while reception_heap and reception_heap[0][0] == now:
+                _, i = heapq.heappop(reception_heap)
+                due.append(i)
+            injected = advance_inject(now)
+            next_inject = prime_inject()
+            a = b = 0
+            while a < len(due) or b < len(injected):
+                if b >= len(injected) or (a < len(due)
+                                          and due[a] < injected[b]):
+                    admit(due[a], now)
+                    a += 1
+                else:
+                    admit(injected[b], now)
+                    b += 1
+            if due or injected:
+                moved = True
+            if idle_heap:
+                start_heads(now)
+                moved = True
+
+    return {"packets": results,
+            "links": [[links[i]["from"], links[i]["to"], admitted[i],
+                       overflows[i], peak[i], last_depart[i]]
+                      for i in range(E)]}
+
+
+def compute_policyqueue(nodes, links, cap_of, packets, rules):
+    # policytx policy routing merged with compute_netqueue's deterministic
+    # multi-hop store-and-forward on one explicit event clock.
+    #
+    # Each packet's path is fixed at injection. Rules are considered by
+    # ascending n with ties keeping array order (_priority_order, as in
+    # compute_policytx): the first rule whose endpoints equal the
+    # packet's source/destination, whose [a, b] interval holds the port,
+    # whose class matches (null is the wildcard), and whose explicit
+    # path has no down edge is selected; the packet keeps that path and
+    # records the rule's array index. With no usable rule the packet
+    # falls back to netqueue's lowest-cost up-only path (one Dijkstra per
+    # distinct fallback source, Unicode node sequence tie-break) with
+    # rule null. source == destination delivers immediately with zero
+    # hops and rule null; a fallback destination with no route is
+    # unreachable and enters no queue. Congestion never reroutes.
+    #
+    # The clock, FIFO capacity accounting, ceil(size/bandwidth) sends,
+    # latency receptions, overflow handling, and same-instant phase order
+    # are compute_netqueue's verbatim.
+    adj_of = {u: [] for u in nodes}
+    link_index = {}
+    up_of = {}
+    for i, link in enumerate(links):
+        pair = (link["from"], link["to"])
+        link_index[pair] = i
+        up_of[pair] = link["up"]
+        if link["up"]:
+            adj_of[link["from"]].append((link["to"], link["cost"]))
+
+    n = len(packets)
+    paths = [None] * n
+    rule_hit = [None] * n
+
+    # Rule usability is static (the up topology never changes during the
+    # run): precompute it once in O(KV) instead of rewalking candidate
+    # paths for every packet.
+    usable = []
+    for rule in rules:
+        rpath = rule[6]
+        ok = True
+        for x, y in zip(rpath, rpath[1:]):
+            if not up_of[(x, y)]:
+                ok = False
+                break
+        usable.append(ok)
+    order = _priority_order(rules)
+
+    # First usable match per packet, endpoints then port interval then
+    # class as in compute_policytx. Unmatched non-zero-hop packets are
+    # grouped by source for one fallback Dijkstra each.
+    fallback_by_source = {}
+    for i, (_, _, source, destination, _, port, klass) in enumerate(
+            packets):
+        if source == destination:
+            continue
+        for ri in order:
+            _, s, d, a, b, c, rpath = rules[ri]
+            if s != source or d != destination:
+                continue
+            if not a <= port <= b:
+                continue
+            if c is not None and c != klass:
+                continue
+            if not usable[ri]:
+                # A path with a down edge is skipped, not fallen back
+                # from within this scan; only no usable match at all
+                # reaches the lowest-cost fallback.
+                continue
+            paths[i] = list(rpath)
+            rule_hit[i] = ri
+            break
+        if paths[i] is None:
+            fallback_by_source.setdefault(source, []).append(i)
+    for source, indices in fallback_by_source.items():
+        dist = _netqueue_dijkstra(nodes, adj_of, source)
+        for i in indices:
+            entry = dist.get(packets[i][3])
+            if entry is not None and len(entry[1]) >= 2:
+                paths[i] = list(entry[1])
+        del dist
+
+    E = len(links)
+    bw = [l["bandwidth"] for l in links]
+    lat = [l["latency"] for l in links]
+    cap = [cap_of[i] for i in range(E)]
+    occupancy = [0] * E
+    queues = [deque() for _ in range(E)]   # admitted packet indices
+    busy = [False] * E
+    admitted = [0] * E
+    overflows = [0] * E
+    peak = [0] * E
+    last_depart = [0] * E
+
+    # results[i] = [id, class, status, rule, path, finish, delay,
+    #               dropLink, hops]
+    # hops is a list of per-hop dicts in traversal order.
+    results = [[pid, klass, None, None, None, None, None, None, []]
+               for pid, _, _, _, _, _, klass in packets]
+    # hop_at[i] is the link index of the hop the packet is about to cross.
+    hop_at = [0] * n
+
+    # Resolve packets that never touch the clock.
+    for i, (_, ptime, source, destination, _, _, _) in enumerate(packets):
+        path = paths[i]
+        if path is not None:
+            results[i][3] = rule_hit[i]
+            results[i][4] = path
+            continue
+        if source == destination:
+            results[i][2] = "delivered"
+            results[i][4] = [source]
+            results[i][5] = ptime
+            results[i][6] = 0
+        else:
+            results[i][2] = "unreachable"
+            results[i][4] = []
+
+    def check_time(value):
+        if value > MAX_TIME:
+            fail(5)
+        return value
+
+    completion_heap = []
+    reception_heap = []
+    idle_heap = []
+
+    def admit(i, now):
+        # Packet i is whole at its hop_at[i] link: test capacity once.
+        path = paths[i]
+        k = hop_at[i]
+        frm, to = path[k], path[k + 1]
+        li = link_index[(frm, to)]
+        hop = {"from": frm, "to": to, "arrive": now, "start": None,
+               "depart": None, "receive": None, "wait": None}
+        results[i][8].append(hop)
+        size = packets[i][4]
+        if occupancy[li] + size > cap[li]:
+            results[i][2] = "overflow"
+            results[i][7] = [frm, to]
+            overflows[li] += 1
+            return
+        occupancy[li] += size
+        if occupancy[li] > peak[li]:
+            peak[li] = occupancy[li]
+        admitted[li] += 1
+        queues[li].append(i)
+        if not busy[li]:
+            heapq.heappush(idle_heap, li)
+
+    def release(now, i, li):
+        # Waiting and sending both held these bytes until now.
+        occupancy[li] -= packets[i][4]
+        busy[li] = False
+        last_depart[li] = now
+        if queues[li]:
+            heapq.heappush(idle_heap, li)
+        receive = check_time(now + lat[li])
+        results[i][8][-1]["receive"] = receive
+        path = paths[i]
+        if hop_at[i] + 1 == len(path) - 1:
+            # Reception reaches the destination: deliver at receive.
+            results[i][2] = "delivered"
+            results[i][5] = receive
+            results[i][6] = receive - packets[i][1]
+        else:
+            hop_at[i] += 1
+            heapq.heappush(reception_heap, (receive, i))
+
+    def start_heads(now):
+        # One FILE-order pass over links that became startable; each
+        # link starts at most its single head here.
+        while idle_heap:
+            li = heapq.heappop(idle_heap)
+            if busy[li] or not queues[li]:
+                continue
+            i = queues[li].popleft()
+            size = packets[i][4]
+            depart = check_time(now + (size + bw[li] - 1) // bw[li])
+            busy[li] = True
+            hop = results[i][8][-1]
+            hop["start"] = now
+            hop["depart"] = depart
+            hop["wait"] = now - hop["arrive"]
+            heapq.heappush(completion_heap, (depart, li, i))
+
+    inject_at = 0
+
+    def prime_inject():
+        j = inject_at
+        while j < n and paths[j] is None:
+            j += 1
+        return packets[j][1] if j < n else None
+
+    def advance_inject(now):
+        # Consume every entry with injection time <= now (the clock only
+        # jumps forward, so these are exactly the due ones), return the
+        # routed ones in DATA order, and skip unrouted entries. O(N) over
+        # the whole run.
+        nonlocal inject_at
+        due_list = []
+        while inject_at < n and packets[inject_at][1] <= now:
             if paths[inject_at] is not None:
                 due_list.append(inject_at)
             inject_at += 1
@@ -11655,6 +11965,100 @@ def main():
                 fail(5)
             packets.append((pid, time, source, destination, size))
         result = compute_netqueue(nodes, links, cap_of, packets)
+    elif argv[1] == "policyqueue":
+        if len(argv) != 6:
+            fail(2)
+        file_path, queues_text, rules_text, data_text = (
+            argv[2], argv[3], argv[4], argv[5])
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        # All three inline inputs are parsed (code 4) before any
+        # structural check (code 5), in argument order, so a syntax
+        # error anywhere is reported before a schema error.
+        try:
+            raw_queues = json.loads(queues_text,
+                                    parse_constant=_reject_constant,
+                                    parse_float=_finite_float,
+                                    object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        try:
+            raw_rules = json.loads(rules_text,
+                                   parse_constant=_reject_constant,
+                                   parse_float=_finite_float,
+                                   object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        # QUEUES follows netqueue: every directed FILE link mapped once.
+        link_pairs_set = {(l["from"], l["to"]) for l in links}
+        if not isinstance(raw_queues, list):
+            fail(5)
+        cap_of_pair = {}
+        for item in raw_queues:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            frm, to, capacity = item
+            if type(frm) is not str or type(to) is not str:
+                fail(5)
+            pair = (frm, to)
+            if pair not in link_pairs_set or pair in cap_of_pair:
+                fail(5)
+            if type(capacity) is not int or not 1 <= capacity <= MAX_COST:
+                fail(5)
+            cap_of_pair[pair] = capacity
+        if set(cap_of_pair) != link_pairs_set:
+            fail(5)
+        cap_of = [cap_of_pair[(l["from"], l["to"])] for l in links]
+        # RULES is a policytx rule set; a path may hold a down edge
+        # (such a rule simply never binds), but endpoints, nodes, edges,
+        # simplicity, and the first/last match are all enforced here.
+        rules = _validate_policytx_rules(raw_rules, node_set,
+                                         link_pairs_set)
+        if not isinstance(data, list):
+            fail(5)
+        packets = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 7:
+                fail(5)
+            pid, time, source, destination, size, port, klass = item
+            if (type(pid) is not str or pid == ""
+                    or not 1 <= len(pid) <= MAX_FLOW_LEN
+                    or pid in seen_ids):
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_ids.add(pid)
+            if type(time) is not int or not 0 <= time <= MAX_TIME:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if source not in node_set or destination not in node_set:
+                fail(5)
+            if type(size) is not int or not 1 <= size <= MAX_COST:
+                fail(5)
+            if type(port) is not int or not 0 <= port <= 65535:
+                fail(5)
+            if type(klass) is not str or not 1 <= len(klass) <= 32:
+                fail(5)
+            try:
+                klass.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            packets.append((pid, time, source, destination, size,
+                            port, klass))
+        result = compute_policyqueue(nodes, links, cap_of, packets,
+                                     rules)
     elif argv[1] == "ecmpqueue":
         if len(argv) != 6:
             fail(2)
