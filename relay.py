@@ -25,6 +25,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py netfail FILE QUEUES EVENTS DATA
        python relay.py policyfail FILE QUEUES RULES EVENTS DATA
        python relay.py netimpair FILE QUEUES EVENTS DATA
+       python relay.py netreorder FILE QUEUES EVENTS WINDOW WAIT DATA
        python relay.py netqdisc FILE CONFIG DATA
        python relay.py converge FILE SRC DST D R EVENTS
        python relay.py ecmpconverge FILE SOURCE DESTINATION DELAY RUN FLOWS EVENTS
@@ -70,7 +71,7 @@ for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
 policytx op 4 also OUT),
 4 JSON syntax
 (for forward/loopsafe also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/qdisc/reorder/tbucket/netqueue/policyqueue/ecmpqueue/netshape/netfail/policyfail/netimpair/netqdisc/converge/ecmpconverge/policy/reserve/rebalance/retune also those in
+for queue/qdisc/reorder/tbucket/netqueue/policyqueue/ecmpqueue/netshape/netfail/policyfail/netimpair/netreorder/netqdisc/converge/ecmpconverge/policy/reserve/rebalance/retune also those in
 FILE/DATA/QUEUES/SHAPERS/CLASSES/CONFIG/EVENTS/FLOWS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
@@ -1072,6 +1073,43 @@ Link rows append lost,count,n,j: the number of sends lost, the number
 of sends started, and the final settings. Worst case is netfail's
 bound plus O(X+H) for X impair events and H started sends, with O(E)
 extra space.
+netreorder is read-only and takes FILE QUEUES EVENTS WINDOW WAIT DATA on
+one explicit event clock. FILE/QUEUES/EVENTS and WINDOW/WAIT (each a
+non-boolean integer in 0..MAX_COST) reuse netimpair's exact contract.
+DATA is a JSON array, possibly empty, of
+[id,flow,seq,time,source,destination,size] items: id, time, source,
+destination, and size follow netimpair's exact contract, flow is a
+1..256 codepoint UTF-8 string, and seq a non-boolean integer in
+0..MAX_COST; within each (source, destination, flow) stream the seqs
+must run 0,1,2,... in DATA order. Packets first undergo netimpair's
+forwarding semantics unchanged, and only packets it finally delivers
+enter the reorderer, one per stream with expected starting at 0. A
+delivered packet with seq == expected releases immediately at its
+network completion time and every buffered consecutive successor with
+it; a larger seq within expected + WINDOW buffers, the first packet
+buffered behind a gap arming a timer at that packet's buffering time
+plus WAIT; a larger seq beyond the window is over_window and is not
+buffered; a smaller seq is late. A timer fire moves expected to the
+smallest buffered seq and releases the contiguous segment, re-arming
+from the new gap head's buffering time while a gap remains. At one
+instant the netimpair network phase finishes first, that instant's
+deliveries are then received in DATA order, and timers are processed
+last; at the end every pending timer is drained, a computed deadline
+above MAX_TIME being code 5 with no partial output. Result top-level
+key order is packets,events,links,flows. packets keeps netimpair's
+rows in DATA order with flow, seq, orderStatus, release, wait appended:
+a packet that never reaches its destination has network_drop with null
+release and wait; a released packet records released, its release
+time, and the wait relative to its network completion; late and
+over_window packets carry null for both times. events and links keep
+netimpair's exact semantics. flows follows first-DATA stream order as
+[source,destination,flow,released,late,overWindow,networkDrop,
+maxBuffered,lastRelease]: the four outcome counts, the largest number
+of simultaneously buffered packets, and the last release time (null if
+the stream released nothing). Validation and output reuse netimpair's
+exit 2..5 ordering, empty-stdout failure, and byte-identical compact
+UTF-8 JSON plus LF; the reorder stage adds O(P log F) time and O(P+F)
+space, F the number of streams.
 netqdisc takes FILE CONFIG DATA and combines netqueue's deterministic
 multi-hop store-and-forward with qdisc's deficit round-robin, one
 independent qdisc per directed FILE link with no scheduling state
@@ -4870,7 +4908,8 @@ def compute_policyfail(nodes, links, cap_of, packets, events, rules):
             "links": link_rows}
 
 
-def compute_netimpair(nodes, links, cap_of, packets, events):
+def compute_netimpair(nodes, links, cap_of, packets, events,
+                      on_deliver=None):
     # netfail's topology, FIFO queues, packet format, and single explicit
     # event clock, extended with per-link impair settings. Besides the
     # netfail [t,0,node,up] / [t,1,from,to,up] settings, EVENTS carries
@@ -4966,6 +5005,12 @@ def compute_netimpair(nodes, links, cap_of, packets, events):
         results[i][3] = now
         results[i][4] = now - packets[i][1]
         results[i][5] = obj
+        if status == "delivered" and on_deliver is not None:
+            # Deliveries fire in the clock's processing order: at one
+            # instant receptions and injections are merged by packet
+            # index, so the resulting (time, index) pairs leave the
+            # clock already ordered without a sort.
+            on_deliver(now, i)
 
     def select_path(i):
         if adj_dirty[0]:
@@ -5253,6 +5298,170 @@ def compute_netimpair(nodes, links, cap_of, packets, events):
                  for i in range(E)]
     return {"packets": results, "events": event_rows,
             "links": link_rows}
+
+
+def compute_netreorder(nodes, links, cap_of, packets, events, window, wait):
+    # netimpair runs first, unchanged; only packets it finally delivers
+    # to their destination enter the per-stream reorderer. A stream is
+    # the (source, destination, flow) triple and its DATA seqs are 0..k-1
+    # in DATA order. Each stream keeps expected (next seq to release), a
+    # seq -> packet buffer, and one timer. A packet arriving with seq ==
+    # expected releases at its arrival and flushes every buffered run; a
+    # seq ahead of expected by at most WINDOW buffers, the first packet
+    # buffered behind a gap arming a timer at its buffering time + WAIT;
+    # a seq farther ahead is over_window and never buffers; a seq below
+    # expected is late. At a timer fire expected jumps to the smallest
+    # buffered seq and the contiguous run releases, re-arming from the
+    # new gap head's buffering time while a gap remains. At an instant
+    # arrivals (DATA order at ties) precede timers; the end drains every
+    # pending timer, a computed deadline above MAX_TIME being code 5. A
+    # dict buffer is O(1) per arrival and the per-stream timer heap is
+    # O(log F), giving O(P log F) time and O(P+F) space.
+    base_packets = [(p[0], p[1], p[2], p[3], p[4]) for p in packets]
+    arrivals = []
+    net = compute_netimpair(nodes, links, cap_of, base_packets, events,
+                            on_deliver=lambda t, i: arrivals.append((t, i)))
+    n = len(packets)
+    rows = net["packets"]
+
+    # Stream states are preregistered in first-DATA-occurrence order so
+    # the flows summary covers every stream, even one with no arrival.
+    states = {}
+    order = []
+    for p in packets:
+        key = (p[2], p[3], p[5])
+        if key not in states:
+            states[key] = {"expected": 0, "buf": {}, "heap": [],
+                           "timer": None,
+                           "gen": 0, "released": 0, "late": 0,
+                           "over": 0, "drop": 0, "maxbuf": 0,
+                           "last": None}
+            order.append(key)
+    index_of = {key: i for i, key in enumerate(order)}
+
+    for i in range(n):
+        p = packets[i]
+        if rows[i][1] != "delivered":
+            rows[i].extend([p[5], p[6], "network_drop", None, None])
+            states[(p[2], p[3], p[5])]["drop"] += 1
+    # arrivals leaves the netimpair clock already in non-decreasing
+    # (time, DATA index) order, so no sort is needed.
+
+    timer_heap = []
+
+    def arm(st, fi, deadline):
+        st["gen"] += 1
+        st["timer"] = deadline
+        heapq.heappush(timer_heap, (deadline, fi, st["gen"]))
+
+    def release(i, t):
+        p = packets[i]
+        row = rows[i]
+        row.extend([p[5], p[6], "released", t, t - row[3]])
+        st = states[(p[2], p[3], p[5])]
+        st["released"] += 1
+        st["last"] = t
+
+    def buf_head(st):
+        # Smallest buffered seq via a lazy heap: entries released while
+        # buffered are simply dropped from buf, so stale heap tops are
+        # discarded here. Each seq is pushed and popped at most once.
+        buf = st["buf"]
+        heap = st["heap"]
+        while heap and heap[0] not in buf:
+            heapq.heappop(heap)
+        return heap[0] if heap else None
+
+    def flush_run(st, t):
+        # Release the buffered contiguous run from expected; an emptied
+        # buffer cancels the stream's pending timer.
+        buf = st["buf"]
+        exp = st["expected"]
+        while exp in buf:
+            release(buf.pop(exp), t)
+            exp += 1
+        st["expected"] = exp
+        if not buf:
+            st["timer"] = None
+
+    def handle_arrival(i, t):
+        p = packets[i]
+        seq = p[6]
+        st = states[(p[2], p[3], p[5])]
+        exp = st["expected"]
+        if seq == exp:
+            release(i, t)
+            # The in-order packet consumed expected; flush buffered
+            # successors from exp + 1.
+            st["expected"] = exp + 1
+            flush_run(st, t)
+        elif seq < exp:
+            rows[i].extend([p[5], p[6], "late", None, None])
+            st["late"] += 1
+        elif seq - exp <= window:
+            buf = st["buf"]
+            buf[seq] = i
+            heapq.heappush(st["heap"], seq)
+            if len(buf) > st["maxbuf"]:
+                st["maxbuf"] = len(buf)
+            if st["timer"] is None:
+                arm(st, index_of[(p[2], p[3], p[5])], t + wait)
+        else:
+            rows[i].extend([p[5], p[6], "over_window", None, None])
+            st["over"] += 1
+
+    def fire_timer(st, fi, t):
+        # Jump over the gap to the smallest buffered seq, release that
+        # contiguous segment, and re-arm from the new gap head.
+        head = buf_head(st)
+        if head is None:
+            st["timer"] = None
+            return
+        st["expected"] = head
+        flush_run(st, t)
+        head = buf_head(st)
+        if head is not None:
+            anchor_i = st["buf"][head]
+            arm(st, fi, rows[anchor_i][3] + wait)
+
+    ai = 0
+    while True:
+        # Drop stale heap entries (canceled or superseded timers).
+        while timer_heap:
+            d, fi, g = timer_heap[0]
+            st = states[order[fi]]
+            if st["timer"] == d and st["gen"] == g and st["buf"]:
+                break
+            heapq.heappop(timer_heap)
+        if ai >= len(arrivals) and not timer_heap:
+            break
+        nt = arrivals[ai][0] if ai < len(arrivals) else None
+        if timer_heap:
+            ht = timer_heap[0][0]
+            if nt is None or ht < nt:
+                nt = ht
+        if nt > MAX_TIME:
+            fail(5)
+        # Same instant: arrivals first (DATA order at ties), timers last.
+        while ai < len(arrivals) and arrivals[ai][0] == nt:
+            handle_arrival(arrivals[ai][1], nt)
+            ai += 1
+        while timer_heap and timer_heap[0][0] <= nt:
+            d, fi, g = heapq.heappop(timer_heap)
+            st = states[order[fi]]
+            if st["timer"] != d or st["gen"] != g or not st["buf"]:
+                continue
+            st["timer"] = None
+            fire_timer(st, fi, d)
+
+    flow_rows = []
+    for key in order:
+        s, d, f = key
+        st = states[key]
+        flow_rows.append([s, d, f, st["released"], st["late"], st["over"],
+                          st["drop"], st["maxbuf"], st["last"]])
+    return {"packets": rows, "events": net["events"],
+            "links": net["links"], "flows": flow_rows}
 
 
 def compute_converge(nodes, links, source, destination, delay, run, events):
@@ -13128,6 +13337,149 @@ def main():
                 fail(5)
             packets.append((pid, time, source, destination, size))
         result = compute_netimpair(nodes, links, cap_of, packets, events)
+    elif argv[1] == "netreorder":
+        if len(argv) != 8:
+            fail(2)
+        file_path, queues_text, events_text = argv[2], argv[3], argv[4]
+        window_text, wait_text, data_text = argv[5], argv[6], argv[7]
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        link_pairs_set = {(l["from"], l["to"]) for l in links}
+        try:
+            raw_queues = json.loads(queues_text,
+                                    parse_constant=_reject_constant,
+                                    parse_float=_finite_float,
+                                    object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(raw_queues, list):
+            fail(5)
+        cap_of_pair = {}
+        for item in raw_queues:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            frm, to, capacity = item
+            if type(frm) is not str or type(to) is not str:
+                fail(5)
+            pair = (frm, to)
+            if pair not in link_pairs_set or pair in cap_of_pair:
+                fail(5)
+            if type(capacity) is not int or not 1 <= capacity <= MAX_COST:
+                fail(5)
+            cap_of_pair[pair] = capacity
+        if set(cap_of_pair) != link_pairs_set:
+            fail(5)
+        cap_of = [cap_of_pair[(l["from"], l["to"])] for l in links]
+        latency_of = {(l["from"], l["to"]): l["latency"] for l in links}
+        try:
+            raw_events = json.loads(events_text,
+                                    parse_constant=_reject_constant,
+                                    parse_float=_finite_float,
+                                    object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(raw_events, list) or not raw_events:
+            fail(5)
+        events = []
+        previous_event_time = None
+        for event in raw_events:
+            if not isinstance(event, list) or len(event) not in (4, 5, 6):
+                fail(5)
+            t, kind = event[0], event[1]
+            if type(t) is not int or not 0 <= t <= MAX_TIME:
+                fail(5)
+            if previous_event_time is not None and t < previous_event_time:
+                fail(5)
+            previous_event_time = t
+            if type(kind) is not int or kind not in (0, 1, 2):
+                fail(5)
+            if kind == 0:
+                if len(event) != 4:
+                    fail(5)
+                _, _, node, up = event
+                if type(node) is not str or node not in node_set:
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                events.append((t, 0, node, up))
+            elif kind == 1:
+                if len(event) != 5:
+                    fail(5)
+                _, _, frm, to, up = event
+                if (type(frm) is not str or type(to) is not str
+                        or (frm, to) not in link_pairs_set):
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                events.append((t, 1, frm, to, up))
+            else:
+                if len(event) != 6:
+                    fail(5)
+                _, _, frm, to, nn, jj = event
+                if (type(frm) is not str or type(to) is not str
+                        or (frm, to) not in link_pairs_set):
+                    fail(5)
+                if type(nn) is not int or not 0 <= nn <= MAX_COST:
+                    fail(5)
+                if type(jj) is not int:
+                    fail(5)
+                if latency_of[(frm, to)] + jj < 0:
+                    fail(5)
+                events.append((t, 2, frm, to, nn, jj))
+        window = _bounded_int_arg(window_text)
+        wait = _bounded_int_arg(wait_text)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        packets = []
+        seen_ids = set()
+        previous_time = None
+        next_seq = {}
+        for item in data:
+            if not isinstance(item, list) or len(item) != 7:
+                fail(5)
+            pid, flow, seq, time, source, destination, size = item
+            if (type(pid) is not str or pid == ""
+                    or not 1 <= len(pid) <= MAX_FLOW_LEN
+                    or pid in seen_ids):
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_ids.add(pid)
+            if type(flow) is not str or not 1 <= len(flow) <= MAX_FLOW_LEN:
+                fail(5)
+            try:
+                flow.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if (type(seq) is not int or isinstance(seq, bool)
+                    or not 0 <= seq <= MAX_COST):
+                fail(5)
+            if type(time) is not int or not 0 <= time <= MAX_TIME:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if source not in node_set or destination not in node_set:
+                fail(5)
+            if type(size) is not int or not 1 <= size <= MAX_COST:
+                fail(5)
+            # Seqs of one (source, destination, flow) run 0,1,2,... in
+            # DATA order.
+            key = (source, destination, flow)
+            if seq != next_seq.get(key, 0):
+                fail(5)
+            next_seq[key] = seq + 1
+            packets.append((pid, time, source, destination, size, flow, seq))
+        result = compute_netreorder(nodes, links, cap_of, packets, events,
+                                    window, wait)
     elif argv[1] == "netqdisc":
         if len(argv) != 5:
             fail(2)
