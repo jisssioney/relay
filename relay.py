@@ -57,6 +57,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py failreport FILE S D W A B SCENARIOS
        python relay.py failcmp OLD NEW S D W A B SCENARIOS
        python relay.py meshreport FILE W A B PAIRS SCENARIOS
+       python relay.py meshcmp OLD NEW W A B PAIRS SCENARIOS
 
 Exit codes: 2 bad args/subcommand, 3 file unreadable (FILE or STATE,
 for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
@@ -69,7 +70,8 @@ pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
 compound/audit/failstat those in DATA, for failreport that in
 SCENARIOS, for failcmp that in OLD/NEW and SCENARIOS, for meshreport
-that in PAIRS and SCENARIOS, for compoundcp
+that in PAIRS and SCENARIOS, for meshcmp that in
+OLD/NEW, PAIRS and SCENARIOS, for compoundcp
 those in STATE/DATA, for
 branch those in DB/OP, for wm/wmecmp those in FILE/W, for drill/multidrill/convstat/slosum
 EVENTS/DATA, for sloeval those in POLICY/EVENTS/DATA, for slocmp
@@ -571,6 +573,47 @@ PAIRS/SCENARIOS JSON syntax error (duplicate keys or non-finite numbers
 included), and 5 every other shape, type, reference, range or overflow
 error. The old entry points are unchanged and out of scope here. Worst
 case is O(P*S*B*(V**2 + E)) time and O(P*S*B + V + E) work/output space.
+meshcmp takes OLD NEW W A B PAIRS SCENARIOS and is read-only: OLD and NEW
+are each a meshreport FILE (parsed strictly, so duplicate keys or
+non-finite numbers in either are code 4), W/A/B/PAIRS/SCENARIOS reuse
+meshreport's exact contract (strict A < B), and every source,
+destination, node and link referenced by a pair or scenario must be
+legal in BOTH topologies; that cross-topology check is code 5. All
+arguments, every pair and every scenario are fully validated against
+both topologies before any combination runs on either side, so a
+validation failure outputs nothing. Each (scenario, pair) combination
+executes independently from each FILE's initial state with scenarios the
+outer loop and pairs the inner, sharing no failure state. The success
+object's fixed key order is a,b,pairs,scenarios,summary with pairs
+echoed verbatim. scenarios follows SCENARIOS order, each entry
+[name,pairs,O,N,d,g]; pairs follows PAIRS order with each entry
+[pairName,O,N,d,g] exactly a failcmp scenario entry (O/N a
+[r,u,q] failreport triple, d the failcmp six-component NEW-minus-OLD
+vector, g its 0/1/2 verdict). O and N at scenario level are
+[u,l,worst,switches,q] in meshreport's weighted basis (u the weighted
+six-decimal availability, l sum(weight*L), worst the worst pair name,
+switches the summed completion counts, q that scenario's pooled
+completion-delay summary). d is [du,dl,ds,d50,d95] NEW minus OLD: du a
+signed six-decimal string over the weighted denominator (exact zero
+"0.000000"), dl/ds integer deltas, and a percentile position null
+whenever either side's percentile is null (an empty delay set stays
+[0,null,null,null,null]). g grades NEW improved/tied/degraded (0/1/2) by
+ascending lexicographic order of the (l,switches,p95,p50) differences;
+when both sides' switch counts are 0 the percentile positions are
+ignored. summary is [O,N,d,g,grades]: O and N are the two sides'
+meshreport summaries, d and g use the same weighted difference and grade
+basis pooled over every scenario, and grades counts the improved, tied
+and degraded verdicts over every (scenario, pair) combination (the pair
+entries).
+Any weight*L multiply-add accumulator or weighted denominator above
+MAX_TIME is code 5 with no output. Exit codes: 2 a wrong argument count,
+3 an unreadable OLD/NEW, 4 a UTF-8/JSON syntax, duplicate-key or
+non-finite-number error in either topology, PAIRS or SCENARIOS, and 5
+every other structure, type, reference, range, cross-topology or
+overflow error. The command never writes a file and the old entry points
+are unchanged; the same inputs must produce byte-identical JSON. Worst
+case is O(P*S*B*(Vo**2 + Eo + Vn**2 + En)) time and
+O(P*S*B + Vo + Eo + Vn + En) work/output space.
 rolepath takes FILE SOURCE DESTINATION LIMIT and does not change the
 route topology format: the route entry points still accept only the
 old {nodes, links} form, and rolepath accepts only its role form, in
@@ -7301,6 +7344,148 @@ def compute_meshreport(nodes, links, wait, window_a, window_b,
             "scenarios": scenario_entries, "summary": summary}
 
 
+def _meshcmp_aggregate(entry, weight_of):
+    # The weighted scenario-level comparison basis meshreport emits
+    # piecemeal, gathered from one scenario's pair entries: u is left to
+    # the caller (the shared denominator is weight_total*D), l sums
+    # weight*L, switches sums the completion counts, worst_idx is the
+    # PAIRS index maximizing weight*L with ties at the earlier entry, and
+    # delays lists every pair's completion delays in PAIRS order so the
+    # pooled scenario q keeps failreport's percentile basis.
+    l_total = 0
+    switches = 0
+    worst_idx = 0
+    worst_value = None
+    delays = []
+    for p_idx, pair_entry in enumerate(entry[1]):
+        result = pair_entry[1]
+        unavailable = result["x"][4]
+        switches += result["x"][2]
+        delays.extend(event[4] for event in result["e"] if event[1] == 1)
+        weighted_unavailable = weight_of[p_idx] * unavailable
+        l_total += weighted_unavailable
+        # Strictly greater keeps the earlier PAIRS entry on a tie.
+        if worst_value is None or weighted_unavailable > worst_value:
+            worst_value = weighted_unavailable
+            worst_idx = p_idx
+    return l_total, switches, worst_idx, delays
+
+
+def _meshcmp_diff_d5(u_num_new, u_num_old, den, l_new, l_old,
+                     switches_new, switches_old, q_new, q_old):
+    # Weighted scenario/summary comparison vector d = [du,dl,ds,d50,d95],
+    # NEW minus OLD: du the signed six-decimal availability difference
+    # over den on failcmp's exact basis, dl/ds integer deltas, and a
+    # percentile difference null whenever either side's percentile is
+    # null (q is [n,min,max,p50,p95]).
+    du = _failcmp_signed_six(u_num_new, u_num_old, den)
+    d50 = (None if q_old[3] is None or q_new[3] is None
+           else q_new[3] - q_old[3])
+    d95 = (None if q_old[4] is None or q_new[4] is None
+           else q_new[4] - q_old[4])
+    return [du, l_new - l_old, switches_new - switches_old, d50, d95]
+
+
+def _meshcmp_grade(d_l, d_switches, d_p95, d_p50):
+    # NEW graded improved (0) / tied (1) / degraded (2) by ascending
+    # lexicographic order of the (l, switches, p95, p50) NEW-minus-OLD
+    # differences; a null percentile (an empty delay set on either side)
+    # is skipped as an equal position, which is exactly the both-switches-
+    # zero case the two sides share.
+    for diff in (d_l, d_switches, d_p95, d_p50):
+        if diff is None:
+            continue
+        if diff < 0:
+            return 0
+        if diff > 0:
+            return 2
+    return 1
+
+
+def compute_meshcmp(old_nodes, old_links, new_nodes, new_links,
+                    wait, window_a, window_b, pairs, scenarios):
+    # meshreport's weighted multi-pair drill compared over two
+    # topologies, reusing the public failcmp/meshreport semantics. pairs
+    # holds validated [name, source, destination, weight] entries in
+    # PAIRS order (all references legal in both FILEs) and scenarios
+    # validated (name, batches) tuples in SCENARIOS order; D = B-A is
+    # positive. Each (scenario, pair) combination runs independently from
+    # each FILE's initial state with scenarios outer and pairs inner, so
+    # no failure state is shared across runs or topologies; running
+    # compute_meshreport once per side gives exactly that.
+    old_report = compute_meshreport(old_nodes, old_links, wait, window_a,
+                                    window_b, pairs, scenarios)
+    new_report = compute_meshreport(new_nodes, new_links, wait, window_a,
+                                    window_b, pairs, scenarios)
+    window_d = window_b - window_a
+    weight_total = sum(weight for _, _, _, weight in pairs)
+    weight_of = [weight for _, _, _, weight in pairs]
+    scenario_den = weight_total * window_d
+
+    scenario_entries = []
+    grades = [0, 0, 0]
+    for old_entry, new_entry in zip(old_report["scenarios"],
+                                    new_report["scenarios"]):
+        name = old_entry[0]
+        old_l, old_switches, old_worst_idx, old_delays = \
+            _meshcmp_aggregate(old_entry, weight_of)
+        new_l, new_switches, new_worst_idx, new_delays = \
+            _meshcmp_aggregate(new_entry, weight_of)
+        old_q = _failreport_delay_q(old_delays)
+        new_q = _failreport_delay_q(new_delays)
+        # Scenario-level O and N are [u,l,worst,switches,q] in
+        # meshreport's weighted basis.
+        old_o = [old_entry[2], old_l, pairs[old_worst_idx][0],
+                 old_switches, old_q]
+        new_o = [new_entry[2], new_l, pairs[new_worst_idx][0],
+                 new_switches, new_q]
+        d = _meshcmp_diff_d5(scenario_den - new_l,
+                             scenario_den - old_l, scenario_den,
+                             new_l, old_l, new_switches, old_switches,
+                             new_q, old_q)
+        g = _meshcmp_grade(d[1], d[2], d[4], d[3])
+
+        pair_entries = []
+        for old_pair, new_pair in zip(old_entry[1], new_entry[1]):
+            pair_name, old_r, old_u, old_pq = old_pair
+            _, new_r, new_u, new_pq = new_pair
+            # The per-pair comparison is exactly a failcmp entry:
+            # [pairName, O, N, d, g] with O/N [r,u,q].
+            du = _failcmp_signed_six(window_d - new_r["x"][4],
+                                     window_d - old_r["x"][4], window_d)
+            d_p50 = (None if old_pq[3] is None or new_pq[3] is None
+                     else new_pq[3] - old_pq[3])
+            d_p95 = (None if old_pq[4] is None or new_pq[4] is None
+                     else new_pq[4] - old_pq[4])
+            pd = [du, new_r["x"][4] - old_r["x"][4],
+                  new_r["x"][5] - old_r["x"][5],
+                  new_r["x"][2] - old_r["x"][2], d_p50, d_p95]
+            pg = _failcmp_grade(pd[1], pd[2], pd[3], d_p95, d_p50)
+            grades[pg] += 1
+            pair_entries.append([pair_name, [old_r, old_u, old_pq],
+                                 [new_r, new_u, new_pq], pd, pg])
+        scenario_entries.append([name, pair_entries, old_o, new_o, d, g])
+
+    # The summary pools the same weight basis over every scenario.
+    old_s = old_report["summary"]
+    new_s = new_report["summary"]
+    overall_den = weight_total * window_d * len(scenarios)
+    # summary is [pair count, scenario count, u, l, worst pair,
+    # worst scenario, switches, merged q].
+    old_l, new_l = old_s[3], new_s[3]
+    old_switches, new_switches = old_s[6], new_s[6]
+    old_mq, new_mq = old_s[7], new_s[7]
+    d = _meshcmp_diff_d5(overall_den - new_l, overall_den - old_l,
+                         overall_den, new_l, old_l, new_switches,
+                         old_switches, new_mq, old_mq)
+    g = _meshcmp_grade(d[1], d[2], d[4], d[3])
+
+    return {"a": window_a, "b": window_b, "pairs": pairs,
+            "scenarios": scenario_entries,
+            "summary": [old_s, new_s, d, g, [grades[0], grades[1],
+                                             grades[2]]]}
+
+
 def compute_impair(nodes, links, source, destination, items):
     # Impairment replay on a static up-graph. Config items (0, t, u, v,
     # n, j) set the drop modulus n and latency jitter j of the directed
@@ -12623,6 +12808,109 @@ def main():
             scenarios.append((name, batches))
         result = compute_meshreport(nodes, links, wait, window_a,
                                     window_b, pairs, scenarios)
+    elif argv[1] == "meshcmp":
+        if len(argv) != 9:
+            fail(2)
+        old_path, new_path = argv[2], argv[3]
+        wait_text, a_text, b_text = argv[4], argv[5], argv[6]
+        pairs_text, scenarios_text = argv[7], argv[8]
+        # Read-only: each FILE follows failstat/meshreport's FILE
+        # contract, parsed strictly like failcmp's OLD/NEW so a topology
+        # read error is code 3 and UTF-8/JSON syntax, duplicate keys or
+        # non-finite numbers code 4, a structural topology error 5.
+        old_nodes, old_links, old_node_set = load_network(
+            old_path, metrics=True, strict=True)
+        new_nodes, new_links, new_node_set = load_network(
+            new_path, metrics=True, strict=True)
+        wait = _bounded_int_arg(wait_text)
+        window_a = _bounded_int_arg(a_text)
+        window_b = _bounded_int_arg(b_text)
+        if window_a >= window_b:
+            # meshcmp inherits failreport's strict, positive D = B-A.
+            fail(5)
+        try:
+            raw_pairs = json.loads(pairs_text,
+                                   parse_constant=_reject_constant,
+                                   parse_float=_finite_float,
+                                   object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        try:
+            raw_scenarios = json.loads(scenarios_text,
+                                       parse_constant=_reject_constant,
+                                       parse_float=_finite_float,
+                                       object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        old_pair_set = {(link["from"], link["to"]) for link in old_links}
+        new_pair_set = {(link["from"], link["to"]) for link in new_links}
+        # Fully validate every pair against BOTH topologies, and every
+        # scenario's batches against the OLD topology with each node/link
+        # reference additionally legal in NEW, before any of the P*S
+        # state machines runs on either side; a failure outputs nothing.
+        if not isinstance(raw_pairs, list) or not raw_pairs:
+            fail(5)
+        pairs = []
+        seen_pair_names = set()
+        for entry in raw_pairs:
+            if not isinstance(entry, list) or len(entry) != 4:
+                fail(5)
+            name, source, destination, weight = entry
+            if type(name) is not str or not 1 <= len(name) <= 64:
+                fail(5)
+            try:
+                name.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if name in seen_pair_names:
+                fail(5)
+            if (type(source) is not str or type(destination) is not str
+                    or source not in old_node_set
+                    or destination not in old_node_set
+                    or source == destination
+                    or source not in new_node_set
+                    or destination not in new_node_set):
+                fail(5)
+            if type(weight) is not int or isinstance(weight, bool) \
+                    or not 1 <= weight <= MAX_COST:
+                fail(5)
+            seen_pair_names.add(name)
+            pairs.append([name, source, destination, weight])
+        if not isinstance(raw_scenarios, list) or not raw_scenarios:
+            fail(5)
+        scenarios = []
+        seen_scenario_names = set()
+        for entry in raw_scenarios:
+            if not isinstance(entry, list) or len(entry) != 2:
+                fail(5)
+            name, data = entry
+            if type(name) is not str or not 1 <= len(name) <= 64:
+                fail(5)
+            try:
+                name.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if name in seen_scenario_names:
+                fail(5)
+            seen_scenario_names.add(name)
+            # Structure and membership in the OLD topology reuse
+            # failstat's exact parser; each referenced node and pair must
+            # additionally be legal in the NEW topology.
+            batches = _parse_failstat_batches(data, old_node_set,
+                                              old_pair_set, window_a,
+                                              window_b)
+            for _, changes in batches:
+                for change in changes:
+                    if change[0] == 0:
+                        if change[1] not in new_node_set:
+                            fail(5)
+                    else:
+                        if (change[1], change[2]) not in new_pair_set:
+                            fail(5)
+            scenarios.append((name, batches))
+        result = compute_meshcmp(old_nodes, old_links, new_nodes,
+                                 new_links, wait, window_a, window_b,
+                                 pairs, scenarios)
     elif argv[1] == "impair":
         if len(argv) != 6:
             fail(2)
