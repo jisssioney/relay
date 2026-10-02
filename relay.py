@@ -19,6 +19,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py tbucket FILE FROM TO BURST CAP DATA
        python relay.py netqueue FILE QUEUES DATA
        python relay.py netfail FILE QUEUES EVENTS DATA
+       python relay.py netimpair FILE QUEUES EVENTS DATA
        python relay.py netqdisc FILE CONFIG DATA
        python relay.py converge FILE SRC DST D R EVENTS
        python relay.py policy FILE S D P C RULES
@@ -62,7 +63,7 @@ for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
 policytx op 4 also OUT),
 4 JSON syntax
 (for forward/loopsafe also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/qdisc/reorder/tbucket/netqueue/netfail/netqdisc/converge/policy/reserve/rebalance/retune also those in
+for queue/qdisc/reorder/tbucket/netqueue/netfail/netimpair/netqdisc/converge/policy/reserve/rebalance/retune also those in
 FILE/DATA/QUEUES/CLASSES/CONFIG/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
@@ -709,6 +710,33 @@ links follows FILE order as
 six fields follow netqueue, faultRemoved counts packets pulled unsent
 from the link by down events, and up is the final state. Worst case is
 O((P+R)((V+E) log V) + H log(P+E)) for R re-routes, with O(V+E+P+H)
+extra space.
+netimpair is read-only and takes FILE QUEUES EVENTS DATA on one
+explicit event clock, reusing netfail's topology, queues, packet
+format, FIFO capacity, ceil(size/bandwidth) send time, overflow,
+re-routing, fault handling, and same-tick phase order. EVENTS keeps
+netfail's [t,0,node,up] and [t,1,from,to,up] settings and adds
+[t,2,from,to,n,j] settings: n is a non-boolean integer in
+0..MAX_COST (0 drops nothing) and j is a signed integer with
+latency + j >= 0; the array stays non-empty and time-non-decreasing.
+Every link starts with n, j, and a send counter at 0; an impair
+setting only changes sends started after it (repeated identical
+settings are idempotent), never moves a packet, and never reroutes.
+When a send starts, the link counter is incremented first and the
+link's current n, j are snapshotted; with n > 0 and the fresh counter
+divisible by n the packet occupies the link through depart and ends
+there as lost without any reception, otherwise it arrives at
+depart + latency + j. A failure occurring while the send is running
+still ends it as fault. Result top-level key order is
+packets,events,links. Packet rows follow netfail with an extra last
+lost field; a lost packet has dropObject [from,to], a final hop that
+keeps arrive/start/depart with a null receive, null receive semantics
+like a faulted send, and finish equal to depart. Event rows stay
+[t,kind,target,value,changed,requeued,faults]: for kind 2 target is
+the [from,to] pair, value is [n,j], and the last three fields are 0.
+Link rows append lost,count,n,j: the number of sends lost, the number
+of sends started, and the final settings. Worst case is netfail's
+bound plus O(X+H) for X impair events and H started sends, with O(E)
 extra space.
 netqdisc takes FILE CONFIG DATA and combines netqueue's deterministic
 multi-hop store-and-forward with qdisc's deficit round-robin, one
@@ -3345,6 +3373,391 @@ def compute_netfail(nodes, links, cap_of, packets, events):
     return {"packets": results, "events": event_rows,
             "links": link_rows}
 
+
+
+def compute_netimpair(nodes, links, cap_of, packets, events):
+    # netfail's topology, FIFO queues, packet format, and single explicit
+    # event clock, extended with per-link impair settings. Besides the
+    # netfail [t,0,node,up] / [t,1,from,to,up] settings, EVENTS carries
+    # [t,2,from,to,n,j] impairment settings: n is the drop modulus
+    # (0 drops nothing) and j a signed latency jitter. Both start at 0 on
+    # every link, alongside a per-link send counter. A setting only
+    # affects sends started afterwards, is idempotent on repetition, and
+    # never reroutes or otherwise moves packets.
+    #
+    # When a send starts, the link counter is incremented first and the
+    # link's current n, j are snapshotted for that send. With n > 0 and
+    # the fresh counter divisible by n, the packet occupies the link
+    # until its depart and ends there as lost with no reception; the
+    # final hop keeps arrive/start/depart and a null receive. Otherwise
+    # reception follows at depart + latency + j. A failure during the
+    # send still faults exactly as in netfail, taking precedence over the
+    # loss decision. Phase order, zero-latency stability repeats, routing,
+    # capacity/overflow mechanics, and the MAX_TIME rule are netfail's.
+    E = len(links)
+    bw = [l["bandwidth"] for l in links]
+    lat = [l["latency"] for l in links]
+    cap = [cap_of[i] for i in range(E)]
+
+    node_up = {u: True for u in nodes}
+    link_up = [bool(links[i]["up"]) for i in range(E)]
+    pair_index = {(links[i]["from"], links[i]["to"]): i
+                  for i in range(E)}
+
+    # Impairment state: imp_n/imp_j the current settings, send_count the
+    # number of sends started, lost_c the sends that ended as lost.
+    imp_n = [0] * E
+    imp_j = [0] * E
+    send_count = [0] * E
+    lost_c = [0] * E
+
+    n = len(packets)
+    occupancy = [0] * E
+    queues = [deque() for _ in range(E)]
+    busy = [False] * E
+    # sending_of[a] is the packet currently sending on link a, if any.
+    sending_of = [None] * E
+    # active[u] holds the links incident to u that currently have a
+    # sending packet or a non-empty queue, so a node-down event touches
+    # only links that can actually carry affected packets.
+    active = {u: set() for u in nodes}
+    admitted_c = [0] * E
+    overflows_c = [0] * E
+    peak = [0] * E
+    last_depart = [0] * E
+    fault_removed = [0] * E
+
+    # loc/prefix/state/inflight/route/rpos/rgen follow compute_netfail
+    # verbatim; cur_n/cur_j snapshot the impair setting of the send a
+    # packet is currently making (0 while not sending).
+    loc = [packets[i][2] for i in range(n)]
+    prefix = [[] for _ in range(n)]
+    state = [0] * n
+    inflight = [None] * n
+    route = [None] * n
+    rpos = [0] * n
+    rgen = [-1] * n
+    gen = [0]
+    # results[i] = [id, status, path, finish, delay, dropObject, hops,
+    # reroutes, lost]. The last flag marks a packet ended as lost.
+    results = [[pid, None, [], None, None, None, [], 0, False]
+               for pid, _, _, _, _ in packets]
+    cur_n = [0] * n
+    cur_j = [0] * n
+
+    adj_cache = [None]
+    adj_dirty = [True]
+
+    def build_adj():
+        adj = {u: [] for u in nodes}
+        for i, l in enumerate(links):
+            if (link_up[i] and node_up[l["from"]]
+                    and node_up[l["to"]]):
+                adj[l["from"]].append((l["to"], l["cost"]))
+        return adj
+
+    def hop_usable(frm, to):
+        li = pair_index[(frm, to)]
+        return (link_up[li] and node_up[frm] and node_up[to])
+
+    def check_time(value):
+        if value > MAX_TIME:
+            fail(5)
+        return value
+
+    def end_terminal(i, status, now, obj):
+        state[i] = 2
+        results[i][1] = status
+        results[i][3] = now
+        results[i][4] = now - packets[i][1]
+        results[i][5] = obj
+
+    def select_path(i):
+        if adj_dirty[0]:
+            adj_cache[0] = build_adj()
+            adj_dirty[0] = False
+        dist = _netfail_dijkstra(nodes, adj_cache[0], loc[i])
+        entry = dist.get(packets[i][3])
+        del dist
+        return None if entry is None else entry[1]
+
+    def admit(i, now, first=False, diverted=False):
+        source = loc[i]
+        if source == packets[i][3]:
+            if not prefix[i]:
+                prefix[i] = [source]
+            end_terminal(i, "delivered", now, None)
+            return
+        old_suffix = (None if first or route[i] is None
+                      else tuple(route[i][rpos[i]:]))
+        reselect = (first or diverted or rgen[i] != gen[0])
+        if not reselect:
+            plan = route[i]
+            k = rpos[i]
+            if not (k + 1 < len(plan)
+                    and hop_usable(plan[k], plan[k + 1])):
+                reselect = True
+        if reselect:
+            new_path = select_path(i)
+            if new_path is None:
+                if not first:
+                    results[i][7] += 1
+                    end_terminal(i, "unreachable", now, None)
+                else:
+                    state[i] = 2
+                    results[i][1] = "unreachable"
+                return
+            new_t = tuple(new_path)
+            if not first and new_t != old_suffix:
+                results[i][7] += 1
+            route[i] = new_t
+            rpos[i] = 0
+            rgen[i] = gen[0]
+        if not prefix[i]:
+            prefix[i] = [source]
+        to = route[i][rpos[i] + 1]
+        li = pair_index[(source, to)]
+        hop = {"from": source, "to": to, "arrive": now, "start": None,
+               "depart": None, "receive": None, "wait": None}
+        results[i][6].append(hop)
+        size = packets[i][4]
+        if occupancy[li] + size > cap[li]:
+            end_terminal(i, "overflow", now, [source, to])
+            overflows_c[li] += 1
+            return
+        occupancy[li] += size
+        if occupancy[li] > peak[li]:
+            peak[li] = occupancy[li]
+        admitted_c[li] += 1
+        queues[li].append(i)
+        refresh_active(li)
+        if not busy[li]:
+            heapq.heappush(idle_heap, li)
+
+    completion_heap = []
+    reception_heap = []
+    idle_heap = []
+
+    def refresh_active(li):
+        l = links[li]
+        present = li in active[l["from"]]
+        has = busy[li] or bool(queues[li])
+        if has and not present:
+            active[l["from"]].add(li)
+            active[l["to"]].add(li)
+        elif not has and present:
+            active[l["from"]].discard(li)
+            active[l["to"]].discard(li)
+
+    def start_heads(now):
+        # One FILE-order pass; each idle link starts its single head. The
+        # send counter is incremented and the current n, j snapshotted
+        # before the send runs, so settings changing during the send do
+        # not affect it.
+        while idle_heap:
+            li = heapq.heappop(idle_heap)
+            if busy[li] or not queues[li]:
+                continue
+            i = queues[li].popleft()
+            size = packets[i][4]
+            depart = check_time(now + (size + bw[li] - 1) // bw[li])
+            busy[li] = True
+            sending_of[li] = i
+            inflight[i] = li
+            send_count[li] += 1
+            cur_n[i] = imp_n[li]
+            cur_j[i] = imp_j[li]
+            refresh_active(li)
+            hop = results[i][6][-1]
+            hop["start"] = now
+            hop["depart"] = depart
+            hop["wait"] = now - hop["arrive"]
+            heapq.heappush(completion_heap, (depart, li, i))
+
+    def complete_send(now, li, i):
+        # Send finished exactly at now: release capacity and either end
+        # the packet as lost here (n > 0 and this send's fresh counter is
+        # a multiple of n, no reception) or schedule its reception at
+        # depart + latency + the snapshotted jitter.
+        occupancy[li] -= packets[i][4]
+        busy[li] = False
+        sending_of[li] = None
+        inflight[i] = None
+        last_depart[li] = now
+        refresh_active(li)
+        if queues[li]:
+            heapq.heappush(idle_heap, li)
+        nn = cur_n[i]
+        jj = cur_j[i]
+        if nn and send_count[li] % nn == 0:
+            lost_c[li] += 1
+            results[i][8] = True
+            end_terminal(i, "lost", now,
+                         [links[li]["from"], links[li]["to"]])
+            return
+        receive = check_time(now + lat[li] + jj)
+        results[i][6][-1]["receive"] = receive
+        heapq.heappush(reception_heap, (receive, i))
+
+    def receive_packet(i, now):
+        node = results[i][6][-1]["to"]
+        if not node_up[node]:
+            end_terminal(i, "fault", now, node)
+            return
+        loc[i] = node
+        prefix[i].append(node)
+        rpos[i] += 1
+        admit(i, now)
+
+    def apply_event(ev, now):
+        # Returns (changed, requeued, faults) for the topology settings;
+        # a kind-2 impair setting just updates the link and reports all
+        # zeroes, moving no packet and bumping no generation.
+        if ev[1] == 2:
+            frm, to, nn, jj = ev[2], ev[3], ev[4], ev[5]
+            li = pair_index[(frm, to)]
+            imp_n[li] = nn
+            imp_j[li] = jj
+            return 0, 0, 0
+        if ev[1] == 0:
+            node, up = ev[2], ev[3]
+            if node_up[node] == up:
+                return 0, 0, 0
+            node_up[node] = up
+            adj_dirty[0] = True
+            gen[0] += 1
+            if up:
+                return 1, 0, 0
+            affected = sorted(active[node])
+            fault_obj = node
+        else:
+            frm, to, up = ev[2], ev[3], ev[4]
+            li = pair_index[(frm, to)]
+            if link_up[li] == up:
+                return 0, 0, 0
+            link_up[li] = up
+            adj_dirty[0] = True
+            gen[0] += 1
+            if up:
+                return 1, 0, 0
+            affected = [li]
+            fault_obj = [frm, to]
+        faulted = set()
+        flushed = []
+        for a in affected:
+            if busy[a]:
+                faulted.add(sending_of[a])
+            while queues[a]:
+                ci = queues[a].popleft()
+                occupancy[a] -= packets[ci][4]
+                results[ci][6].pop()
+                fault_removed[a] += 1
+                flushed.append(ci)
+        for ci in faulted:
+            a = inflight[ci]
+            occupancy[a] -= packets[ci][4]
+            busy[a] = False
+            sending_of[a] = None
+            inflight[ci] = None
+            end_terminal(ci, "fault", now, fault_obj)
+        for a in affected:
+            refresh_active(a)
+        for ci in sorted(flushed):
+            admit(ci, now, diverted=True)
+        return 1, len(flushed), len(faulted)
+
+    e_at = 0
+    en = len(events)
+    inject_at = 0
+
+    def next_inject_time():
+        return packets[inject_at][1] if inject_at < n else None
+
+    def next_time():
+        t = events[e_at][0] if e_at < en else None
+        nt = next_inject_time()
+        if nt is not None and (t is None or nt < t):
+            t = nt
+        if completion_heap:
+            ct = completion_heap[0][0]
+            if t is None or ct < t:
+                t = ct
+        if reception_heap:
+            rt = reception_heap[0][0]
+            if t is None or rt < t:
+                t = rt
+        return t
+
+    event_rows = []
+
+    while True:
+        now = next_time()
+        if now is None:
+            break
+        check_time(now)
+        # Phase 1: all settings at this tick, input order.
+        while e_at < en and events[e_at][0] == now:
+            ev = events[e_at]
+            e_at += 1
+            if ev[1] == 2:
+                apply_event(ev, now)
+                event_rows.append([ev[0], 2, [ev[2], ev[3]],
+                                   [ev[4], ev[5]], 0, 0, 0])
+                continue
+            changed, requeued, faults = apply_event(ev, now)
+            target = ev[2] if ev[1] == 0 else [ev[2], ev[3]]
+            event_rows.append([ev[0], ev[1], target, ev[-1], changed,
+                               requeued, faults])
+        # Phases 2..4 repeat until the instant is stable.
+        moved = True
+        while moved:
+            moved = False
+            while completion_heap and completion_heap[0][0] == now:
+                _, li, i = heapq.heappop(completion_heap)
+                if state[i] == 2:
+                    # Faulted by a down event before its depart: bytes
+                    # were released at the event, nothing more to do.
+                    continue
+                complete_send(now, li, i)
+                moved = True
+            due = []
+            while reception_heap and reception_heap[0][0] == now:
+                _, i = heapq.heappop(reception_heap)
+                if state[i] != 2:
+                    due.append(i)
+            injected = []
+            while inject_at < n and packets[inject_at][1] <= now:
+                j = inject_at
+                inject_at += 1
+                if state[j] == 0:
+                    injected.append(j)
+            a = b = 0
+            while a < len(due) or b < len(injected):
+                if b >= len(injected) or (a < len(due)
+                                          and due[a] < injected[b]):
+                    i = due[a]
+                    a += 1
+                    receive_packet(i, now)
+                else:
+                    i = injected[b]
+                    b += 1
+                    state[i] = 1
+                    admit(i, now, first=True)
+            if due or injected:
+                moved = True
+            if idle_heap:
+                start_heads(now)
+                moved = True
+
+    for i in range(n):
+        results[i][2] = prefix[i]
+    link_rows = [[links[i]["from"], links[i]["to"], admitted_c[i],
+                  overflows_c[i], peak[i], last_depart[i],
+                  fault_removed[i], link_up[i], lost_c[i],
+                  send_count[i], imp_n[i], imp_j[i]]
+                 for i in range(E)]
+    return {"packets": results, "events": event_rows,
+            "links": link_rows}
 
 
 def compute_converge(nodes, links, source, destination, delay, run, events):
@@ -10046,6 +10459,134 @@ def main():
                 fail(5)
             packets.append((pid, time, source, destination, size))
         result = compute_netfail(nodes, links, cap_of, packets, events)
+    elif argv[1] == "netimpair":
+        if len(argv) != 6:
+            fail(2)
+        file_path, queues_text, events_text, data_text = (
+            argv[2], argv[3], argv[4], argv[5])
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        link_pairs_set = {(l["from"], l["to"]) for l in links}
+        try:
+            raw_queues = json.loads(queues_text,
+                                    parse_constant=_reject_constant,
+                                    parse_float=_finite_float,
+                                    object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(raw_queues, list):
+            fail(5)
+        cap_of_pair = {}
+        for item in raw_queues:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            frm, to, capacity = item
+            if type(frm) is not str or type(to) is not str:
+                fail(5)
+            pair = (frm, to)
+            if pair not in link_pairs_set or pair in cap_of_pair:
+                fail(5)
+            if type(capacity) is not int or not 1 <= capacity <= MAX_COST:
+                fail(5)
+            cap_of_pair[pair] = capacity
+        if set(cap_of_pair) != link_pairs_set:
+            fail(5)
+        cap_of = [cap_of_pair[(l["from"], l["to"])] for l in links]
+        latency_of = {(l["from"], l["to"]): l["latency"] for l in links}
+        try:
+            raw_events = json.loads(events_text,
+                                    parse_constant=_reject_constant,
+                                    parse_float=_finite_float,
+                                    object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        # EVENTS is netfail's non-empty, time-ordered array of
+        # [t,0,node,up] / [t,1,from,to,up] settings plus
+        # [t,2,from,to,n,j] impair settings: n a non-boolean integer in
+        # 0..MAX_COST and j a signed integer with latency + j >= 0.
+        if not isinstance(raw_events, list) or not raw_events:
+            fail(5)
+        events = []
+        previous_event_time = None
+        for event in raw_events:
+            if not isinstance(event, list) or len(event) not in (4, 5, 6):
+                fail(5)
+            t, kind = event[0], event[1]
+            if type(t) is not int or not 0 <= t <= MAX_TIME:
+                fail(5)
+            if previous_event_time is not None and t < previous_event_time:
+                fail(5)
+            previous_event_time = t
+            if type(kind) is not int or kind not in (0, 1, 2):
+                fail(5)
+            if kind == 0:
+                if len(event) != 4:
+                    fail(5)
+                _, _, node, up = event
+                if type(node) is not str or node not in node_set:
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                events.append((t, 0, node, up))
+            elif kind == 1:
+                if len(event) != 5:
+                    fail(5)
+                _, _, frm, to, up = event
+                if (type(frm) is not str or type(to) is not str
+                        or (frm, to) not in link_pairs_set):
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                events.append((t, 1, frm, to, up))
+            else:
+                if len(event) != 6:
+                    fail(5)
+                _, _, frm, to, nn, jj = event
+                if (type(frm) is not str or type(to) is not str
+                        or (frm, to) not in link_pairs_set):
+                    fail(5)
+                if type(nn) is not int or not 0 <= nn <= MAX_COST:
+                    fail(5)
+                if type(jj) is not int:
+                    fail(5)
+                if latency_of[(frm, to)] + jj < 0:
+                    fail(5)
+                events.append((t, 2, frm, to, nn, jj))
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(data, list):
+            fail(5)
+        packets = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 5:
+                fail(5)
+            pid, time, source, destination, size = item
+            if (type(pid) is not str or pid == ""
+                    or not 1 <= len(pid) <= MAX_FLOW_LEN
+                    or pid in seen_ids):
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_ids.add(pid)
+            if type(time) is not int or not 0 <= time <= MAX_TIME:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if source not in node_set or destination not in node_set:
+                fail(5)
+            if type(size) is not int or not 1 <= size <= MAX_COST:
+                fail(5)
+            packets.append((pid, time, source, destination, size))
+        result = compute_netimpair(nodes, links, cap_of, packets, events)
     elif argv[1] == "netqdisc":
         if len(argv) != 5:
             fail(2)
