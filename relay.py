@@ -24,6 +24,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py netimpair FILE QUEUES EVENTS DATA
        python relay.py netqdisc FILE CONFIG DATA
        python relay.py converge FILE SRC DST D R EVENTS
+       python relay.py ecmpconverge FILE SOURCE DESTINATION DELAY RUN FLOWS EVENTS
        python relay.py policy FILE S D P C RULES
        python relay.py policytx FILE STATE OP
        python relay.py policyreplay PACK STATE TV PV DATA
@@ -66,8 +67,8 @@ for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
 policytx op 4 also OUT),
 4 JSON syntax
 (for forward/loopsafe also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/qdisc/reorder/tbucket/netqueue/netshape/netfail/netimpair/netqdisc/converge/policy/reserve/rebalance/retune also those in
-FILE/DATA/QUEUES/SHAPERS/CLASSES/CONFIG/EVENTS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
+for queue/qdisc/reorder/tbucket/netqueue/netshape/netfail/netimpair/netqdisc/converge/ecmpconverge/policy/reserve/rebalance/retune also those in
+FILE/DATA/QUEUES/SHAPERS/CLASSES/CONFIG/EVENTS/FLOWS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
 compound/audit/failstat those in DATA, for failreport that in
@@ -460,6 +461,60 @@ candidate a pending install would put in, each
 when absent; reachable is whether the installed route's edges are all
 currently up (false when no route exists); triggerAt/installAt are the
 currently armed times or null. final is the final installed route.
+ecmpconverge takes FILE SOURCE DESTINATION DELAY RUN FLOWS EVENTS and is
+read-only: FILE follows dispatch (the cost/up topology parsed strictly,
+so duplicate keys or non-finite numbers are code 4), and SOURCE and
+DESTINATION name two different known nodes. DELAY and RUN are
+non-boolean decimal integers in 0..MAX_COST. FLOWS is a non-empty JSON
+array of [id,flow] pairs with unique ids; id and flow are 1..256
+codepoint UTF-8 strings and flow may repeat. EVENTS is a non-empty
+strict JSON array with strictly increasing t (a non-boolean integer in
+0..MAX_COST); each item is [t,changes] with changes a non-empty array
+whose entries are one of [0,u,v,cost] and [1,u,v,up]: u->v names a
+FILE edge, a cost is a non-boolean integer in 1..MAX_COST and up a
+boolean; one batch may not set the same directed edge field twice.
+Only up links are used. Every recomputation follows dispatch exactly:
+the lowest total cost, the candidate first hops sorted by Unicode code
+point, and each candidate's representative path. Each flow's score is
+the first eight bytes of the SHA-256 of the compact non-ASCII
+UTF-8 JSON array [flow,SOURCE,DESTINATION,nextHop] as a big-endian
+integer; the highest score wins and an exact tie goes to the candidate
+first hop smaller in Unicode code point order. When the candidate
+first-hop set is unchanged each flow keeps its current first hop and
+only that hop's representative path is refreshed, so no flow migrates
+while the candidates do not move. An unreachable destination carries
+null cost and no candidates, and every flow then has next hop null and
+an empty path.
+All validation completes before the clock starts. The clock starts at
+0 with the initial mapping installed. A batch applies atomically at its
+t; entries that repeat the current value change nothing, and an
+all-repeat batch is idempotent, keeps any outstanding cycle, and
+reports changed 0. A batch with a real change cancels the unfinished
+cycle (trigger fired or not) and rearms the trigger at t+DELAY and the
+install at t+DELAY+RUN; an overflow past MAX_TIME is code 5. Batches at
+a tick run in input order before either timer, and at the same tick the
+trigger fires before an install; a batch landing on a pending
+candidate's install tick cancels that old candidate. The trigger
+recomputes the dispatch candidates over the currently up edges and
+latest costs and produces the candidate mapping; the install only then
+replaces the installed mapping atomically, so until an install the old
+mapping stays in place even when a down edge makes its paths
+unreachable (reachable is then merely set false). Result key order is
+source,destination,delay,run,timeline,final. The timeline starts with
+the initial install row at t=0 and then follows processing order with
+one row per batch, trigger, and install; every row is
+[t,kind,changed,installed,pending,triggerAt,installAt] with kind 0 the
+initial install, 1 a batch, 2 a trigger, and 3 an install. changed is
+the real-change field count on kind-1 rows and null otherwise.
+installed/pending are each [cost,nextHops,flows], cost the lowest total
+cost (null when unreachable), nextHops the sorted candidate first hops
+([] when unreachable), and flows listed in FLOWS input order as
+[id,flow,nextHop,path,reachable]; with no pending candidate the form is
+[null,[],[]]. final is the final installed state. On failure stdout is
+empty and stderr is {"error":N} plus LF; other entry points are
+unchanged byte for byte. Worst case is O((B+T)(V**2 + E + F*V)) time
+and O((B+T)*F*V + V**2 + E) output space for B batches, T triggers,
+and F flows.
 lrepair takes FILE S D W DATA: FILE/S/D/W follow lfail, and DATA is a
 JSON array, possibly empty, of [t,u,v,up] link items only (t a
 non-boolean integer in 0..MAX_COST, non-decreasing with equal t kept in
@@ -4371,6 +4426,151 @@ def compute_wmconverge(nodes, links, source, destination, weights,
 
     return {"s": source, "d": destination, "w": list(weights),
             "timeline": timeline, "final": route_json(installed)}
+
+
+def compute_ecmpconverge(nodes, links, source, destination, delay, run,
+                         flows, events):
+    # Multi-flow ECMP counterpart of compute_converge. Each recomputation
+    # reuses dispatch's lowest-cost candidates and representative paths;
+    # every flow independently scores the candidates by the SHA-256 of
+    # the compact [flow, source, destination, nextHop] JSON (first eight
+    # bytes big-endian, highest wins, Unicode-smaller first hop breaking
+    # a tie). While the candidate first-hop set is unchanged no flow
+    # migrates: its installed hop is kept and only the representative
+    # path for that hop is refreshed, so equal flow labels keep landing
+    # on the same hop. The clock/timer semantics match
+    # compute_wmconverge: batches before timers at a tick, trigger before
+    # install, real changes cancel and rearm, repeats leave timers alone.
+    up_of = {}
+    cost_of = {}
+    for link in links:
+        pair = (link["from"], link["to"])
+        up_of[pair] = link["up"]
+        cost_of[pair] = link["cost"]
+
+    def live_links():
+        # dispatch_candidates reads each dict's cost/up fields, so mirror
+        # the current state into fresh dicts in FILE order.
+        return [{"from": link["from"], "to": link["to"],
+                 "cost": cost_of[(link["from"], link["to"])],
+                 "up": up_of[(link["from"], link["to"])]}
+                for link in links]
+
+    def build_mapping(previous):
+        # previous is the installed [total, hops, flow_rows] mapping or
+        # None. An unchanged candidate first-hop set means no flow
+        # migrates: every flow keeps its installed first hop, but the
+        # reported path is always that hop's representative path in the
+        # current computation (a broken old representative then heals to
+        # the hop's current one without a migration). A changed set makes
+        # every flow re-score the new candidates from scratch.
+        total, hops, rep_paths = dispatch_candidates(
+            nodes, live_links(), source, destination)
+        rep_of = dict(zip(hops, rep_paths))
+        kept_hops = {}
+        if previous is not None and previous[1] == hops:
+            kept_hops = {row[0]: row[2] for row in previous[2]}
+        rows = []
+        for fid, flow in flows:
+            if total is None:
+                rows.append([fid, flow, None, [], False])
+                continue
+            hop = kept_hops.get(fid)
+            if hop is None:
+                best_hop = None
+                best_score = None
+                for index, candidate in enumerate(hops):
+                    key = json.dumps(
+                        [flow, source, destination, candidate],
+                        ensure_ascii=False,
+                        separators=(",", ":")).encode("utf-8")
+                    score = int.from_bytes(
+                        hashlib.sha256(key).digest()[:8], "big")
+                    if best_score is None or score > best_score:
+                        best_score = score
+                        best_hop = candidate
+                hop = best_hop
+            path = rep_of[hop]
+            reachable = all(up_of[pair] for pair in zip(path, path[1:]))
+            rows.append([fid, flow, hop, list(path), reachable])
+        return [total, list(hops), rows]
+
+    def state_json(mapping):
+        # Reachability is re-evaluated against the current up state on
+        # every row, so an installed mapping keeps its hops and paths
+        # while a broken edge only flips reachable to false.
+        if mapping is None:
+            return [None, [], []]
+        total, hops, rows = mapping
+        out_rows = []
+        for fid, flow, hop, path, _ in rows:
+            reachable = (hop is not None
+                         and all(up_of[pair]
+                                 for pair in zip(path, path[1:])))
+            out_rows.append([fid, flow, hop, list(path), reachable])
+        return [total, hops, out_rows]
+
+    installed = build_mapping(None)
+
+    trigger_at = None
+    complete_at = None
+    pending = None
+
+    def entry(now, kind, changed=None):
+        return [now, kind, changed, state_json(installed),
+                state_json(pending), trigger_at, complete_at]
+
+    timeline = [entry(0, 0)]
+
+    i = 0
+    n = len(events)
+    while i < n or trigger_at is not None or complete_at is not None:
+        wakes = []
+        if i < n:
+            wakes.append(events[i][0])
+        if trigger_at is not None:
+            wakes.append(trigger_at)
+        if complete_at is not None:
+            wakes.append(complete_at)
+        now = min(wakes)
+        # Event times are strictly increasing, so at most one batch is
+        # due at a tick; it applies atomically before either timer.
+        if i < n and events[i][0] == now:
+            t, changes = events[i]
+            i += 1
+            changed_count = 0
+            for kind, frm, to, value in changes:
+                pair = (frm, to)
+                if kind == 0:
+                    if cost_of[pair] != value:
+                        cost_of[pair] = value
+                        changed_count += 1
+                else:
+                    if up_of[pair] != value:
+                        up_of[pair] = value
+                        changed_count += 1
+            if changed_count:
+                # A real change cancels the unfinished cycle (trigger
+                # fired or not), dropping any old candidate, and rearms
+                # both timers.
+                pending = None
+                trigger_at = now + delay
+                complete_at = trigger_at + run
+                if complete_at > MAX_TIME:
+                    fail(5)
+            timeline.append(entry(now, 1, changed_count))
+        if trigger_at is not None and trigger_at == now:
+            pending = build_mapping(installed)
+            trigger_at = None
+            timeline.append(entry(now, 2))
+        if complete_at is not None and complete_at == now:
+            installed = pending
+            pending = None
+            complete_at = None
+            timeline.append(entry(now, 3))
+
+    return {"source": source, "destination": destination, "delay": delay,
+            "run": run, "timeline": timeline, "final": state_json(installed)}
 
 
 def _priority_order(rules):
@@ -11631,6 +11831,95 @@ def main():
                 fail(5)
         result = compute_converge(nodes, links, source, destination,
                                   delay, run, events)
+    elif argv[1] == "ecmpconverge":
+        if len(argv) != 9:
+            fail(2)
+        file_path, source, destination = argv[2], argv[3], argv[4]
+        delay_text, run_text, flows_text, events_text = (
+            argv[5], argv[6], argv[7], argv[8])
+        nodes, links, node_set = load_network(file_path, strict=True)
+        try:
+            raw_flows = json.loads(flows_text,
+                                   parse_constant=_reject_constant,
+                                   parse_float=_finite_float,
+                                   object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        delay = _bounded_int_arg(delay_text)
+        run = _bounded_int_arg(run_text)
+        if source not in node_set or destination not in node_set \
+                or source == destination:
+            fail(5)
+        if not isinstance(raw_flows, list) or not raw_flows:
+            fail(5)
+        flows = []
+        seen_ids = set()
+        for item in raw_flows:
+            if not isinstance(item, list) or len(item) != 2:
+                fail(5)
+            fid, flow = item
+            for value in (fid, flow):
+                if type(value) is not str \
+                        or not 1 <= len(value) <= MAX_FLOW_LEN:
+                    fail(5)
+                try:
+                    value.encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(5)
+            if fid in seen_ids:
+                fail(5)
+            seen_ids.add(fid)
+            flows.append((fid, flow))
+        try:
+            raw_events = json.loads(events_text,
+                                    parse_constant=_reject_constant,
+                                    parse_float=_finite_float,
+                                    object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        if not isinstance(raw_events, list) or not raw_events:
+            fail(5)
+        pair_set = {(link["from"], link["to"]) for link in links}
+        events = []
+        previous_time = None
+        for batch in raw_events:
+            if not isinstance(batch, list) or len(batch) != 2:
+                fail(5)
+            time, changes = batch
+            if (type(time) is not int or isinstance(time, bool)
+                    or not 0 <= time <= MAX_COST):
+                fail(5)
+            if previous_time is not None and time <= previous_time:
+                fail(5)
+            previous_time = time
+            if not isinstance(changes, list) or not changes:
+                fail(5)
+            seen_fields = set()
+            parsed_changes = []
+            for item in changes:
+                if not isinstance(item, list) or len(item) != 4:
+                    fail(5)
+                kind, frm, to, value = item
+                if (type(kind) is not int or isinstance(kind, bool)
+                        or not 0 <= kind <= 1):
+                    fail(5)
+                if (type(frm) is not str or type(to) is not str
+                        or (frm, to) not in pair_set):
+                    fail(5)
+                field_key = (frm, to, kind)
+                if field_key in seen_fields:
+                    fail(5)
+                seen_fields.add(field_key)
+                if kind == 1:
+                    if type(value) is not bool:
+                        fail(5)
+                elif (type(value) is not int or isinstance(value, bool)
+                        or not 1 <= value <= MAX_COST):
+                    fail(5)
+                parsed_changes.append((kind, frm, to, value))
+            events.append((time, parsed_changes))
+        result = compute_ecmpconverge(nodes, links, source, destination,
+                                      delay, run, flows, events)
     elif argv[1] == "policy":
         if len(argv) != 8:
             fail(2)
