@@ -130,7 +130,17 @@ b/points values conflict with B/G, a selected point whose prefix
 commit is missing from PACK.h or conflicts with it, and op 11's
 segment-chain and per-item checks over the whole G; for config op 13
 code 3 also covers a C read/write error and code 4 a C with invalid
-UTF-8/JSON syntax, duplicate keys, or non-finite numbers; for
+UTF-8/JSON syntax, duplicate keys, or non-finite numbers; config op 14
+code 5 also covers an invalid BASE/OUT shape, a BASE that conflicts
+with the current v, and an OUT that names PACK, and code 3 covers an
+OUT read error other than a missing OUT and an OUT write error; op 14
+exports a compact snapshot of the current t/p as a v=0 pack (h only
+[0,t,p]) that config and policyreplay accept with identical current
+routing and policy answers, writes OUT via the same exclusive
+same-directory staging atomic replace in the canonical compact UTF-8
+form with one trailing LF, skips the replace when OUT already holds
+those exact bytes, never modifies PACK, and on a write failure leaves
+OUT's bytes untouched and removes only its own staging temp file; for
 compoundcp code 3 also covers a STATE read/write error and code 5
 also covers a STATE whose key order, content, or h digest is invalid,
 an e/p entry that is not item-by-item what compound emits, e/p times
@@ -9653,6 +9663,31 @@ def _config_multi_checkpoint(pack_path, pack, v, history, mode, base,
             "config": new_pack}
 
 
+def _config_compact_export(pack_path, pack, v, topo, policy, out_path):
+    # Compact snapshot export (config op 14): [14, BASE, OUT]. BASE must
+    # equal the current v (checked by the caller after PACK validation)
+    # and OUT must name a file other than PACK (enforced by
+    # _write_distinct_atomic against the abspath and, when both paths
+    # exist, os.path.samefile). The export is the minimal independently
+    # loadable pack {"v": 0, "t": t, "p": p, "h": [[0, t, p]]} built
+    # only from the current t/p, so the long history is never copied:
+    # O(S) extra space beyond the parsed pack with S the canonical
+    # snapshot byte size. Every public config-pack entry (config,
+    # policyreplay) accepts it at version 0 and its t/p routing and
+    # policy answers are exactly those of the source's current version.
+    # OUT receives its canonical compact UTF-8 bytes (one trailing LF)
+    # via one same-directory exclusive-staging atomic replace, or
+    # nothing when OUT already holds those exact bytes (status 1); a
+    # missing or differing OUT is created/replaced (status 0). PACK is
+    # never modified; a write failure leaves OUT's bytes untouched and
+    # removes only this call's staging temp file.
+    export = {"v": 0, "t": topo, "p": policy, "h": [[0, topo, policy]]}
+    status = _write_distinct_atomic(out_path, [pack_path],
+                                    _state_payload(export))
+    return {"op": 14, "status": status, "sourceVersion": v,
+            "config": export}
+
+
 def _validate_hotload_records(links, events, data, node_set, pair_set, a, b):
     # Stream validation matching slogate's data contract (the record
     # checks inside compute_convstat) without running the windowed gate:
@@ -13759,6 +13794,19 @@ def main():
             ckpt_path = op[4]
             if type(ckpt_path) is not str or len(ckpt_path) == 0:
                 fail(5)
+        elif kind == 14:
+            # [14, BASE, OUT]: compact snapshot export. BASE is a
+            # non-boolean integer that must equal the current v (the
+            # conflict is checked after PACK validation); OUT is a
+            # non-empty path that must not name PACK (enforced by
+            # _write_distinct_atomic from _config_compact_export
+            # against both the normalized path and, when both paths
+            # exist, os.path.samefile).
+            if len(op) != 3 or type(op[1]) is not int \
+                    or not 0 <= op[1] <= MAX_COST \
+                    or type(op[2]) is not str or len(op[2]) == 0:
+                fail(5)
+            base, out_path = op[1], op[2]
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -13769,6 +13817,9 @@ def main():
             _validate_topology(new_t, metrics=True)
             if not _is_policy(new_p):
                 fail(5)
+        if kind == 14 and base != v:
+            # BASE must name the source's current version.
+            fail(5)
         if kind == 0:
             try:
                 with open(out_path, "rb") as f:
@@ -13832,6 +13883,9 @@ def main():
             result = _config_multi_checkpoint(pack_path, pack, v,
                                               history, mode, base,
                                               segments, ckpt_path)
+        elif kind == 14:
+            result = _config_compact_export(pack_path, pack, v, topo,
+                                            policy, out_path)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
