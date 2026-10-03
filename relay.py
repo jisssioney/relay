@@ -202,6 +202,34 @@ false, no write) while every other b/current-version mismatch rejects;
 the result key order is op,mode,status,old,new,applied,events,config
 with each events row [e,status,old,new,diff]; any failure leaves PACK
 and every temp file untouched;
+config op 17 code 5 also covers a mode outside 0/1, an out-of-range
+b/e/L, a non-boolean L, a non-array or empty E or Q, an [e,t,p] event
+whose e is not a non-boolean integer or whose clocks decrease, an
+invalid event t/p, a repeated [s,d] pair or a non-string endpoint, a Q
+endpoint absent from h[b]'s topology, a b that conflicts with the
+current v except an exact already-applied resend, a history suffix
+that conflicts with the simulated suffix, and a new version that would
+overflow MAX_COST;
+op 17 is op 16's batched event-clock transaction
+[17,m,b,E,Q,L] with a per-event routing-impact gate: Q is a non-empty
+list of distinct [s,d] pairs over h[b]'s topology and L the largest
+tolerated single-route cost increase; starting at h[b], each
+non-idempotent event compares every pair's route before and after with
+the route subcommand's lowest-cost deterministic path, emitting impact
+rows [s,d,oldCost,newCost,oldPath,newPath,pass] in Q order (null and []
+when unreachable), passing when the old route is unreachable or the new
+route stays reachable with newCost-oldCost <= L; the first failing
+event is row status 2, stops the simulation, and rejects the whole
+batch as a normal status-2 result (exit code 0, applied false, old/new
+the pre-call v, config the pre-call object) rather than a code-5
+error, while an idempotent event keeps row status 1 with no
+impact rows and no version; passing events, duplicate-resend
+recognition, the preview/commit difference, and the single atomic
+replace follow op 16 exactly; the result key order is
+op,mode,status,old,new,applied,events,config with each events row
+[e,status,old,new,impact], old/new/config the pre-call versions and
+object on every rejected call, applied false there, and PACK unchanged;
+any failure leaves PACK and every temp file untouched;
 for
 compoundcp code 3 also covers a STATE read/write error and code 5
 also covers a STATE whose key order, content, or h digest is invalid,
@@ -12900,6 +12928,169 @@ def _config_event_batch(pack_path, pack, v, history, mode, base, events):
             "config": new_pack}
 
 
+def _config_event_batch_gated(pack_path, pack, v, history, mode, base,
+                              events, queries, limit):
+    # Gated batched event-clock configuration transaction (config op 17):
+    # [17, m, b, E, Q, L]. It reuses op 16's clock-sorted batch shape and
+    # commit/duplicate semantics but adds a per-event routing-impact gate.
+    # m is 0 (read-only preview) or 1 (atomic commit); b is the
+    # caller-observed base version; E is op 16's non-empty, clock
+    # non-decreasing [e, t, p] sequence; Q is a non-empty list of distinct
+    # [s, d] pairs whose endpoints must both be nodes of h[b]'s topology;
+    # L is a non-boolean integer in 0..MAX_COST, the largest tolerated
+    # single-route cost increase.
+    #
+    # All inputs are validated before any routing is simulated. Simulation
+    # then starts at h[b] and walks the events in order. Routes follow the
+    # route subcommand's lowest-cost, deterministic-tie-break semantics
+    # (shortest_paths); each distinct query source is searched once per
+    # state and shared across that state's pairs. An event whose t/p equals
+    # the previous state is idempotent: row status 1, no version, and no
+    # impact rows. Every other event is compared against the previous
+    # state for each pair in Q order: the impact row is
+    # [s, d, oldCost, newCost, oldPath, newPath, pass] with null and []
+    # for an unreachable route. A pair passes when the old route is
+    # unreachable, or the new route is reachable and newCost-oldCost <= L;
+    # a cost decrease always passes. An event whose pairs all pass is a
+    # candidate version (row status 0, next continuous version); the first
+    # event that fails is row status 2, simulation stops, and the whole
+    # batch is rejected as a normal result (top-level status 2, exit code
+    # 0, applied false, old/new the pre-call v, config the pre-call pack,
+    # events truncated at and including that row) - a gate failure is a
+    # semantic reject, not one of the code-5 shape/range errors. PACK is
+    # never touched and no temp file is left.
+    #
+    # A gate-passing batch follows op 16 exactly: a first processing
+    # against the current version (b == v) has batch status 0 and applied
+    # is true only for a mode-1 commit with at least one change; a resend
+    # whose simulated change suffix already matches PACK's consecutive
+    # suffix from b is a duplicate (status 1, applied false, no write);
+    # every other b != v case and a new version past MAX_COST reject with
+    # code 5. The status-2 rejection reports old = new = pre-call v with
+    # config the pre-call pack; the duplicate mirrors op 16's old = b,
+    # new = v. mode 0 writes nothing and mode 1 replaces PACK at most
+    # once, atomically. The time bound is
+    # O(BK(V^2 + A) + S) - one O(V^2 + A) Dijkstra search per event per
+    # distinct source, with K the distinct query sources - and the extra
+    # space O(S + BRV + KV) for the B*R impact rows (R = |Q|) and the
+    # per-state shared shortest-path trees.
+    if base > v:
+        fail(5)
+    base_t = history[base][1]
+    base_p = history[base][2]
+    base_node_set = set(base_t["nodes"])
+    for s, d in queries:
+        if s not in base_node_set or d not in base_node_set:
+            fail(5)
+    # All inputs (shapes, t/p, and the Q/L contracts) were validated
+    # before the pack; finish with the full clock check here so every
+    # input is validated before any routing is simulated.
+    last_e = None
+    for event in events:
+        e = event[0]
+        if last_e is not None and e < last_e:
+            fail(5)
+        last_e = e
+
+    def route_state(topo):
+        # One lowest-cost shortest-path tree per distinct query source,
+        # shared across every pair with that source in this state. Endpoints
+        # absent from this state's topology count as an unreachable route.
+        node_set = set(topo["nodes"])
+        nodes = topo["nodes"]
+        links = topo["links"]
+        trees = {}
+        routes = []
+        for s, d in queries:
+            if s not in node_set or d not in node_set:
+                routes.append((None, []))
+                continue
+            if s not in trees:
+                trees[s] = shortest_paths(nodes, links, s)
+            cost_of, path_of = trees[s]
+            cost = cost_of[d]
+            routes.append((cost, list(path_of[d]) if cost is not None
+                           else []))
+        return routes
+
+    cur_version = base
+    cur_t = base_t
+    cur_p = base_p
+    rows = []
+    suffix = []
+    for event in events:
+        e, new_t, new_p = event
+        if new_t == cur_t and new_p == cur_p:
+            # Same (t, p): idempotent regardless of e, no version and no
+            # routing-impact rows.
+            rows.append([e, 1, cur_version, cur_version, []])
+            continue
+        old_routes = route_state(cur_t)
+        new_routes = route_state(new_t)
+        impact = []
+        event_passes = True
+        for (s, d), (old_cost, old_path), (new_cost, new_path) in zip(
+                queries, old_routes, new_routes):
+            if old_cost is None:
+                pair_pass = True
+            elif new_cost is None or new_cost - old_cost > limit:
+                pair_pass = False
+            else:
+                pair_pass = True
+            if not pair_pass:
+                event_passes = False
+            impact.append([s, d, old_cost, new_cost, old_path, new_path,
+                           pair_pass])
+        if not event_passes:
+            # First failing event: stop and reject the whole batch. No
+            # later event is simulated and PACK is never touched.
+            rows.append([e, 2, cur_version, cur_version, impact])
+            return {"op": 17, "mode": mode, "status": 2, "old": v,
+                    "new": v, "applied": False, "events": rows,
+                    "config": pack}
+        if cur_version >= MAX_COST:
+            fail(5)
+        next_version = cur_version + 1
+        rows.append([e, 0, cur_version, next_version, impact])
+        suffix.append([next_version, new_t, new_p])
+        cur_version = next_version
+        cur_t, cur_p = new_t, new_p
+    change_count = len(suffix)
+
+    if base != v:
+        # The only tolerated stale base is an exact resend, exactly as in
+        # op 16: PACK must already end at the simulated suffix with every
+        # entry equal; anything else is a version/suffix conflict.
+        if change_count == 0 or v != base + change_count:
+            fail(5)
+        for offset, entry in enumerate(suffix, start=1):
+            if history[base + offset] != entry:
+                fail(5)
+        # Duplicate resend: mirror op 16 exactly - status 1, applied
+        # false, nothing written, old/new the resend's base..current
+        # span and config the pre-call (current) pack.
+        return {"op": 17, "mode": mode, "status": 1, "old": base,
+                "new": v, "applied": False, "events": rows,
+                "config": pack}
+
+    if change_count == 0:
+        # Every event idempotent at the current version: nothing to append,
+        # so a commit writes nothing either.
+        return {"op": 17, "mode": mode, "status": 0, "old": base,
+                "new": base, "applied": False, "events": rows,
+                "config": pack}
+    new_pack = {"v": v + change_count, "t": cur_t, "p": cur_p,
+                "h": history + suffix}
+    if mode == 1:
+        _write_state_atomic(pack_path, new_pack)
+        applied = True
+    else:
+        applied = False
+    return {"op": 17, "mode": mode, "status": 0, "old": base,
+            "new": v + change_count, "applied": applied, "events": rows,
+            "config": new_pack}
+
+
 def _config_rollback_log(pack_path, pack, v, history, mode, base, log,
                          out_path):
     # Rollback log export/replay (config op 10): [10, m, B, L, O]. L is
@@ -18634,6 +18825,45 @@ def main():
                 if type(item[0]) is not int \
                         or not 0 <= item[0] <= MAX_COST:
                     fail(5)
+        elif kind == 17:
+            # [17, m, b, E, Q, L]: batched event-clock configuration
+            # transaction with a per-event routing-impact gate. m, b, and
+            # E are shaped exactly like op 16's (t/p validated after PACK
+            # validation). Q is a non-empty list of distinct [s, d]
+            # endpoint pairs (presence in h[b]'s topology checked after
+            # PACK validation) and L is a non-boolean integer in
+            # 0..MAX_COST, the largest tolerated per-route cost increase.
+            if len(op) != 6 or type(op[1]) is not int \
+                    or op[1] not in (0, 1) \
+                    or type(op[2]) is not int \
+                    or not 0 <= op[2] <= MAX_COST:
+                fail(5)
+            mode, base = op[1], op[2]
+            events = op[3]
+            if not isinstance(events, list) or not events:
+                fail(5)
+            for item in events:
+                if not isinstance(item, list) or len(item) != 3:
+                    fail(5)
+                if type(item[0]) is not int \
+                        or not 0 <= item[0] <= MAX_COST:
+                    fail(5)
+            queries = op[4]
+            if not isinstance(queries, list) or not queries:
+                fail(5)
+            seen_queries = set()
+            for pair in queries:
+                if not isinstance(pair, list) or len(pair) != 2:
+                    fail(5)
+                s, d = pair
+                if type(s) is not str or type(d) is not str \
+                        or (s, d) in seen_queries:
+                    fail(5)
+                seen_queries.add((s, d))
+            limit = op[5]
+            if type(limit) is not int or isinstance(limit, bool) \
+                    or not 0 <= limit <= MAX_COST:
+                fail(5)
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -18644,7 +18874,7 @@ def main():
             _validate_topology(new_t, metrics=True)
             if not _is_policy(new_p):
                 fail(5)
-        if kind == 16:
+        if kind in (16, 17):
             # Every event t follows the metric topology and every p the
             # six-integer policy contract, exactly like op 8's target.
             for item in events:
@@ -18724,6 +18954,10 @@ def main():
         elif kind == 16:
             result = _config_event_batch(pack_path, pack, v, history,
                                          mode, base, events)
+        elif kind == 17:
+            result = _config_event_batch_gated(pack_path, pack, v, history,
+                                               mode, base, events,
+                                               queries, limit)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
