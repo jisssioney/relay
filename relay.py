@@ -30,6 +30,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py netqdisc FILE CONFIG DATA
        python relay.py qdiscfail FILE CONFIG EVENTS DATA
        python relay.py qdiscimpair FILE CONFIG EVENTS DATA
+       python relay.py policyqdiscimpair FILE CONFIG RULES EVENTS DATA
        python relay.py converge FILE SRC DST D R EVENTS
        python relay.py ecmpconverge FILE SOURCE DESTINATION DELAY RUN FLOWS EVENTS
        python relay.py policy FILE S D P C RULES
@@ -74,7 +75,7 @@ for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
 policytx op 4 also OUT),
 4 JSON syntax
 (for forward/loopsafe also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/qdisc/reorder/tbucket/netqueue/netfragment/policyqueue/ecmpqueue/netshape/netfail/policyfail/netimpair/netreorder/netqdisc/qdiscfail/qdiscimpair/converge/ecmpconverge/policy/reserve/rebalance/retune also those in
+for queue/qdisc/reorder/tbucket/netqueue/netfragment/policyqueue/ecmpqueue/netshape/netfail/policyfail/netimpair/netreorder/netqdisc/qdiscfail/qdiscimpair/policyqdiscimpair/converge/ecmpconverge/policy/reserve/rebalance/retune also those in
 FILE/DATA/QUEUES/MTUS/SHAPERS/CLASSES/CONFIG/EVENTS/FLOWS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
@@ -1350,6 +1351,52 @@ lost,count,n,j]: the number of sends lost, the number of sends
 started, and the final settings. Worst case is qdiscfail's bound
 plus O(X+H) time for X impair events and H started sends, with O(E)
 extra space.
+policyqdiscimpair is read-only and takes FILE CONFIG RULES EVENTS DATA
+on one explicit event clock, combining qdiscimpair's per-link deficit
+round-robin, total/class dual-capacity admission, fault queue clearing,
+snapshotted periodic loss and latency offset, dynamic topology, and
+exact phase order with policyfail's rule-based suffix selection.
+FILE/CONFIG/EVENTS reuse qdiscimpair's exact metric topology, classes
+and links capacities, and kind 0/1/2 event contract; RULES is
+policyfail's policytx [n,s,d,a,b,c,path] set (c null the class
+wildcard; a c naming a class absent from CONFIG.classes is not an
+error and simply never matches); DATA follows policyfail's
+[id,time,source,destination,size,port,class] contract with the class
+additionally required to occur in CONFIG.classes and may be empty.
+Each packet keeps its injection-time source, destination, port, and
+class and selects a suffix at exactly three moments: at injection
+(cause 0), on every whole one-hop arrival (cause 1), and when a fault
+event pulls it unsent from a waiting queue (cause 2). Rules are
+considered by ascending n with ties in array order, matching source,
+destination, the port interval [a, b], and the class; a rule is usable
+only when its explicit path contains the current node exactly once,
+the suffix starting there ends at the packet's original destination,
+and every suffix node and directed edge is up. The first usable rule
+supplies its suffix; with none the packet takes the lowest-cost
+current-topology path with the full node sequence's Unicode order as
+the tie-break, rule null; with neither it ends unreachable. Selection
+moments, decision rows, zero-hop handling, and the reroutes counter
+follow policyfail; overflow occupies and enqueues nothing and leaves
+every deficit and the cursor untouched; loss snapshots, the down-over-
+loss fault precedence, phases, and the MAX_TIME rule follow
+qdiscimpair. Result top-level key order is packets,events,links.
+Packet rows append decisions to qdiscimpair's eleven fields,
+[id,class,status,path,finish,delay,dropLink,hops,reroutes,dropObject,
+lost,decisions] in DATA order; each decision is
+[time,node,rule,suffix,cause] with rule the original rule index or
+null, suffix [] with no route, and no decision for a zero-hop
+delivery. events and links keep qdiscimpair's exact statistics, order,
+and final state. Validation finishes before the clock starts: wrong
+argument count exits 2, FILE unreadable 3, strict JSON errors
+(UTF-8, syntax, duplicate keys, non-finite numbers) in any of the five
+JSON inputs exit 4, and every other shape, type, range, reference,
+topology, or clock overflow error exits 5; failure leaves stdout
+empty. Success writes compact UTF-8 JSON plus one LF, byte-identical
+for identical input, and writes no files. Worst case is
+O(D(KV+(V+E) log V)+H(C+log(P+E))+Q+X) for K rules, V nodes, E links,
+P packets, C classes, X events, D decisions, H actual hops, and Q total
+DRR class visits, with O(KV+V+E+P+H+D+EC) extra space besides the
+output.
 loopsafe takes FILE DESTINATION TABLE and is read-only: FILE uses
 forward's strict topology (duplicate keys and non-finite numbers code
 4), DESTINATION must name a node, and TABLE is a JSON object whose key
@@ -5843,6 +5890,536 @@ def compute_qdiscimpair(nodes, links, class_specs, cap_of, packets,
         # A kind-2 impair setting updates the link and reports all
         # zeroes, moving no packet and bumping no generation; kind 0/1
         # follow qdiscfail's fault/flush semantics verbatim.
+        if ev[1] == 2:
+            frm, to, nn, jj = ev[2], ev[3], ev[4], ev[5]
+            li = pair_index[(frm, to)]
+            imp_n[li] = nn
+            imp_j[li] = jj
+            return 0, 0, 0
+        if ev[1] == 0:
+            node, up = ev[2], ev[3]
+            if node_up[node] == up:
+                return 0, 0, 0
+            node_up[node] = up
+            adj_dirty[0] = True
+            gen[0] += 1
+            if up:
+                return 1, 0, 0
+            affected = sorted(active[node])
+            fault_obj = node
+        else:
+            frm, to, up = ev[2], ev[3], ev[4]
+            li = pair_index[(frm, to)]
+            if link_up[li] == up:
+                return 0, 0, 0
+            link_up[li] = up
+            adj_dirty[0] = True
+            gen[0] += 1
+            if up:
+                return 1, 0, 0
+            affected = [li]
+            fault_obj = [frm, to]
+        faulted = set()
+        flushed = []
+        for a in affected:
+            if busy[a]:
+                faulted.add(sending_of[a])
+            # Pull every not-yet-sent packet from every class queue,
+            # releasing both capacity shares; deficits and the cursor
+            # are not DRR decisions and stay untouched.
+            for c in range(C):
+                q = queues[a][c]
+                while q:
+                    ci = q.popleft()
+                    size = packets[ci][4]
+                    link_used[a] -= size
+                    class_used[a][c] -= size
+                    results[ci][7].pop()
+                    fault_removed[a] += 1
+                    flushed.append(ci)
+        for ci in faulted:
+            a = inflight[ci]
+            busy[a] = False
+            sending_of[a] = None
+            inflight[ci] = None
+            end_terminal(ci, "fault", now, None, fault_obj)
+        for a in affected:
+            refresh_active(a)
+        for ci in sorted(flushed):
+            admit(ci, now, diverted=True)
+        return 1, len(flushed), len(faulted)
+
+    e_at = 0
+    en = len(events)
+    inject_at = 0
+
+    def next_inject_time():
+        return packets[inject_at][1] if inject_at < n else None
+
+    def next_time():
+        t = events[e_at][0] if e_at < en else None
+        nt = next_inject_time()
+        if nt is not None and (t is None or nt < t):
+            t = nt
+        if completion_heap:
+            ct = completion_heap[0][0]
+            if t is None or ct < t:
+                t = ct
+        if reception_heap:
+            rt = reception_heap[0][0]
+            if t is None or rt < t:
+                t = rt
+        return t
+
+    event_rows = []
+
+    while True:
+        now = next_time()
+        if now is None:
+            break
+        check_time(now)
+        # Phase 1: settings at this tick in EVENTS input order; the
+        # admissions their flushes trigger queue here and only start in
+        # the final phase of this tick.
+        while e_at < en and events[e_at][0] == now:
+            ev = events[e_at]
+            e_at += 1
+            if ev[1] == 2:
+                apply_event(ev, now)
+                event_rows.append([ev[0], 2, [ev[2], ev[3]],
+                                   [ev[4], ev[5]], 0, 0, 0])
+                continue
+            changed, requeued, faults = apply_event(ev, now)
+            target = ev[2] if ev[1] == 0 else [ev[2], ev[3]]
+            event_rows.append([ev[0], ev[1], target, ev[-1], changed,
+                               requeued, faults])
+        # Phases 2..4 repeat until the instant is stable: completions,
+        # receptions and injections merged in DATA order, then one DRR
+        # decision per idle link in FILE link order.
+        moved = True
+        while moved:
+            moved = False
+            while completion_heap and completion_heap[0][0] == now:
+                _, li, i = heapq.heappop(completion_heap)
+                if state[i] == 2:
+                    continue
+                complete_send(now, li, i)
+                moved = True
+            due = []
+            while reception_heap and reception_heap[0][0] == now:
+                _, i = heapq.heappop(reception_heap)
+                if state[i] != 2:
+                    due.append(i)
+            injected = []
+            while inject_at < n and packets[inject_at][1] <= now:
+                j = inject_at
+                inject_at += 1
+                if state[j] == 0:
+                    injected.append(j)
+            a = b = 0
+            while a < len(due) or b < len(injected):
+                if b >= len(injected) or (a < len(due)
+                                          and due[a] < injected[b]):
+                    i = due[a]
+                    a += 1
+                    receive_packet(i, now)
+                else:
+                    i = injected[b]
+                    b += 1
+                    state[i] = 1
+                    admit(i, now, first=True)
+            if due or injected:
+                moved = True
+            if runnable_heap:
+                run_due_links(now)
+                moved = True
+
+    for i in range(n):
+        results[i][3] = prefix[i]
+    link_rows = []
+    for li in range(E):
+        class_rows = [[names[c], cls_enq[li][c], cls_ovf[li][c],
+                       cls_peak[li][c], cls_sent[li][c]]
+                      for c in range(C)]
+        link_rows.append([links[li]["from"], links[li]["to"],
+                          admitted_c[li], overflows_c[li], peak[li],
+                          last_depart[li], class_rows,
+                          fault_removed[li], link_up[li], lost_c[li],
+                          send_count[li], imp_n[li], imp_j[li]])
+    return {"packets": results, "events": event_rows,
+            "links": link_rows}
+
+
+def compute_policyqdiscimpair(nodes, links, class_specs, cap_of,
+                              packets, events, rules):
+    # Policy routing on qdiscimpair's per-link DRR impairment clock.
+    # The DRR queues, total/class dual-capacity admission (overflows
+    # occupy and enqueue nothing and leave every deficit and the cursor
+    # untouched), fault flushes, snapshotted [n, j] impairment, loss
+    # precedence, phase order, and MAX_TIME rule follow
+    # compute_qdiscimpair verbatim; the suffix selection and decisions
+    # follow compute_policyfail. Each packet tuple is
+    # (id, time, source, destination, size, port, class index) and keeps
+    # its injection-time source, destination, port, and class for its
+    # whole life.
+    #
+    # A suffix is re-selected at exactly three moments: injection
+    # (cause 0), every whole one-hop arrival (cause 1), and a down event
+    # that pulls the packet unsent from a waiting queue (cause 2). Rules
+    # are considered by ascending n with ties in array order; a rule
+    # matches on source/destination, the port interval [a, b], and the
+    # class (null the wildcard), and is usable only when its explicit
+    # path contains the current node exactly once, the suffix from there
+    # ends at the original destination, and every suffix node and
+    # directed edge is up. The first usable rule supplies its suffix;
+    # with none the packet takes the lowest-cost current-topology path
+    # with the Unicode node-sequence tie-break, rule null; with neither
+    # it ends unreachable. Each selection appends
+    # [time, node, rule, suffix, cause] (suffix [] with no route); a
+    # zero-hop delivery records no decision. The reroutes counter follows
+    # policyfail.
+    E = len(links)
+    C = len(class_specs)
+    names = [c[0] for c in class_specs]
+    quanta = [c[1] for c in class_specs]
+    class_caps = [c[2] for c in class_specs]
+    bw = [l["bandwidth"] for l in links]
+    lat = [l["latency"] for l in links]
+    link_cap = [cap_of[i] for i in range(E)]
+
+    node_up = {u: True for u in nodes}
+    link_up = [bool(links[i]["up"]) for i in range(E)]
+    pair_index = {(links[i]["from"], links[i]["to"]): i
+                  for i in range(E)}
+
+    # Priority order (ascending n, ties in array order) is shared by
+    # every decision scan.
+    order = _priority_order(rules)
+
+    # Impairment state per link: imp_n/imp_j the current settings,
+    # send_count the sends started, lost_c the sends that ended lost.
+    imp_n = [0] * E
+    imp_j = [0] * E
+    send_count = [0] * E
+    lost_c = [0] * E
+
+    n = len(packets)
+    # Per-link DRR state, fully independent between links.
+    queues = [[deque() for _ in range(C)] for _ in range(E)]
+    link_used = [0] * E
+    class_used = [[0] * C for _ in range(E)]
+    deficit = [[0] * C for _ in range(E)]
+    cursor = [0] * E
+    busy = [False] * E
+    sending_of = [None] * E
+    after_completion = [False] * E
+    admitted_c = [0] * E
+    overflows_c = [0] * E
+    peak = [0] * E
+    last_depart = [0] * E
+    fault_removed = [0] * E
+    cls_enq = [[0] * C for _ in range(E)]
+    cls_ovf = [[0] * C for _ in range(E)]
+    cls_peak = [[0] * C for _ in range(E)]
+    cls_sent = [[0] * C for _ in range(E)]
+    # active[u]: incident links currently sending or carrying a
+    # nonempty class queue, so a node-down event visits only links
+    # that can hold affected packets.
+    active = {u: set() for u in nodes}
+
+    loc = [packets[i][2] for i in range(n)]
+    prefix = [[] for _ in range(n)]
+    # state[i]: 0 not yet injected, 1 live, 2 terminal.
+    state = [0] * n
+    inflight = [None] * n
+    # route[i] the suffix tuple currently followed and sgen[i] the
+    # topology generation the selection was made in.
+    route = [None] * n
+    rpos = [0] * n
+    sgen = [-1] * n
+    gen = [0]
+    # results[i] = [id, class, status, path, finish, delay, dropLink,
+    # hops, reroutes, dropObject, lost, decisions]. The first eleven
+    # fields follow qdiscimpair; decisions holds the policyfail
+    # [time,node,rule,suffix,cause] rows in processing order.
+    results = [[pid, names[klass], None, [], None, None, None, [], 0,
+                None, False, []]
+               for pid, _, _, _, _, _, klass in packets]
+    # cur_n/cur_j snapshot the impair setting of the send a packet is
+    # currently making (0 while not sending).
+    cur_n = [0] * n
+    cur_j = [0] * n
+
+    adj_cache = [None]
+    adj_dirty = [True]
+
+    def build_adj():
+        adj = {u: [] for u in nodes}
+        for i, l in enumerate(links):
+            if (link_up[i] and node_up[l["from"]]
+                    and node_up[l["to"]]):
+                adj[l["from"]].append((l["to"], l["cost"]))
+        return adj
+
+    def suffix_up(suffix):
+        # Every node and directed edge of the suffix is up. Rule paths
+        # were validated against FILE, so every pair is in pair_index.
+        for x in suffix:
+            if not node_up[x]:
+                return False
+        for a, b in zip(suffix, suffix[1:]):
+            li = pair_index[(a, b)]
+            if not link_up[li] or not node_up[a] or not node_up[b]:
+                return False
+        return True
+
+    def check_time(value):
+        if value > MAX_TIME:
+            fail(5)
+        return value
+
+    def end_terminal(i, status, now, link_obj, obj):
+        state[i] = 2
+        results[i][2] = status
+        results[i][4] = now
+        results[i][5] = now - packets[i][1]
+        results[i][6] = link_obj
+        results[i][9] = obj
+
+    def choose_suffix(i):
+        # First usable policy rule suffix from loc[i] to the original
+        # destination, else the lowest-cost up path (rule null); returns
+        # (rule_index, suffix tuple) or (None, None) when unreachable.
+        u = loc[i]
+        src = packets[i][2]
+        dest = packets[i][3]
+        port = packets[i][5]
+        klass = names[packets[i][6]]
+        for ri in order:
+            _, s, d, a, b, c, rpath = rules[ri]
+            if s != src or d != dest:
+                continue
+            if not a <= port <= b:
+                continue
+            if c is not None and c != klass:
+                continue
+            if rpath.count(u) != 1:
+                continue
+            j = rpath.index(u)
+            suffix = rpath[j:]
+            if suffix[-1] != dest:
+                continue
+            if suffix_up(suffix):
+                return ri, tuple(suffix)
+        if adj_dirty[0]:
+            adj_cache[0] = build_adj()
+            adj_dirty[0] = False
+        dist = _netfail_dijkstra(nodes, adj_cache[0], u)
+        entry = dist.get(dest)
+        del dist
+        if entry is None:
+            return None, None
+        return None, entry[1]
+
+    def refresh_active(li):
+        l = links[li]
+        present = li in active[l["from"]]
+        has = busy[li] or any(queues[li][c] for c in range(C))
+        if has and not present:
+            active[l["from"]].add(li)
+            active[l["to"]].add(li)
+        elif not has and present:
+            active[l["from"]].discard(li)
+            active[l["to"]].discard(li)
+
+    def admit(i, now, first=False, diverted=False):
+        # The packet is whole at loc[i]. A fresh rule/fallback selection
+        # runs at injection, on every whole arrival, and after a flush;
+        # each run appends one decision row. A zero-hop packet delivers
+        # without a selection. The capacity test is netqdisc's pair
+        # (link total AND the packet's fixed class), an overflow
+        # occupying and enqueuing nothing and leaving every deficit and
+        # the cursor untouched.
+        source = loc[i]
+        cidx = packets[i][6]
+        if source == packets[i][3]:
+            if not prefix[i]:
+                prefix[i] = [source]
+            end_terminal(i, "delivered", now, None, None)
+            return
+        cause = 0 if first else (2 if diverted else 1)
+        old_suffix = (None if first or route[i] is None
+                      else tuple(route[i][rpos[i]:]))
+        ri, new_t = choose_suffix(i)
+        results[i][11].append(
+            [now, source, ri, [] if new_t is None else list(new_t),
+             cause])
+        if new_t is None:
+            if not first:
+                if diverted or sgen[i] != gen[0]:
+                    results[i][8] += 1
+                end_terminal(i, "unreachable", now, None, None)
+            else:
+                state[i] = 2
+                results[i][2] = "unreachable"
+            return
+        if not first:
+            changed = new_t != old_suffix
+            if diverted:
+                if changed:
+                    results[i][8] += 1
+            elif sgen[i] != gen[0] and changed:
+                results[i][8] += 1
+        route[i] = new_t
+        rpos[i] = 0
+        sgen[i] = gen[0]
+        if not prefix[i]:
+            prefix[i] = [source]
+        to = route[i][1]
+        li = pair_index[(source, to)]
+        hop = {"from": source, "to": to, "arrive": now, "start": None,
+               "depart": None, "receive": None, "wait": None}
+        results[i][7].append(hop)
+        size = packets[i][4]
+        if (link_used[li] + size > link_cap[li]
+                or class_used[li][cidx] + size > class_caps[cidx]):
+            end_terminal(i, "overflow", now, [source, to], [source, to])
+            overflows_c[li] += 1
+            cls_ovf[li][cidx] += 1
+            return
+        link_used[li] += size
+        if link_used[li] > peak[li]:
+            peak[li] = link_used[li]
+        class_used[li][cidx] += size
+        if class_used[li][cidx] > cls_peak[li][cidx]:
+            cls_peak[li][cidx] = class_used[li][cidx]
+        admitted_c[li] += 1
+        cls_enq[li][cidx] += 1
+        queues[li][cidx].append(i)
+        refresh_active(li)
+        if not busy[li]:
+            heapq.heappush(runnable_heap, li)
+
+    completion_heap = []
+    reception_heap = []
+    runnable_heap = []
+
+    def drr_pick(li, start):
+        # compute_qdisc/DRR scan, as in compute_netqdisc.
+        c = start
+        nonempty_seen = False
+        visited = 0
+        while True:
+            q = queues[li][c]
+            if q:
+                nonempty_seen = True
+                deficit[li][c] += quanta[c]
+                head = q[0]
+                if deficit[li][c] >= packets[head][4]:
+                    return c, head
+            else:
+                deficit[li][c] = 0
+            c = (c + 1) % C
+            visited += 1
+            if visited == C:
+                if not nonempty_seen:
+                    return None
+                nonempty_seen = False
+                visited = 0
+
+    def send_head(li, cidx, i, now):
+        size = packets[i][4]
+        queues[li][cidx].popleft()
+        # Starting frees the waiting bytes (class share and link total)
+        # at once; the non-preemptible send itself holds no bytes.
+        link_used[li] -= size
+        class_used[li][cidx] -= size
+        deficit[li][cidx] -= size
+        cursor[li] = cidx
+        busy[li] = True
+        sending_of[li] = i
+        inflight[i] = li
+        # The counter increments and the current n, j are snapshotted
+        # before the send runs; settings changing during the send never
+        # affect it.
+        send_count[li] += 1
+        cur_n[i] = imp_n[li]
+        cur_j[i] = imp_j[li]
+        depart = check_time(now + (size + bw[li] - 1) // bw[li])
+        hop = results[i][7][-1]
+        hop["start"] = now
+        hop["depart"] = depart
+        hop["wait"] = now - hop["arrive"]
+        cls_sent[li][cidx] += 1
+        refresh_active(li)
+        heapq.heappush(completion_heap, (depart, li, i))
+
+    def schedule_link(li, now):
+        # One DRR decision on idle link li, netqdisc's fresh vs.
+        # post-completion distinction verbatim.
+        if after_completion[li]:
+            after_completion[li] = False
+            cidx = cursor[li]
+            q = queues[li][cidx]
+            if q and deficit[li][cidx] >= packets[q[0]][4]:
+                send_head(li, cidx, q[0], now)
+                return
+            if not q:
+                deficit[li][cidx] = 0
+            chosen = drr_pick(li, (cidx + 1) % C)
+        else:
+            chosen = drr_pick(li, cursor[li])
+        if chosen is not None:
+            send_head(li, chosen[0], chosen[1], now)
+
+    def run_due_links(now):
+        # One FILE-order pass; each idle link makes at most one DRR
+        # decision; an all-empty scan simply sends nothing.
+        while runnable_heap:
+            li = heapq.heappop(runnable_heap)
+            if busy[li]:
+                continue
+            schedule_link(li, now)
+
+    def complete_send(now, li, i):
+        busy[li] = False
+        sending_of[li] = None
+        inflight[i] = None
+        last_depart[li] = now
+        refresh_active(li)
+        after_completion[li] = True
+        heapq.heappush(runnable_heap, li)
+        nn = cur_n[i]
+        jj = cur_j[i]
+        if nn and send_count[li] % nn == 0:
+            # The packet occupied the sender through depart and ends
+            # here as lost: no reception is scheduled, the final hop
+            # keeps arrive/start/depart with null receive.
+            lost_c[li] += 1
+            results[i][10] = True
+            end_terminal(i, "lost", now, None,
+                         [links[li]["from"], links[li]["to"]])
+            return
+        receive = check_time(now + lat[li] + jj)
+        results[i][7][-1]["receive"] = receive
+        heapq.heappush(reception_heap, (receive, i))
+
+    def receive_packet(i, now):
+        node = results[i][7][-1]["to"]
+        if not node_up[node]:
+            end_terminal(i, "fault", now, None, node)
+            return
+        loc[i] = node
+        prefix[i].append(node)
+        rpos[i] += 1
+        admit(i, now)
+
+    def apply_event(ev, now):
+        # A kind-2 impair setting updates the link and reports all
+        # zeroes, moving no packet and bumping no generation; kind 0/1
+        # follow qdiscfail's fault/flush semantics verbatim, with each
+        # flushed packet re-selecting its suffix once (a cause-2
+        # decision) in DATA index order on the post-event topology.
         if ev[1] == 2:
             frm, to, nn, jj = ev[2], ev[3], ev[4], ev[5]
             li = pair_index[(frm, to)]
@@ -15845,6 +16422,184 @@ def main():
                             class_index[klass]))
         result = compute_qdiscimpair(nodes, links, classes, cap_of,
                                      packets, events)
+    elif argv[1] == "policyqdiscimpair":
+        if len(argv) != 7:
+            fail(2)
+        file_path, config_text, rules_text, events_text, data_text = (
+            argv[2], argv[3], argv[4], argv[5], argv[6])
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        link_pairs_set = {(l["from"], l["to"]) for l in links}
+        latency_of = {(l["from"], l["to"]): l["latency"] for l in links}
+        # Parse all four inline JSON inputs (code 4) before any
+        # structural check (code 5), like qdiscimpair/policyfail.
+        try:
+            config = json.loads(config_text,
+                                parse_constant=_reject_constant,
+                                parse_float=_finite_float,
+                                object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        try:
+            raw_rules = json.loads(rules_text,
+                                   parse_constant=_reject_constant,
+                                   parse_float=_finite_float,
+                                   object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        try:
+            raw_events = json.loads(events_text,
+                                    parse_constant=_reject_constant,
+                                    parse_float=_finite_float,
+                                    object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        # CONFIG follows qdiscimpair/netqdisc exactly: classes of
+        # [name,quantum,classCapacity] and a links table covering every
+        # directed FILE link once with its totalCapacity.
+        if not isinstance(config, dict) or set(config) != {"classes",
+                                                           "links"}:
+            fail(5)
+        raw_classes = config["classes"]
+        if not isinstance(raw_classes, list) or not raw_classes:
+            fail(5)
+        classes = []
+        seen_names = set()
+        for item in raw_classes:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            name, quantum, capacity = item
+            if type(name) is not str or name == "" or name in seen_names:
+                fail(5)
+            try:
+                name.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_names.add(name)
+            if type(quantum) is not int or not 1 <= quantum <= MAX_COST:
+                fail(5)
+            if type(capacity) is not int or not 1 <= capacity <= MAX_COST:
+                fail(5)
+            classes.append((name, quantum, capacity))
+        class_index = {name: i for i, (name, _, _) in enumerate(classes)}
+        raw_link_caps = config["links"]
+        if not isinstance(raw_link_caps, list):
+            fail(5)
+        cap_of_pair = {}
+        for item in raw_link_caps:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            frm, to, capacity = item
+            if type(frm) is not str or type(to) is not str:
+                fail(5)
+            pair = (frm, to)
+            if pair not in link_pairs_set or pair in cap_of_pair:
+                fail(5)
+            if type(capacity) is not int or not 1 <= capacity <= MAX_COST:
+                fail(5)
+            cap_of_pair[pair] = capacity
+        if set(cap_of_pair) != link_pairs_set:
+            fail(5)
+        cap_of = [cap_of_pair[(l["from"], l["to"])] for l in links]
+        # RULES is policyfail's policytx [n,s,d,a,b,c,path] set; a rule
+        # class absent from CONFIG.classes simply never matches and is
+        # not itself an error, exactly as in policyfail.
+        rules = _validate_policytx_rules(raw_rules, node_set,
+                                         link_pairs_set)
+        # EVENTS follows qdiscimpair: topology settings plus
+        # [t,2,from,to,n,j] loss-modulus/latency-offset settings.
+        if not isinstance(raw_events, list) or not raw_events:
+            fail(5)
+        events = []
+        previous_event_time = None
+        for event in raw_events:
+            if not isinstance(event, list) or len(event) not in (4, 5, 6):
+                fail(5)
+            t, kind = event[0], event[1]
+            if type(t) is not int or not 0 <= t <= MAX_TIME:
+                fail(5)
+            if previous_event_time is not None and t < previous_event_time:
+                fail(5)
+            previous_event_time = t
+            if type(kind) is not int or kind not in (0, 1, 2):
+                fail(5)
+            if kind == 0:
+                if len(event) != 4:
+                    fail(5)
+                _, _, node, up = event
+                if type(node) is not str or node not in node_set:
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                events.append((t, 0, node, up))
+            elif kind == 1:
+                if len(event) != 5:
+                    fail(5)
+                _, _, frm, to, up = event
+                if (type(frm) is not str or type(to) is not str
+                        or (frm, to) not in link_pairs_set):
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                events.append((t, 1, frm, to, up))
+            else:
+                if len(event) != 6:
+                    fail(5)
+                _, _, frm, to, nn, jj = event
+                if (type(frm) is not str or type(to) is not str
+                        or (frm, to) not in link_pairs_set):
+                    fail(5)
+                if type(nn) is not int or not 0 <= nn <= MAX_COST:
+                    fail(5)
+                if type(jj) is not int:
+                    fail(5)
+                if latency_of[(frm, to)] + jj < 0:
+                    fail(5)
+                events.append((t, 2, frm, to, nn, jj))
+        # DATA follows policyfail's 7-tuple packet contract with the
+        # class additionally required to occur in CONFIG.classes, as in
+        # qdiscimpair; may be empty.
+        if not isinstance(data, list):
+            fail(5)
+        packets = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 7:
+                fail(5)
+            pid, time, source, destination, size, port, klass = item
+            if (type(pid) is not str or pid == ""
+                    or not 1 <= len(pid) <= MAX_FLOW_LEN
+                    or pid in seen_ids):
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_ids.add(pid)
+            if type(time) is not int or not 0 <= time <= MAX_TIME:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if source not in node_set or destination not in node_set:
+                fail(5)
+            if type(size) is not int or not 1 <= size <= MAX_COST:
+                fail(5)
+            if type(port) is not int or not 0 <= port <= 65535:
+                fail(5)
+            if type(klass) is not str or klass not in class_index:
+                fail(5)
+            packets.append((pid, time, source, destination, size, port,
+                            class_index[klass]))
+        result = compute_policyqdiscimpair(nodes, links, classes, cap_of,
+                                           packets, events, rules)
     elif argv[1] == "converge":
         if len(argv) != 8:
             fail(2)
