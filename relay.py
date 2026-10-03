@@ -695,6 +695,38 @@ the result key order is op,mode,status,old,new,applied,events,config
 with each events row [e,status,old,new,impact]; for B events, S
 scenarios, K distinct flow sources, F flows, V nodes, and A links the
 bound is O(B(S+1)(K(V^2+A)+FV+A)) time and O(KV+FV+A) extra space;
+op 28 is op 27's batched compound-failure latency gate
+[28,m,b,E,F,S,L,C] with m/b/E/F/S/L carrying op 27's exact semantics
+and C a non-boolean integer in 0..1000000 bounding a single scenario's
+migrated demand as a fraction of total demand; each non-idempotent
+event compares the candidate against the previous state routing both
+sides per scenario, no-failure first and then the S scenarios in
+order, with failure objects, the lowest-cost path, and the
+full-node-sequence Unicode tie break exactly as in op 27; for one
+scenario a flow is a migration only when reachable on both sides with
+different complete paths, movedDemand sums those flows' demand and
+totalDemand every flow's demand, and each scenario must satisfy
+movedDemand/totalDemand <= C/1000000 by integer cross multiplication;
+the event also needs every flow reachable within its own maxLatency,
+no overloaded link, and a cross-scenario worst-peak rise at most
+L/1000000; it emits the same impact [oldWorst,newWorst,delta,scenarios]
+where each new-side scenario row is
+[scenarioId,peak,movedDemand,totalDemand,movedRatio,pass,flows,links],
+flows in F order
+[id,oldCost,newCost,oldLatency,newLatency,oldPath,newPath,moved,pass]
+(null cost/latency and [] on an unreachable side) and links in
+candidate topology order [from,to,bandwidth,used,utilization], all
+ratios six-decimal half-up strings and delta signed; an h[b] scenario
+that is unreachable, overloaded, or beyond a flow's maxLatency is code
+5, and the first failing candidate is events-row status 2 after which
+the batch rejects with the pre-call version and config and writes
+nothing in either mode; an equal-state event is status 1 with an empty
+impact; preview, one atomic commit, exact-resend idempotency, and
+consecutive version semantics follow op 27; for B events, S scenarios,
+K distinct sources, F flows, V nodes, and A links the bound is
+O(B(S+1)(K(V^2+A)+FV+A)) time and O(KV+FV+A) extra space; config op
+28 code 5 additionally covers a wrong arity and a C outside
+0..1000000, while every op 27 code-5 case still applies;
 for
 compoundcp code 3 also covers a STATE read/write error and code 5
 also covers a STATE whose key order, content, or h digest is invalid,
@@ -16552,6 +16584,319 @@ def _config_clatency_gate_batch(pack_path, pack, v, history, mode, base,
             "config": new_pack}
 
 
+def _config_clatmig_iter(old_topo, new_topo, flows, flow_count, prepared):
+    # Yield one (sid, old_record, new_record) pair per compound-failure
+    # scenario in scenario order for op 28: the no-failure scenario
+    # first (sid None), then one pair per prepared scenario in S order.
+    # Each record is the tuple returned by _config_clatency_scenario for
+    # that side, so a scenario routes on the lowest-cost available path
+    # with the full-node-sequence Unicode tie break on each side and
+    # carries each path's integer latency sum; failure objects an
+    # earlier candidate deleted drop out of that side's filtering
+    # naturally. Only one scenario's pair of routings is live at a time.
+    old_nodes, old_links = old_topo["nodes"], old_topo["links"]
+    new_nodes, new_links = new_topo["nodes"], new_topo["links"]
+    old_rec = _config_clatency_scenario(old_nodes, old_links, old_links,
+                                        flows, flow_count)
+    new_rec = _config_clatency_scenario(new_nodes, new_links, new_links,
+                                        flows, flow_count)
+    yield None, old_rec, new_rec
+    for sid, fail_node_set, explicit_pairs in prepared:
+        old_active_nodes = [node for node in old_nodes
+                            if node not in fail_node_set]
+        old_active_links = [link for link in old_links
+                            if link["from"] not in fail_node_set
+                            and link["to"] not in fail_node_set
+                            and (link["from"], link["to"]) not in
+                            explicit_pairs]
+        new_active_nodes = [node for node in new_nodes
+                            if node not in fail_node_set]
+        new_active_links = [link for link in new_links
+                            if link["from"] not in fail_node_set
+                            and link["to"] not in fail_node_set
+                            and (link["from"], link["to"]) not in
+                            explicit_pairs]
+        old_rec = _config_clatency_scenario(old_active_nodes, old_links,
+                                            old_active_links, flows,
+                                            flow_count)
+        new_rec = _config_clatency_scenario(new_active_nodes, new_links,
+                                            new_active_links, flows,
+                                            flow_count)
+        yield sid, old_rec, new_rec
+
+
+def _config_clatmig_assess(old_topo, new_topo, flows, flow_count, prepared,
+                           total_demand, moved_ppm, render):
+    # Walk op 28's compound-failure scenarios in order (no-failure then S
+    # order) routing BOTH sides per scenario, tracking each side's
+    # running worst (the first strict maximum wins, records being
+    # visited in tie-break order). A new-side scenario fails when any
+    # flow is unreachable, any link is overloaded, any reachable flow's
+    # integer latency sum exceeds its own maxLatency, or the migrated
+    # share exceeds moved_ppm/1000000; a flow migrates only when it is
+    # reachable on both sides and its two complete paths differ, and
+    # movedDemand is the summed demand of migrated flows while
+    # totalDemand is the demand of every flow. All ratio checks are
+    # integer cross multiplication. When render is true each new-side
+    # scenario is emitted straight into the returned rows as
+    # [scenarioId, peak, movedDemand, totalDemand, movedRatio, pass,
+    # flows, links] - those rows are the result, not working space. Flow
+    # rows follow F order as
+    # [id, oldCost, newCost, oldLatency, newLatency, oldPath, newPath,
+    # moved, pass] with a null cost/latency and [] path on an
+    # unreachable side, moved false unless both sides are reachable with
+    # differing paths, and pass the new-side latency compliance; link
+    # rows follow the candidate topology in order. Returns
+    # (old_worst..., new_worst..., all_reachable, no_over, latency_ok,
+    # migration_ok, rows), worst_sid None tagging the no-failure
+    # scenario. Extra space is just the one live scenario pair:
+    # O(KV + FV + A).
+    old_worst_sid = None
+    old_worst_num, old_worst_den = 0, 1
+    new_worst_sid = None
+    new_worst_num, new_worst_den = 0, 1
+    all_reachable = True
+    no_over = True
+    latency_ok = True
+    migration_ok = True
+    rows = []
+    for pair in _config_clatmig_iter(old_topo, new_topo, flows,
+                                     flow_count, prepared):
+        sid, old_rec, new_rec = pair
+        (old_paths, old_costs, old_latencies, _, old_peak,
+         old_reachable, old_over) = old_rec
+        (new_paths, new_costs, new_latencies, new_used, new_peak,
+         new_reachable, new_over) = new_rec
+        old_num, old_den = old_peak
+        new_num, new_den = new_peak
+        if old_num * old_worst_den > old_worst_num * old_den:
+            old_worst_sid, old_worst_num, old_worst_den = \
+                sid, old_num, old_den
+        if new_num * new_worst_den > new_worst_num * new_den:
+            new_worst_sid, new_worst_num, new_worst_den = \
+                sid, new_num, new_den
+        moved = [False] * flow_count
+        moved_demand = 0
+        scenario_latency_ok = True
+        for i, item in enumerate(flows):
+            op_ = old_paths[i]
+            np_ = new_paths[i]
+            if np_ is not None and new_latencies[i] > item[4]:
+                scenario_latency_ok = False
+            if op_ is not None and np_ is not None and op_ != np_:
+                moved[i] = True
+                moved_demand += item[3]
+        # movedDemand/totalDemand <= moved_ppm/1000000 by cross multiply.
+        scenario_moved_ok = (moved_demand * 1000000
+                             <= moved_ppm * total_demand)
+        if not new_reachable:
+            all_reachable = False
+        if new_over:
+            no_over = False
+        if not scenario_latency_ok:
+            latency_ok = False
+        if not scenario_moved_ok:
+            migration_ok = False
+        if render:
+            flow_rows = []
+            for i, item in enumerate(flows):
+                op_ = old_paths[i]
+                np_ = new_paths[i]
+                flow_rows.append(
+                    [item[0],
+                     None if op_ is None else old_costs[i],
+                     None if np_ is None else new_costs[i],
+                     None if op_ is None else old_latencies[i],
+                     None if np_ is None else new_latencies[i],
+                     [] if op_ is None else op_,
+                     [] if np_ is None else np_,
+                     bool(moved[i]),
+                     np_ is not None and new_latencies[i] <= item[4]])
+            link_rows = []
+            for index, link in enumerate(new_topo["links"]):
+                u = new_used[index]
+                link_rows.append([link["from"], link["to"],
+                                  link["bandwidth"], u,
+                                  _config_capacity_six(u,
+                                                       link["bandwidth"])])
+            scenario_pass = (new_reachable and not new_over
+                             and scenario_latency_ok
+                             and scenario_moved_ok)
+            rows.append([sid, _config_capacity_six(new_num, new_den),
+                         moved_demand, total_demand,
+                         _config_capacity_six(moved_demand, total_demand),
+                         scenario_pass, flow_rows, link_rows])
+    return (old_worst_sid, old_worst_num, old_worst_den,
+            new_worst_sid, new_worst_num, new_worst_den,
+            all_reachable, no_over, latency_ok, migration_ok, rows)
+
+
+def _config_clatmig_gate_batch(pack_path, pack, v, history, mode, base,
+                               events, flows, limit_ppm, scenario_specs,
+                               moved_ppm):
+    # Batched hotload with a per-event compound-failure latency and
+    # per-scenario migration gate (config op 28):
+    # [28, m, b, E, F, S, L, C]. m, b, E, F, S, and L carry op 27's
+    # exact semantics (F the [id, source, destination, demand,
+    # maxLatency] shape and L the worst-utilization-increase cap in
+    # parts per million); C is a non-boolean integer in 0..1000000, the
+    # largest migrated demand of one scenario as a fraction of total
+    # demand.
+    #
+    # Every input validates first (shapes in the command entry; the h[b]
+    # reference/endpoint/scenario checks, clocks, and event t/p here),
+    # then simulation walks from h[b] in E order. Each non-idempotent
+    # event compares the candidate against the previous state with both
+    # sides routed in scenario order: the no-failure scenario first and
+    # then each S scenario in order, failure objects, the lowest-cost
+    # path, and the full-node-sequence Unicode tie break all exactly as
+    # in op 27. For one scenario a flow is a migration only when it is
+    # reachable on both sides and the complete paths differ; movedDemand
+    # is those flows' demand and totalDemand every flow's demand, and
+    # each scenario must satisfy movedDemand/totalDemand <= C/1000000.
+    # The event must additionally leave every flow reachable in every
+    # new-side scenario within its own maxLatency, every link within its
+    # bandwidth, and the cross-scenario worst peak rise at most
+    # L/1000000; every ratio is compared by integer cross
+    # multiplication. Any unreachable flow, overloaded link, or
+    # beyond-maxLatency flow in an h[b] scenario is code 5, as is a
+    # reachable path whose latency sum exceeds MAX_TIME.
+    #
+    # An event whose t/p equals the previous state is idempotent (row
+    # status 1, no version, an empty impact). A passing event (row
+    # status 0, a candidate version) and the first failing event alike
+    # carry the impact [oldWorst, newWorst, delta, scenarios] with a
+    # worst [scenarioId, peak] (scenarioId null for no failure else the
+    # scenario id string) and scenarios listing only the new side as
+    # [scenarioId, peak, movedDemand, totalDemand, movedRatio, pass,
+    # flows, links]; flows are
+    # [id, oldCost, newCost, oldLatency, newLatency, oldPath, newPath,
+    # moved, pass] ([id, null, null, null, null, [], [], false, false]
+    # when unreachable on both sides) and links
+    # [from, to, bandwidth, used, utilization] in candidate topology
+    # order, the ratios six-decimal half-up strings and delta signed.
+    # At the first failing event simulation stops at once and the whole
+    # batch rejects: batch status 2, old/new both the pre-call v,
+    # applied false, config the pre-call pack, and PACK untouched in
+    # either mode.
+    #
+    # Once every event is a gated candidate, version/history append,
+    # duplicate-resend recognition, the preview/commit difference, and
+    # the single atomic replace follow op 16/27 exactly. For B events,
+    # S scenarios, K distinct flow sources, F flows, V nodes, and A
+    # links the bound is O(B(S+1)(K(V^2+A) + FV + A)) time and
+    # O(KV + FV + A) extra space besides the returned result.
+    if base > v:
+        fail(5)
+    base_topo = history[base][1]
+    base_node_set = set(base_topo["nodes"])
+    for item in flows:
+        if item[1] not in base_node_set or item[2] not in base_node_set:
+            fail(5)
+    prepared = _config_compound_prepare(base_topo["nodes"],
+                                        base_topo["links"], flows,
+                                        scenario_specs)
+    last_e = None
+    for item in events:
+        e = item[0]
+        if last_e is not None and e < last_e:
+            fail(5)
+        last_e = e
+        _validate_topology(item[1], metrics=True)
+        if not _is_policy(item[2]):
+            fail(5)
+
+    flow_count = len(flows)
+    total_demand = 0
+    for item in flows:
+        total_demand += item[3]
+    cur_version = base
+    cur_t = history[base][1]
+    cur_p = history[base][2]
+    # The batch is only defined from a failure-feasible h[b]: every
+    # flow must be routable in every scenario within its maxLatency and
+    # every link within its bandwidth there. Every later previous
+    # state is a candidate that passed the same gate, so each compared
+    # old side is feasible and its own routed worst is the exact old
+    # worst used below.
+    (_, _, _, cur_reachable, cur_no_over, cur_latency_ok, _) = \
+        _config_clatency_assess(cur_t["nodes"], cur_t["links"], flows,
+                                flow_count, prepared, False)
+    if not cur_reachable or not cur_no_over or not cur_latency_ok:
+        fail(5)
+
+    rows = []
+    suffix = []
+    for event in events:
+        e, new_t, new_p = event
+        if new_t == cur_t and new_p == cur_p:
+            rows.append([e, 1, cur_version, cur_version, []])
+            continue
+        if cur_version >= MAX_COST:
+            fail(5)
+        (old_worst_sid, old_worst_num, old_worst_den,
+         new_worst_sid, new_worst_num, new_worst_den,
+         new_reachable, new_no_over, new_latency_ok, migration_ok,
+         scenario_rows) = _config_clatmig_assess(
+             cur_t, new_t, flows, flow_count, prepared, total_demand,
+             moved_ppm, True)
+        passed = (new_reachable and new_no_over and new_latency_ok
+                  and migration_ok)
+        if passed:
+            # Exact comparison of the worst-peak increase against
+            # L/1000000: newWorst - oldWorst <= L/1000000.
+            delta_num = new_worst_num * old_worst_den \
+                - old_worst_num * new_worst_den
+            increase_ok = (delta_num * 1000000
+                           <= limit_ppm * new_worst_den * old_worst_den)
+            if not increase_ok:
+                passed = False
+        impact = _config_compound_impact(
+            old_worst_sid, old_worst_num, old_worst_den,
+            new_worst_sid, new_worst_num, new_worst_den, scenario_rows)
+        if not passed:
+            rows.append([e, 2, cur_version, cur_version, impact])
+            return {"op": 28, "mode": mode, "status": 2, "old": v,
+                    "new": v, "applied": False, "events": rows,
+                    "config": pack}
+        next_version = cur_version + 1
+        rows.append([e, 0, cur_version, next_version, impact])
+        suffix.append([next_version, new_t, new_p])
+        cur_version = next_version
+        cur_t, cur_p = new_t, new_p
+    change_count = len(suffix)
+
+    if base != v:
+        # The only tolerated stale base is an exact resend: PACK must
+        # already end exactly at the simulated suffix with every entry
+        # equal; anything else is a version/suffix conflict.
+        if change_count == 0 or v != base + change_count:
+            fail(5)
+        for offset, entry in enumerate(suffix, start=1):
+            if history[base + offset] != entry:
+                fail(5)
+        return {"op": 28, "mode": mode, "status": 1, "old": base,
+                "new": v, "applied": False, "events": rows,
+                "config": pack}
+
+    if change_count == 0:
+        # All events idempotent at the current version: nothing to
+        # append, so a commit writes nothing either.
+        return {"op": 28, "mode": mode, "status": 0, "old": base,
+                "new": base, "applied": False, "events": rows,
+                "config": pack}
+    new_pack = {"v": v + change_count, "t": cur_t, "p": cur_p,
+                "h": history + suffix}
+    if mode == 1:
+        _write_state_atomic(pack_path, new_pack)
+        applied = True
+    else:
+        applied = False
+    return {"op": 28, "mode": mode, "status": 0, "old": base,
+            "new": v + change_count, "applied": applied, "events": rows,
+            "config": new_pack}
+
+
 def _config_rollback_log(pack_path, pack, v, history, mode, base, log,
                          out_path):
     # Rollback log export/replay (config op 10): [10, m, B, L, O]. L is
@@ -23066,6 +23411,91 @@ def main():
             if type(limit_ppm) is not int \
                     or not 0 <= limit_ppm <= 1000000:
                 fail(5)
+        elif kind == 28:
+            # [28, m, b, E, F, S, L, C]: batched hotload with a
+            # per-event compound-failure latency gate exactly like op
+            # 27's plus a per-scenario migration cap. m/b/E/F/S/L carry
+            # op 27's exact input semantics (F the same
+            # [id, source, destination, demand, maxLatency] shape and L
+            # the worst-utilization-increase cap in parts per million);
+            # C is a non-boolean integer in 0..1000000 bounding one
+            # scenario's migrated demand as a fraction of total demand.
+            # Every op 27 structural and simulation check also applies;
+            # the per-scenario movedDemand/totalDemand cross-multiply,
+            # the b-vs-v conflict / duplicate-suffix check, and the
+            # MAX_COST overflow check run in _config_clatmig_gate_batch.
+            if len(op) != 8 or type(op[1]) is not int \
+                    or op[1] not in (0, 1) \
+                    or type(op[2]) is not int \
+                    or not 0 <= op[2] <= MAX_COST:
+                fail(5)
+            mode, base = op[1], op[2]
+            events = op[3]
+            if not isinstance(events, list) or not events:
+                fail(5)
+            for item in events:
+                if not isinstance(item, list) or len(item) != 3:
+                    fail(5)
+                if type(item[0]) is not int \
+                        or not 0 <= item[0] <= MAX_COST:
+                    fail(5)
+            flows = op[4]
+            if not isinstance(flows, list) or not flows:
+                fail(5)
+            seen_ids = set()
+            for flow in flows:
+                if not isinstance(flow, list) or len(flow) != 5:
+                    fail(5)
+                fid, fs, fd, demand, max_latency = flow
+                if type(fid) is not str or fid == "" or fid in seen_ids:
+                    fail(5)
+                seen_ids.add(fid)
+                if type(fs) is not str or type(fd) is not str or fs == fd:
+                    fail(5)
+                if type(demand) is not int \
+                        or not 1 <= demand <= MAX_COST:
+                    fail(5)
+                if type(max_latency) is not int \
+                        or not 0 <= max_latency <= MAX_COST:
+                    fail(5)
+            scenario_specs = op[5]
+            if not isinstance(scenario_specs, list) or not scenario_specs:
+                fail(5)
+            seen_scenario_ids = set()
+            for spec in scenario_specs:
+                if not isinstance(spec, list) or len(spec) != 3:
+                    fail(5)
+                sid, fail_nodes, fail_links = spec
+                if type(sid) is not str or sid == "" \
+                        or sid in seen_scenario_ids:
+                    fail(5)
+                seen_scenario_ids.add(sid)
+                if not isinstance(fail_nodes, list):
+                    fail(5)
+                seen_nodes = set()
+                for node in fail_nodes:
+                    if type(node) is not str or node in seen_nodes:
+                        fail(5)
+                    seen_nodes.add(node)
+                if not isinstance(fail_links, list):
+                    fail(5)
+                seen_pairs = set()
+                for pair in fail_links:
+                    if not isinstance(pair, list) or len(pair) != 2:
+                        fail(5)
+                    a, c = pair
+                    if type(a) is not str or type(c) is not str \
+                            or (a, c) in seen_pairs:
+                        fail(5)
+                    seen_pairs.add((a, c))
+            limit_ppm = op[6]
+            if type(limit_ppm) is not int \
+                    or not 0 <= limit_ppm <= 1000000:
+                fail(5)
+            moved_ppm = op[7]
+            if type(moved_ppm) is not int \
+                    or not 0 <= moved_ppm <= 1000000:
+                fail(5)
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -23207,6 +23637,11 @@ def main():
                                                  history, mode, base,
                                                  events, flows, limit_ppm,
                                                  scenario_specs)
+        elif kind == 28:
+            result = _config_clatmig_gate_batch(pack_path, pack, v,
+                                                history, mode, base,
+                                                events, flows, limit_ppm,
+                                                scenario_specs, moved_ppm)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
