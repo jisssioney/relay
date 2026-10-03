@@ -343,6 +343,53 @@ single atomic replace follow op 16; the result key order is
 op,mode,status,old,new,applied,events,config with each events row
 [e,status,old,new,impact]; the bound is O(BR(V^2+A)) time and
 O(BRV+V+A) extra space for B events, R queries, V nodes, and A links;
+config op 21 code 5 also covers a mode outside 0/1, an out-of-range
+b/e, an L outside 0..1000000, a non-array or empty E, an [e,t,p] event
+whose e is not a non-boolean integer or whose clocks decrease, an
+invalid event t/p, a non-array/empty F or [id,source,destination,demand]
+flow with a non-string/empty/duplicate id, equal or non-string
+endpoints, or a demand outside 1..MAX_COST, an F endpoint absent from
+h[b]'s topology, h[b] itself carrying an unreachable flow or an
+overloaded link, a b that conflicts with the current v except an exact
+already-applied resend, a history suffix that conflicts with the
+simulated suffix, a new version that would overflow MAX_COST, and a
+reachable path cost above MAX_TIME; op 21 is op 16's batched hotload
+plus a per-event business-flow capacity gate [21,m,b,E,F,L] with L in
+0..1000000 the peak-increment ceiling as a per-million fraction: F is a
+non-empty array of [id,source,destination,demand] flows with a unique
+non-empty string id, distinct endpoints that are nodes of h[b]'s
+topology, and demand a non-boolean integer in 1..MAX_COST; inputs
+validate before any simulation, which starts at h[b] and walks the
+clock-sorted events in E order; an event equal to the previous state is
+idempotent (events-row status 1, no version, an empty impact) and every
+other event routes each flow independently over up links only along the
+route subcommand's lowest-cost path with the full-node-sequence Unicode
+code point tie break, takes each link's used as the sum of its
+traversing flows' demands, and requires every flow reachable, every
+link at most its bandwidth, and the peak - the exact maximum of
+used/bandwidth over links - to rise by no more than L/1000000, every
+comparison by integer cross-multiplication with no floating point; the
+impact is [oldPeak,newPeak,delta,flows,links] with flows in F order as
+[id,oldCost,newCost,oldPath,newPath] (null cost and [] path for an
+unreachable side, an endpoint missing from that topology included) and
+links in candidate topology order as
+[from,to,bandwidth,used,utilization]; oldPeak/newPeak and utilization
+are six-decimal half-up fixed-point strings (the same rule and
+"0.000000" zero as a rebalance peak) and delta is the signed
+six-decimal half-up new-minus-old difference over the peaks' exact
+rationals; the first failing event is events-row status 2 with
+old/new both the pre-call version, after which simulation stops and the
+whole batch rejects with batch status 2, applied false and the pre-call
+config, PACK untouched in both modes with no PACK write or leftover
+temp file (old/new the pre-call versions); with all events gated
+candidates, version/history append, duplicate-resend recognition, the
+preview/commit difference, the single atomic replace, and the
+status/applied semantics follow op 16; the result key order is
+op,mode,status,old,new,applied,events,config with each events row
+[e,status,old,new,impact]; the bound is O(B(K(V^2+A)+FV+A)) time and
+O(KV+FV+A) extra space apart from the result for B events, K distinct
+flow sources, F flows, V nodes, and A links (one Dijkstra table per
+distinct source, each path at most V nodes);
 for
 compoundcp code 3 also covers a STATE read/write error and code 5
 also covers a STATE whose key order, content, or h digest is invalid,
@@ -14273,6 +14320,238 @@ def _config_protect_gate_batch(pack_path, pack, v, history, mode, base,
             "config": new_pack}
 
 
+def _config_capacity_gate_batch(pack_path, pack, v, history, mode, base,
+                                events, flows, peak_limit):
+    # Batched hotload with a per-event flow-capacity gate (config op
+    # 21): [21, m, b, E, F, L]. m is 0 (read-only preview) or 1 (atomic
+    # commit); b the caller-observed base version; E a non-empty array
+    # of non-decreasing-clock [e, t, p] events exactly like op 16's; F
+    # a non-empty list of [id, source, destination, demand] flows with a
+    # unique non-empty string id, distinct endpoints that are nodes of
+    # h[b]'s topology, and a demand a non-boolean integer in
+    # 1..MAX_COST; L a non-boolean integer in 0..1000000, the largest
+    # allowed peak utilization increase as a per-million fraction.
+    #
+    # Every input validates first (shapes in the command entry; the F
+    # endpoints against h[b]'s topology, clocks, and event t/p here),
+    # then simulation walks from h[b] in E order. An event whose t/p
+    # equals the previous state is idempotent (row status 1, no version,
+    # an empty impact). Every other event is a candidate: each flow is
+    # routed independently on up links only via the same lowest-cost
+    # path and full-node-sequence Unicode tie break as the route
+    # subcommand, and link used is the sum of the traversing flows'
+    # demands. A side with an unreachable flow, or a link whose used
+    # exceeds its bandwidth, fails. The side peak is the exact maximum
+    # over links of used/bandwidth (the null-placement peak is 0/1); an
+    # event passes only when every flow is reachable, every link fits,
+    # and newPeak-oldPeak <= L/1000000, every comparison by integer
+    # cross-multiplication, never floats. The impact is
+    # [oldPeak, newPeak, delta, flows, links]: flows follows F order as
+    # [id, oldCost, newCost, oldPath, newPath] with null cost and []
+    # path for an unreachable side (an endpoint missing from that
+    # topology included); links follows the candidate topology's order
+    # as
+    # [from, to, bandwidth, used, utilization] with utilization the
+    # six-decimal half-up used/bandwidth string. oldPeak/newPeak use the
+    # same six-decimal fixed-point strings as a rebalance peak and delta
+    # is the signed six-decimal half-up new-minus-old difference over
+    # the peaks' exact rationals (never a subtraction of rounded
+    # strings), exact zero as "0.000000". At the first failing
+    # non-idempotent event simulation stops at once and the whole batch
+    # rejects: batch status 2, old/new both the pre-call v, applied
+    # false, config the pre-call pack, and PACK untouched in either
+    # mode. A reachable flow path's accumulated cost above MAX_TIME
+    # fails code 5, as do the same clock/base/version conflicts as op
+    # 16's gates.
+    #
+    # Once every event is a gated candidate, version/history append,
+    # duplicate-resend recognition, the preview/commit difference, and
+    # the single atomic replace follow op 16 exactly. O(B(K(V^2+A) + FV
+    # + A)) time and O(KV + FV + A) extra space apart from the emitted
+    # result: B events, K distinct flow sources (K <= F), F flows, V
+    # nodes, and A links (one Dijkstra table per distinct source, only
+    # the queried destinations retained, each path at most V nodes).
+    if base > v:
+        fail(5)
+    base_nodes = history[base][1]["nodes"]
+    base_node_set = set(base_nodes)
+    for _fid, s, d, _demand in flows:
+        if s not in base_node_set or d not in base_node_set:
+            fail(5)
+    last_e = None
+    for item in events:
+        e = item[0]
+        if last_e is not None and e < last_e:
+            fail(5)
+        last_e = e
+        _validate_topology(item[1], metrics=True)
+        if not _is_policy(item[2]):
+            fail(5)
+
+    million = 1000000
+
+    def side_placement(topo):
+        # Lowest-cost up-only routes, one Dijkstra per distinct source,
+        # then per-link demand totals in the topology's link order. A
+        # reachable path cost above MAX_TIME is code 5, matching route.
+        # Returns per-flow (cost, path), the used array aligned with
+        # topo["links"], and the exact peak fraction (num, den).
+        nodes, links = topo["nodes"], topo["links"]
+        node_set = set(nodes)
+        index_of = {}
+        for index, link in enumerate(links):
+            index_of[(link["from"], link["to"])] = index
+        routes = {}
+        for _fid, s, _d, _demand in flows:
+            if s not in routes and s in node_set:
+                routes[s] = shortest_paths(nodes, links, s)
+        placed = []
+        used = [0] * len(links)
+        for _fid, s, d, demand in flows:
+            if s not in node_set or d not in node_set:
+                placed.append((None, []))
+                continue
+            cost_of, path_of = routes[s]
+            cost = cost_of[d]
+            if cost is None:
+                placed.append((None, []))
+                continue
+            if cost > MAX_TIME:
+                fail(5)
+            path = path_of[d]
+            placed.append((cost, path))
+            for a, c in zip(path, path[1:]):
+                used[index_of[(a, c)]] += demand
+        peak_num, peak_den = 0, 1
+        for u, link in zip(used, links):
+            bw = link["bandwidth"]
+            if u * peak_den > peak_num * bw:
+                peak_num, peak_den = u, bw
+        return placed, used, peak_num, peak_den
+
+    def signed_delta(new_num, new_den, old_num, old_den):
+        # newPeak-oldPeak over exact rationals, rounded half up to six
+        # decimals as a signed fixed-point string.
+        delta_num = new_num * old_den - old_num * new_den
+        delta_den = new_den * old_den
+        if delta_num == 0:
+            return "0.000000"
+        scaled = (2 * abs(delta_num) * million + delta_den) \
+            // (2 * delta_den)
+        body = "%d.%06d" % (scaled // million, scaled % million)
+        return ("-" + body) if delta_num < 0 else body
+
+    cur_version = base
+    cur_t = history[base][1]
+    cur_p = history[base][2]
+    cur_placed, cur_used, cur_peak_num, cur_peak_den = \
+        side_placement(cur_t)
+    # h[b] itself must carry every flow on a reachable path without an
+    # overloaded link; an infeasible base is code 5 before any event.
+    if any(cost is None for cost, _path in cur_placed) \
+            or any(u > link["bandwidth"]
+                   for u, link in zip(cur_used, cur_t["links"])):
+        fail(5)
+
+    rows = []
+    suffix = []
+    for event in events:
+        e, new_t, new_p = event
+        if new_t == cur_t and new_p == cur_p:
+            rows.append([e, 1, cur_version, cur_version, []])
+            continue
+        if cur_version >= MAX_COST:
+            fail(5)
+        new_placed, new_used, new_peak_num, new_peak_den = \
+            side_placement(new_t)
+        reachable = all(cost is not None for cost, _path in new_placed)
+        fits = all(u <= link["bandwidth"]
+                   for u, link in zip(new_used, new_t["links"]))
+        # Peak-increase gate: newNum/newDen - oldNum/oldDen <= L/1e6,
+        # by cross multiplication against L (zero L asks for no
+        # increase: newNum*oldDen*1e6 <= oldNum*newDen*1e6 + 0).
+        peak_ok = ((new_peak_num * cur_peak_den
+                    - cur_peak_num * new_peak_den) * million
+                   <= peak_limit * new_peak_den * cur_peak_den)
+        next_version = cur_version + 1
+        if not (reachable and fits and peak_ok):
+            flow_rows = []
+            for index, (fid, _s, _d, _demand) in enumerate(flows):
+                old_cost, old_path = cur_placed[index]
+                new_cost, new_path = new_placed[index]
+                flow_rows.append([fid, old_cost, new_cost,
+                                  old_path, new_path])
+            link_rows = []
+            for index, link in enumerate(new_t["links"]):
+                u = new_used[index]
+                link_rows.append([link["from"], link["to"],
+                                  link["bandwidth"], u,
+                                  _format_peak(u, link["bandwidth"])])
+            impact = [_format_peak(cur_peak_num, cur_peak_den),
+                      _format_peak(new_peak_num, new_peak_den),
+                      signed_delta(new_peak_num, new_peak_den,
+                                   cur_peak_num, cur_peak_den),
+                      flow_rows, link_rows]
+            rows.append([e, 2, cur_version, cur_version, impact])
+            return {"op": 21, "mode": mode, "status": 2, "old": v,
+                    "new": v, "applied": False, "events": rows,
+                    "config": pack}
+        flow_rows = []
+        for index, (fid, _s, _d, _demand) in enumerate(flows):
+            old_cost, old_path = cur_placed[index]
+            new_cost, new_path = new_placed[index]
+            flow_rows.append([fid, old_cost, new_cost, old_path,
+                              new_path])
+        link_rows = []
+        for index, link in enumerate(new_t["links"]):
+            u = new_used[index]
+            link_rows.append([link["from"], link["to"],
+                              link["bandwidth"], u,
+                              _format_peak(u, link["bandwidth"])])
+        impact = [_format_peak(cur_peak_num, cur_peak_den),
+                  _format_peak(new_peak_num, new_peak_den),
+                  signed_delta(new_peak_num, new_peak_den,
+                               cur_peak_num, cur_peak_den),
+                  flow_rows, link_rows]
+        rows.append([e, 0, cur_version, next_version, impact])
+        suffix.append([next_version, new_t, new_p])
+        cur_version = next_version
+        cur_t, cur_p = new_t, new_p
+        cur_placed, cur_used = new_placed, new_used
+        cur_peak_num, cur_peak_den = new_peak_num, new_peak_den
+    change_count = len(suffix)
+
+    if base != v:
+        # The only tolerated stale base is an exact resend: PACK must
+        # already end exactly at the simulated suffix with every entry
+        # equal; anything else is a version/suffix conflict.
+        if change_count == 0 or v != base + change_count:
+            fail(5)
+        for offset, entry in enumerate(suffix, start=1):
+            if history[base + offset] != entry:
+                fail(5)
+        return {"op": 21, "mode": mode, "status": 1, "old": base,
+                "new": v, "applied": False, "events": rows,
+                "config": pack}
+
+    if change_count == 0:
+        # All events idempotent at the current version: nothing to
+        # append, so a commit writes nothing either.
+        return {"op": 21, "mode": mode, "status": 0, "old": base,
+                "new": base, "applied": False, "events": rows,
+                "config": pack}
+    new_pack = {"v": v + change_count, "t": cur_t, "p": cur_p,
+                "h": history + suffix}
+    if mode == 1:
+        _write_state_atomic(pack_path, new_pack)
+        applied = True
+    else:
+        applied = False
+    return {"op": 21, "mode": mode, "status": 0, "old": base,
+            "new": v + change_count, "applied": applied, "events": rows,
+            "config": new_pack}
+
+
 def _config_rollback_log(pack_path, pack, v, history, mode, base, log,
                          out_path):
     # Rollback log export/replay (config op 10): [10, m, B, L, O]. L is
@@ -20374,6 +20653,59 @@ def main():
                     or type(backup_limit) is not int \
                     or not 0 <= backup_limit <= MAX_COST:
                 fail(5)
+        elif kind == 21:
+            # [21, m, b, E, F, L]: batched hotload with a per-event
+            # flow-capacity gate. m is 0 (read-only preview) or 1
+            # (atomic commit); b a bounded non-boolean integer base
+            # version; E a non-empty list of [e, t, p] events shaped
+            # exactly like op 16's (e a bounded non-boolean integer,
+            # t/p validated after PACK validation); F a non-empty list
+            # of [id, source, destination, demand] flows with a unique
+            # non-empty string id, string endpoints distinct on each
+            # flow, and demand a non-boolean integer in 1..MAX_COST
+            # (endpoints against h[b] validated after PACK validation);
+            # L a non-boolean integer in 0..1000000, the per-million
+            # peak-increment ceiling. The non-decreasing e check, the F
+            # endpoints against h[b]'s topology, h[b]'s own
+            # reachability/capacity feasibility, the b-vs-v conflict /
+            # duplicate-suffix check, the MAX_COST overflow check, and
+            # routing's MAX_TIME overflow run in
+            # _config_capacity_gate_batch.
+            if len(op) != 6 or type(op[1]) is not int \
+                    or op[1] not in (0, 1) \
+                    or type(op[2]) is not int \
+                    or not 0 <= op[2] <= MAX_COST:
+                fail(5)
+            mode, base = op[1], op[2]
+            events = op[3]
+            if not isinstance(events, list) or not events:
+                fail(5)
+            for item in events:
+                if not isinstance(item, list) or len(item) != 3:
+                    fail(5)
+                if type(item[0]) is not int \
+                        or not 0 <= item[0] <= MAX_COST:
+                    fail(5)
+            flows = op[4]
+            if not isinstance(flows, list) or not flows:
+                fail(5)
+            seen_ids = set()
+            for f in flows:
+                if not isinstance(f, list) or len(f) != 4:
+                    fail(5)
+                fid, s, d, demand = f
+                if type(fid) is not str or fid == "" or fid in seen_ids:
+                    fail(5)
+                seen_ids.add(fid)
+                if type(s) is not str or type(d) is not str or s == d:
+                    fail(5)
+                if type(demand) is not int \
+                        or not 1 <= demand <= MAX_COST:
+                    fail(5)
+            peak_limit = op[5]
+            if type(peak_limit) is not int \
+                    or not 0 <= peak_limit <= 1000000:
+                fail(5)
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -20384,7 +20716,7 @@ def main():
             _validate_topology(new_t, metrics=True)
             if not _is_policy(new_p):
                 fail(5)
-        if kind == 16:
+        if kind == 16 or kind == 21:
             # Every event t follows the metric topology and every p the
             # six-integer policy contract, exactly like op 8's target.
             for item in events:
@@ -20483,6 +20815,11 @@ def main():
                                                 events, queries,
                                                 primary_limit,
                                                 backup_limit)
+        elif kind == 21:
+            result = _config_capacity_gate_batch(pack_path, pack, v,
+                                                 history, mode, base,
+                                                 events, flows,
+                                                 peak_limit)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
