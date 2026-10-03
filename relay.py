@@ -484,6 +484,55 @@ op,mode,status,old,new,applied,events,config with each events row
 flows, V nodes, and A links the bound is
 O(B(K(V^2+A)+FV+A)) time and O(KV+FV+A) extra space besides the
 returned result;
+config op 24 code 5 also covers a mode outside 0/1, an out-of-range
+b/e/L, a non-array or empty E, an [e,t,p] event whose e is not a
+non-boolean integer or whose clocks decrease, an invalid event t/p, a
+non-array/empty F or [id,source,destination,demand] flow with a
+non-unique or empty id, equal endpoints, or a demand outside
+1..MAX_COST, an F endpoint absent from h[b]'s topology, an old-side
+failure scenario (no-failure at h[b] included) with an unreachable flow
+or an overloaded link, a b that conflicts with the current v except an
+exact already-applied resend, a history suffix that conflicts with the
+simulated suffix, and a new version that would overflow MAX_COST; op 24
+is op 16's batched hotload plus a per-event directed-link-failure
+capacity gate [24,m,b,E,F,L] with L in 0..1000000 the largest allowed
+worst-case utilization increase as a fraction of one million: inputs
+validate before any simulation, which starts at h[b] and walks the
+clock-sorted events in E order; an event equal to the previous state is
+idempotent (events-row status 1, no version, an empty impact) and every
+other event compares, on each of the old and new topology in turn, the
+no-failure scenario first and then one scenario per links-array entry
+with that up link treated as down in links order; each scenario routes
+every F flow on the up-link lowest-cost path with the
+full-node-sequence Unicode tie break, a link's used is the summed
+demand of every flow whose path traverses it (a down link carries
+nothing), and the scenario peak is the exact maximum used/bandwidth
+over all links; the side's worst scenario is the peak maximum with
+ties resolved by scenario order (no-failure, then links order); any
+old-side scenario unreachable or overloaded is code 5, while an event
+passes only when every new-side scenario is reachable and not
+overloaded and the exact worst-peak difference is at most L/1000000
+(compared by integer cross multiplication, never floats); the impact is
+[oldWorst,newWorst,delta,scenarios] with each worst [failedLink,peak],
+failedLink null for the no-failure scenario and [from,to] otherwise,
+and scenarios listing only the new side in scenario order as
+[failedLink,peak,pass,flows,links], flows in F order
+[id,cost,path] with an unreachable flow [id,null,[]] and links in the
+scenario topology's order [from,to,bandwidth,used,utilization]; peaks
+and utilization are rounded half up to six-decimal strings and delta is
+a signed six-decimal string from the exact rationals; the first
+failing event is events-row status 2 with old/new both the pre-call
+version, after which simulation stops and the whole batch rejects with
+batch status 2, applied false and the pre-call config, PACK untouched
+in both modes with no partial version or leftover temp file; with all
+events gated candidates, version/history append, duplicate-resend
+recognition, the preview/commit difference, and the single atomic
+replace follow op 16; the result key order is
+op,mode,status,old,new,applied,events,config with each events row
+[e,status,old,new,impact]; for B events, A links, K distinct flow
+sources, F flows, and V nodes the bound is
+O(BA(K(V^2+A)+FV+A)) time, O(KV+FV+A) extra space, and
+O(BA(FV+A)) returned result;
 for
 compoundcp code 3 also covers a STATE read/write error and code 5
 also covers a STATE whose key order, content, or h digest is invalid,
@@ -15161,6 +15210,265 @@ def _config_latency_gate_batch(pack_path, pack, v, history, mode, base,
             "config": new_pack}
 
 
+def _config_resilience_iter(topo, flows, flow_count):
+    # Yield (fail_index, result) for one topology's failure scenarios in
+    # order: first the no-failure scenario (fail_index None, the topology
+    # as it stands), then one scenario per links-array entry with that
+    # link treated as down (a link already down is forced down
+    # identically). result is _config_capacity_side's tuple
+    # (paths, costs, used, peak(Num,Den), reachable, over). The forced
+    # link's "up" is flipped only while its scenario routes and restored
+    # as the generator advances, so the topology is always back in its
+    # input state between yielded records and on exhaustion; only one
+    # scenario result is live at a time. O(A + 1) scenarios at
+    # O(K(V^2 + A) + FV + A) each.
+    nodes = topo["nodes"]
+    links = topo["links"]
+    yield None, _config_capacity_side(nodes, links, flows, flow_count)
+    for fail_index, link in enumerate(links):
+        was_up = link["up"]
+        if was_up:
+            link["up"] = False
+        try:
+            yield fail_index, _config_capacity_side(
+                nodes, links, flows, flow_count)
+        finally:
+            if was_up:
+                link["up"] = True
+
+
+def _config_resilience_failed_link(topo, fail_index):
+    # The impact form of a scenario's forced-down link: null for the
+    # no-failure scenario, else [from, to].
+    if fail_index is None:
+        return None
+    link = topo["links"][fail_index]
+    return [link["from"], link["to"]]
+
+
+def _config_resilience_scenario_row(flows, topo, fail_index, result):
+    # One new-side scenario row
+    # [failedLink, peak, pass, flows, links]: flows in F order
+    # [id, cost, path] with an unreachable flow [id, null, []]; links in
+    # the scenario topology's order as
+    # [from, to, bandwidth, used, utilization]; peak/utilization are the
+    # half-up six-decimal renderings of the exact rationals.
+    paths, costs, used, (num, den), reachable, over = result
+    flow_rows = []
+    for i, item in enumerate(flows):
+        fid = item[0]
+        if paths[i] is None:
+            flow_rows.append([fid, None, []])
+        else:
+            flow_rows.append([fid, costs[i], paths[i]])
+    link_rows = []
+    for index, link in enumerate(topo["links"]):
+        u = used[index]
+        bw = link["bandwidth"]
+        link_rows.append([link["from"], link["to"], bw, u,
+                          _config_capacity_six(u, bw)])
+    return [_config_resilience_failed_link(topo, fail_index),
+            _config_capacity_six(num, den),
+            bool(reachable and not over), flow_rows, link_rows]
+
+
+def _config_resilience_base_worst(topo, flows, flow_count):
+    # Evaluate the h[b] base side scenario by scenario and return its
+    # worst-scenario summary (fail_index, peakNum, peakDen), the peak
+    # maximum with ties broken by scenario order because a strictly larger
+    # peak alone replaces the incumbent. The batch is only defined from a
+    # failure-safe h[b]: any scenario with an unreachable flow or an
+    # overloaded link is code 5. Only one scenario result is live at a
+    # time, and fail(5) exits the process, so the generator's link-state
+    # restoration on normal exhaustion is the only live path.
+    worst = (None, 0, 1)
+    worst_num, worst_den = 0, 1
+    for fail_index, result in _config_resilience_iter(
+            topo, flows, flow_count):
+        if not result[4] or result[5]:
+            fail(5)
+        num, den = result[3]
+        if num * worst_den > worst_num * den:
+            worst = (fail_index, num, den)
+            worst_num, worst_den = num, den
+    return worst
+
+
+def _config_resilience_new_side(topo, flows, flow_count):
+    # Evaluate one new side, returning (worst, all_safe, scenario_rows)
+    # with worst the (fail_index, peakNum, peakDen) summary under the
+    # same peak-max/order-tie rule and scenario_rows the new-side rows of
+    # the impact, rendered in scenario order directly into the result.
+    # all_safe is true only when every scenario is reachable and not
+    # overloaded; only one scenario result is live at a time.
+    worst = (None, 0, 1)
+    worst_num, worst_den = 0, 1
+    all_safe = True
+    scenario_rows = []
+    for fail_index, result in _config_resilience_iter(
+            topo, flows, flow_count):
+        paths, costs, used, (num, den), reachable, over = result
+        if not reachable or over:
+            all_safe = False
+        if num * worst_den > worst_num * den:
+            worst = (fail_index, num, den)
+            worst_num, worst_den = num, den
+        scenario_rows.append(_config_resilience_scenario_row(
+            flows, topo, fail_index, result))
+    return worst, all_safe, scenario_rows
+
+
+def _config_resilience_gate_batch(pack_path, pack, v, history, mode, base,
+                                  events, flows, limit_ppm):
+    # Batched hotload with a per-event directed-link-failure capacity
+    # gate (config op 24): [24, m, b, E, F, L]. m is 0 (read-only
+    # preview) or 1 (atomic commit); b the caller-observed base version;
+    # E a non-empty array of non-decreasing-clock [e, t, p] events
+    # exactly like op 16's; F a non-empty array of
+    # [id, source, destination, demand] flows with unique non-empty
+    # string ids, two distinct endpoints that are both nodes of the h[b]
+    # topology, and a demand a non-boolean integer in 1..MAX_COST; L a
+    # non-boolean integer in 0..1000000, the largest allowed worst-case
+    # utilization increase as a fraction of one million.
+    #
+    # Every input validates first (shapes in the command entry; the h[b]
+    # endpoint check, clocks, and event t/p here), then simulation walks
+    # from h[b] in E order. For each non-idempotent event the old and the
+    # new topology are each evaluated scenario by scenario - no-failure
+    # first, then each links-array entry treated as down in links order.
+    # A scenario routes every flow on the up-link lowest-cost path with
+    # shortest_paths' full-node-sequence Unicode tie break; a link's used
+    # is the summed demand of flows whose path traverses it (a down link
+    # carries nothing) and the scenario peak is the exact maximum
+    # used/bandwidth over every link. The side's worst scenario is the
+    # peak maximum with ties resolved by scenario order (no-failure,
+    # then links order).
+    #
+    # The batch is only defined from a failure-safe h[b]: any of its
+    # scenarios with an unreachable flow or an overloaded link is code 5.
+    # Every later old side is the previous event's passing new side, so
+    # it is failure-safe by construction. The new side of an event passes
+    # only when every scenario is reachable and not overloaded and the
+    # exact worst-peak increase is at most L/1000000 (integer cross
+    # multiplication only, never floats). The impact is
+    # [oldWorst, newWorst, delta, scenarios] with each worst
+    # [failedLink, peak] (failedLink null for no-failure) and scenarios
+    # listing only the new side in scenario order. An event whose t/p
+    # equals the previous state is idempotent (row status 1, no version,
+    # an empty impact). At the first non-idempotent event whose new side
+    # fails the gate simulation stops at once and the whole batch
+    # rejects: batch status 2, old/new both the pre-call v, applied
+    # false, config the pre-call pack, and PACK untouched in either
+    # mode.
+    #
+    # Once every event is a gated candidate, version/history append,
+    # duplicate-resend recognition, the preview/commit difference, and
+    # the single atomic replace follow op 16 exactly. For B events, A
+    # links, K distinct flow sources, F flows, and V nodes the bound is
+    # O(BA(K(V^2 + A) + FV + A)) time and O(KV + FV + A) extra space
+    # besides the returned result O(BA(FV + A)).
+    if base > v:
+        fail(5)
+    base_topo = history[base][1]
+    base_node_set = set(base_topo["nodes"])
+    for item in flows:
+        if item[1] not in base_node_set or item[2] not in base_node_set:
+            fail(5)
+    last_e = None
+    for item in events:
+        e = item[0]
+        if last_e is not None and e < last_e:
+            fail(5)
+        last_e = e
+        _validate_topology(item[1], metrics=True)
+        if not _is_policy(item[2]):
+            fail(5)
+
+    flow_count = len(flows)
+    cur_version = base
+    cur_t = history[base][1]
+    cur_p = history[base][2]
+    # The batch is only defined from a failure-safe h[b]: every scenario
+    # must keep every flow routable within every link's bandwidth.
+    cur_worst = _config_resilience_base_worst(
+        cur_t, flows, flow_count)
+
+    rows = []
+    suffix = []
+    for event in events:
+        e, new_t, new_p = event
+        if new_t == cur_t and new_p == cur_p:
+            rows.append([e, 1, cur_version, cur_version, []])
+            continue
+        if cur_version >= MAX_COST:
+            fail(5)
+        # The old side's worst summary carries over: h[b]'s from the base
+        # check, otherwise the previous event's passing new side, which is
+        # failure-safe by construction.
+        new_worst, new_safe, scenario_rows = _config_resilience_new_side(
+            new_t, flows, flow_count)
+        passed = new_safe
+        old_num, old_den = cur_worst[1], cur_worst[2]
+        new_num, new_den = new_worst[1], new_worst[2]
+        if passed:
+            # Exact comparison of the worst-peak increase against
+            # L/1000000: newNum/newDen - oldNum/oldDen <= L/1000000.
+            delta_num = new_num * old_den - old_num * new_den
+            increase_ok = (delta_num * 1000000
+                           <= limit_ppm * new_den * old_den)
+            if not increase_ok:
+                passed = False
+        impact = [
+            [_config_resilience_failed_link(cur_t, cur_worst[0]),
+             _config_capacity_six(old_num, old_den)],
+            [_config_resilience_failed_link(new_t, new_worst[0]),
+             _config_capacity_six(new_num, new_den)],
+            _config_capacity_delta_six(new_num, new_den, old_num, old_den),
+            scenario_rows]
+        if not passed:
+            rows.append([e, 2, cur_version, cur_version, impact])
+            return {"op": 24, "mode": mode, "status": 2, "old": v,
+                    "new": v, "applied": False, "events": rows,
+                    "config": pack}
+        next_version = cur_version + 1
+        rows.append([e, 0, cur_version, next_version, impact])
+        suffix.append([next_version, new_t, new_p])
+        cur_version = next_version
+        cur_t, cur_p = new_t, new_p
+        cur_worst = new_worst
+    change_count = len(suffix)
+
+    if base != v:
+        # The only tolerated stale base is an exact resend: PACK must
+        # already end exactly at the simulated suffix with every entry
+        # equal; anything else is a version/suffix conflict.
+        if change_count == 0 or v != base + change_count:
+            fail(5)
+        for offset, entry in enumerate(suffix, start=1):
+            if history[base + offset] != entry:
+                fail(5)
+        return {"op": 24, "mode": mode, "status": 1, "old": base,
+                "new": v, "applied": False, "events": rows,
+                "config": pack}
+
+    if change_count == 0:
+        # All events idempotent at the current version: nothing to
+        # append, so a commit writes nothing either.
+        return {"op": 24, "mode": mode, "status": 0, "old": base,
+                "new": base, "applied": False, "events": rows,
+                "config": pack}
+    new_pack = {"v": v + change_count, "t": cur_t, "p": cur_p,
+                "h": history + suffix}
+    if mode == 1:
+        _write_state_atomic(pack_path, new_pack)
+        applied = True
+    else:
+        applied = False
+    return {"op": 24, "mode": mode, "status": 0, "old": base,
+            "new": v + change_count, "applied": applied, "events": rows,
+            "config": new_pack}
+
+
 def _config_rollback_log(pack_path, pack, v, history, mode, base, log,
                          out_path):
     # Rollback log export/replay (config op 10): [10, m, B, L, O]. L is
@@ -21417,6 +21725,58 @@ def main():
             if type(moved_ppm) is not int \
                     or not 0 <= moved_ppm <= 1000000:
                 fail(5)
+        elif kind == 24:
+            # [24, m, b, E, F, L]: batched hotload with a per-event
+            # directed-link-failure capacity gate. m is 0 (read-only
+            # preview) or 1 (atomic commit); b a bounded non-boolean
+            # integer base version; E a non-empty list of [e, t, p]
+            # events shaped exactly like op 16's (e a bounded
+            # non-boolean integer, t/p validated after PACK validation);
+            # F a non-empty list of [id, source, destination, demand]
+            # flows with unique non-empty string ids, distinct string
+            # endpoints that are checked against h[b]'s topology after
+            # PACK validation, and a demand a non-boolean integer in
+            # 1..MAX_COST; L a non-boolean integer in 0..1000000, the
+            # worst-case utilization-increase cap in parts per million.
+            # The non-decreasing e check, the h[b] failure-safety and
+            # endpoint checks, the per-event new-side gate, the b-vs-v
+            # conflict / duplicate-suffix check, and the MAX_COST
+            # overflow check run in _config_resilience_gate_batch.
+            if len(op) != 6 or type(op[1]) is not int \
+                    or op[1] not in (0, 1) \
+                    or type(op[2]) is not int \
+                    or not 0 <= op[2] <= MAX_COST:
+                fail(5)
+            mode, base = op[1], op[2]
+            events = op[3]
+            if not isinstance(events, list) or not events:
+                fail(5)
+            for item in events:
+                if not isinstance(item, list) or len(item) != 3:
+                    fail(5)
+                if type(item[0]) is not int \
+                        or not 0 <= item[0] <= MAX_COST:
+                    fail(5)
+            flows = op[4]
+            if not isinstance(flows, list) or not flows:
+                fail(5)
+            seen_ids = set()
+            for flow in flows:
+                if not isinstance(flow, list) or len(flow) != 4:
+                    fail(5)
+                fid, fs, fd, demand = flow
+                if type(fid) is not str or fid == "" or fid in seen_ids:
+                    fail(5)
+                seen_ids.add(fid)
+                if type(fs) is not str or type(fd) is not str or fs == fd:
+                    fail(5)
+                if type(demand) is not int \
+                        or not 1 <= demand <= MAX_COST:
+                    fail(5)
+            limit_ppm = op[5]
+            if type(limit_ppm) is not int \
+                    or not 0 <= limit_ppm <= 1000000:
+                fail(5)
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -21540,6 +21900,10 @@ def main():
                                                 history, mode, base,
                                                 events, flows,
                                                 limit_ppm, moved_ppm)
+        elif kind == 24:
+            result = _config_resilience_gate_batch(
+                pack_path, pack, v, history, mode, base, events, flows,
+                limit_ppm)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
