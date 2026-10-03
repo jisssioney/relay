@@ -269,6 +269,45 @@ the single atomic replace follow op 16; the result key order is
 op,mode,status,old,new,applied,events,config with each events row
 [e,status,old,new,impact]; the bound is O(BR(V^2+A)) time and
 O(BRV+V+A) extra space for B events, R queries, V nodes, and A links;
+config op 19 code 5 also covers a mode outside 0/1, an out-of-range
+b/e/L, a non-array or empty E, an [e,t,p] event whose e is not a
+non-boolean integer or whose clocks decrease, an invalid event t/p, a
+non-array/empty Q or [s,d] pair with non-string or duplicate pairs, a Q
+endpoint absent from h[b]'s topology, a W that is not four non-boolean
+integers in 0..MAX_COST or that is all zero, a b that conflicts with
+the current v except an exact already-applied resend, a history suffix
+that conflicts with the simulated suffix, and a new version that would
+overflow MAX_COST or a wm score that would exceed MAX_TIME; op 19 is op
+16's batched hotload plus a per-event weighted-quality gate
+[19,m,b,E,Q,W,L] with W wm's four non-boolean integer weights, not all
+zero, and L in 0..MAX_COST the allowed single-query wm score increase:
+inputs validate before any simulation, which starts at h[b] and walks
+the clock-sorted events in E order; an event equal to the previous
+state is idempotent (events-row status 1, no version, an empty impact)
+and every other event compares, for each Q pair in input order, the
+optimal wm weighted routes before and after - score, path bottleneck
+bandwidth, exact integer arithmetic, the MAX_TIME overflow exit, and
+the Unicode code point path tie break are all wm's - emitting, in Q
+order, impact rows [s,d,oldRoute,newRoute,pass] with each route
+[q,hopCount,cost,bandwidth,latency,path] and an unreachable side
+[null,null,null,null,null,[]] (an endpoint missing from a topology is
+unreachable); a pair passes when the old route was unreachable, or the
+new route is reachable and newQ-oldQ <= L, and an event passes only
+when all pairs pass (events-row status 0, a candidate version); the
+first failing event is events-row status 2 with old/new both the
+pre-call version, after which simulation stops and the whole batch
+rejects with batch status 2, old/new both the pre-call version, applied
+false and the pre-call config, PACK untouched in both modes with no
+partial result or leftover temp file; an all-idempotent batch against
+the current version is status 0 with no version added; with all events
+gated candidates, version/history append, duplicate-resend recognition,
+the preview/commit difference, and the single atomic replace follow op
+16; the result key order is op,mode,status,old,new,applied,events,
+config with each events row [e,status,old,new,impact]; for B events, R
+queries, K distinct sources (K <= R), V the largest node count and A
+the largest link count among the simulated topologies, P the wm simple
+path-prefix cap for a source, and S the total input/output size, the
+bound is O(BK(A+P log V)+S) time and O(S+KPV+BRV) extra space;
 for
 compoundcp code 3 also covers a STATE read/write error and code 5
 also covers a STATE whose key order, content, or h digest is invalid,
@@ -1856,6 +1895,27 @@ def compute_wm(nodes, links, source, weights):
             routes.append([n, path[1], q, hop_count, cost, bandwidth,
                            latency, path])
     return {"s": source, "w": [a, b, c, d], "r": routes}
+
+
+def _wm_route_map(nodes, links, source, weights):
+    # The wm best routes for one source as a {destination: route} map,
+    # reusing compute_wm verbatim (same DFS enumeration, four-weight q,
+    # exact integer arithmetic, MAX_TIME overflow exit 5, and Unicode
+    # code point tie-break). A route is [q, hopCount, cost, bandwidth,
+    # latency, path] (next hop dropped, as in wmconverge); reachable
+    # destinations include the source itself ([0,0,0,null,0,[s]],
+    # exactly wm's own self route).
+    wm = compute_wm(nodes, links, source, weights)
+    routes = {}
+    for item in wm["r"]:
+        # item = [destination, nextHop, q, hop, cost, bandwidth,
+        # latency, path], with q null and path [] when unreachable.
+        if item[2] is None:
+            routes[item[0]] = [None, None, None, None, None, []]
+        else:
+            routes[item[0]] = [item[2], item[3], item[4], item[5],
+                               item[6], item[7]]
+    return routes
 
 
 def compute_wmecmp(nodes, links, source, flow, weights):
@@ -13845,6 +13905,168 @@ def _config_ecmp_gate_batch(pack_path, pack, v, history, mode, base,
             "config": new_pack}
 
 
+def _config_quality_gate_batch(pack_path, pack, v, history, mode, base,
+                               events, queries, weights, allowance):
+    # Batched hotload with a per-event weighted-quality gate (config op
+    # 19): [19, m, b, E, Q, W, L]. m is 0 (read-only preview) or 1
+    # (atomic commit); b the caller-observed base version; E a non-empty
+    # array of non-decreasing-clock [e, t, p] events exactly like op
+    # 16's; Q a non-empty list of distinct [s, d] pairs whose endpoints
+    # must both be nodes of the h[b] topology; W wm's four non-boolean
+    # integer weights in 0..MAX_COST, not all zero; L a non-boolean
+    # integer in 0..MAX_COST, the largest allowed single-query score
+    # increase.
+    #
+    # Every input validates first (shapes in the command entry; the h[b]
+    # endpoint check, clocks, and event t/p here), then simulation walks
+    # from h[b] in E order. An event whose t/p equals the previous state
+    # is idempotent (row status 1, no version, an empty impact). Every
+    # other event is a candidate: the optimal wm weighted routes before
+    # and after the event are computed with compute_wm verbatim - the
+    # four-weight q, path bottleneck bandwidth, exact integer
+    # arithmetic, the MAX_TIME overflow exit, and the Unicode code point
+    # path tie break are all wm's. Each Q pair yields, in Q order, an
+    # impact row [s, d, oldRoute, newRoute, pass] where each route is
+    # [q, hopCount, cost, bandwidth, latency, path] and an unreachable
+    # side is [null, null, null, null, null, []] (an endpoint absent
+    # from either topology counts as unreachable). A pair passes when
+    # its old route was unreachable, or the new route is reachable and
+    # newQ-oldQ <= L; an event passes only when every pair passes (row
+    # status 0, a candidate version). At the first failing
+    # non-idempotent event simulation stops at once and the whole batch
+    # rejects: batch status 2, old/new both the pre-call v, applied
+    # false, config the pre-call pack, and PACK untouched in either
+    # mode.
+    #
+    # Once every event is a gated candidate, version/history append,
+    # duplicate-resend recognition, the preview/commit difference, and
+    # the single atomic replace follow op 16 exactly. Let B be the
+    # number of events, R the number of Q pairs, K the number of
+    # distinct Q sources (K <= R), V the largest node count and A the
+    # largest link count among the simulated topologies, P the simple
+    # path-prefix cap for a source (the number of simple path prefixes
+    # wm's DFS visits, at most sum_{i<=V} V!/(V-i)!), and S the total
+    # input/output size. One wm run costs O(A + P log V) time and
+    # O(P + V) working space (each kept prefix carries a path of at
+    # most V nodes); the batch is therefore O(BK(A + P log V) + S)
+    # time and O(S + KPV + BRV) extra space (each impact route is at
+    # most V nodes).
+    if base > v:
+        fail(5)
+    base_node_set = set(history[base][1]["nodes"])
+    for s, d in queries:
+        if s not in base_node_set or d not in base_node_set:
+            fail(5)
+    last_e = None
+    for item in events:
+        e = item[0]
+        if last_e is not None and e < last_e:
+            fail(5)
+        last_e = e
+        _validate_topology(item[1], metrics=True)
+        if not _is_policy(item[2]):
+            fail(5)
+
+    # wm routes on the running topology, one compute_wm per distinct Q
+    # source, handed from each passing event's after-side to the next
+    # event's before-side. The h[b] routes seed the first event.
+    def side_routes(topo):
+        node_set = set(topo["nodes"])
+        routes = {}
+        for s in distinct_sources:
+            if s in node_set:
+                routes[s] = _wm_route_map(topo["nodes"], topo["links"],
+                                          s, weights)
+        return routes, node_set
+
+    cur_version = base
+    cur_t = history[base][1]
+    cur_p = history[base][2]
+    distinct_sources = []
+    seen_sources = set()
+    for s, _d in queries:
+        if s not in seen_sources:
+            seen_sources.add(s)
+            distinct_sources.append(s)
+    cur_routes, cur_node_set = side_routes(cur_t)
+
+    rows = []
+    suffix = []
+    unreachable = [None, None, None, None, None, []]
+    for event in events:
+        e, new_t, new_p = event
+        if new_t == cur_t and new_p == cur_p:
+            rows.append([e, 1, cur_version, cur_version, []])
+            continue
+        if cur_version >= MAX_COST:
+            fail(5)
+        new_routes, new_node_set = side_routes(new_t)
+        impact = []
+        passed = True
+        for s, d in queries:
+            if s not in cur_node_set or d not in cur_node_set:
+                old_route = unreachable
+            else:
+                old_route = cur_routes[s][d]
+            if s not in new_node_set or d not in new_node_set:
+                new_route = unreachable
+            else:
+                new_route = new_routes[s][d]
+            old_q = old_route[0]
+            new_q = new_route[0]
+            if old_q is None:
+                pair_pass = True
+            else:
+                pair_pass = (new_q is not None
+                             and new_q - old_q <= allowance)
+            if not pair_pass:
+                passed = False
+            impact.append([s, d, old_route, new_route, pair_pass])
+        next_version = cur_version + 1
+        if not passed:
+            rows.append([e, 2, cur_version, cur_version, impact])
+            return {"op": 19, "mode": mode, "status": 2, "old": v,
+                    "new": v, "applied": False, "events": rows,
+                    "config": pack}
+        rows.append([e, 0, cur_version, next_version, impact])
+        suffix.append([next_version, new_t, new_p])
+        cur_version = next_version
+        cur_t, cur_p = new_t, new_p
+        cur_node_set = new_node_set
+        cur_routes = new_routes
+    change_count = len(suffix)
+
+    if base != v:
+        # The only tolerated stale base is an exact resend: PACK must
+        # already end exactly at the simulated suffix with every entry
+        # equal; anything else is a version/suffix conflict.
+        if change_count == 0 or v != base + change_count:
+            fail(5)
+        for offset, entry in enumerate(suffix, start=1):
+            if history[base + offset] != entry:
+                fail(5)
+        return {"op": 19, "mode": mode, "status": 1, "old": base,
+                "new": v, "applied": False, "events": rows,
+                "config": pack}
+
+    if change_count == 0:
+        # All events idempotent at the current version: nothing to
+        # append, so a commit writes nothing either.
+        return {"op": 19, "mode": mode, "status": 0, "old": base,
+                "new": base, "applied": False, "events": rows,
+                "config": pack}
+    new_pack = {"v": v + change_count, "t": cur_t, "p": cur_p,
+                "h": history + suffix}
+    if mode == 1:
+        _write_state_atomic(pack_path, new_pack)
+        applied = True
+    else:
+        applied = False
+    return {"op": 19, "mode": mode, "status": 0, "old": base,
+            "new": v + change_count, "applied": applied, "events": rows,
+            "config": new_pack}
+
+
 def _config_rollback_log(pack_path, pack, v, history, mode, base, log,
                          out_path):
     # Rollback log export/replay (config op 10): [10, m, B, L, O]. L is
@@ -19848,6 +20070,59 @@ def main():
                     or type(remove_limit) is not int \
                     or not 0 <= remove_limit <= MAX_COST:
                 fail(5)
+        elif kind == 19:
+            # [19, m, b, E, Q, W, L]: batched hotload with a per-event
+            # weighted-quality (wm four-weight score) gate. m is 0
+            # (read-only preview) or 1 (atomic commit); b a bounded
+            # non-boolean integer base version; E a non-empty list of
+            # [e, t, p] events shaped exactly like op 16's (e a bounded
+            # non-boolean integer, t/p validated after PACK validation);
+            # Q a non-empty list of distinct [s, d] string endpoint
+            # pairs; W wm's four non-boolean integer weights in
+            # 0..MAX_COST, not all zero; L a bounded non-boolean integer
+            # (the allowed single-query wm score increase). The
+            # non-decreasing e check, the Q endpoints against h[b]'s
+            # topology, the b-vs-v conflict / duplicate-suffix check,
+            # and the MAX_COST/MAX_TIME overflow checks run in
+            # _config_quality_gate_batch.
+            if len(op) != 7 or type(op[1]) is not int \
+                    or op[1] not in (0, 1) \
+                    or type(op[2]) is not int \
+                    or not 0 <= op[2] <= MAX_COST:
+                fail(5)
+            mode, base = op[1], op[2]
+            events = op[3]
+            if not isinstance(events, list) or not events:
+                fail(5)
+            for item in events:
+                if not isinstance(item, list) or len(item) != 3:
+                    fail(5)
+                if type(item[0]) is not int \
+                        or not 0 <= item[0] <= MAX_COST:
+                    fail(5)
+            queries = op[4]
+            if not isinstance(queries, list) or not queries:
+                fail(5)
+            seen_queries = set()
+            for pair in queries:
+                if not isinstance(pair, list) or len(pair) != 2:
+                    fail(5)
+                s, d = pair
+                if type(s) is not str or type(d) is not str \
+                        or (s, d) in seen_queries:
+                    fail(5)
+                seen_queries.add((s, d))
+            weights = op[5]
+            if (not isinstance(weights, list) or len(weights) != 4
+                    or any(type(w) is not int
+                           or not 0 <= w <= MAX_COST
+                           for w in weights)
+                    or all(w == 0 for w in weights)):
+                fail(5)
+            allowance = op[6]
+            if type(allowance) is not int \
+                    or not 0 <= allowance <= MAX_COST:
+                fail(5)
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -19946,6 +20221,11 @@ def main():
             result = _config_ecmp_gate_batch(pack_path, pack, v, history,
                                              mode, base, events, queries,
                                              cost_limit, remove_limit)
+        elif kind == 19:
+            result = _config_quality_gate_batch(pack_path, pack, v,
+                                                history, mode, base,
+                                                events, queries, weights,
+                                                allowance)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
