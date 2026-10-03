@@ -29,6 +29,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py netreorder FILE QUEUES EVENTS WINDOW WAIT DATA
        python relay.py netqdisc FILE CONFIG DATA
        python relay.py qdiscfail FILE CONFIG EVENTS DATA
+       python relay.py qdiscimpair FILE CONFIG EVENTS DATA
        python relay.py converge FILE SRC DST D R EVENTS
        python relay.py ecmpconverge FILE SOURCE DESTINATION DELAY RUN FLOWS EVENTS
        python relay.py policy FILE S D P C RULES
@@ -73,7 +74,7 @@ for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
 policytx op 4 also OUT),
 4 JSON syntax
 (for forward/loopsafe also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/qdisc/reorder/tbucket/netqueue/netfragment/policyqueue/ecmpqueue/netshape/netfail/policyfail/netimpair/netreorder/netqdisc/qdiscfail/converge/ecmpconverge/policy/reserve/rebalance/retune also those in
+for queue/qdisc/reorder/tbucket/netqueue/netfragment/policyqueue/ecmpqueue/netshape/netfail/policyfail/netimpair/netreorder/netqdisc/qdiscfail/qdiscimpair/converge/ecmpconverge/policy/reserve/rebalance/retune also those in
 FILE/DATA/QUEUES/MTUS/SHAPERS/CLASSES/CONFIG/EVENTS/FLOWS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
@@ -1254,6 +1255,45 @@ netqdisc's link and class statistics,
 fault removals never count as overflow. Worst case is
 O((P+R)((V+E) log V) + H(C + log(P+E)) + Q) for R re-routes, with
 O(V+E+P+H+EC) extra space.
+qdiscimpair is read-only and takes FILE CONFIG EVENTS DATA on one
+explicit event clock, combining qdiscfail's per-link DRR, dual-capacity
+admission, dynamic lowest-cost routing, fault queue flushes, and
+re-routing with netimpair's deterministic loss and latency offset.
+FILE/CONFIG/DATA reuse qdiscfail's exact metric topology, classes and
+link capacities, and [id,time,source,destination,size,class] contract
+(DATA may be empty); EVENTS keeps qdiscfail's non-empty,
+time-non-decreasing [t,0,node,up] and [t,1,from,to,up] topology
+settings and additionally accepts [t,2,from,to,n,j] settings: n is a
+non-boolean integer in 0..MAX_COST (0 drops nothing) and j is a signed
+integer with latency + j >= 0. Every link starts with n, j, and a send
+counter at 0; an impair setting only changes sends started after it
+(repeated identical settings are idempotent), never moves a packet, and
+never changes scheduling state. When a send starts, the link counter is
+incremented first and the link's current n, j are snapshotted; with
+n > 0 and the fresh counter divisible by n the packet occupies the
+sender through depart and ends there as lost without any reception,
+otherwise it arrives at depart + latency + j. A down event occurring
+while the send is running still ends it as fault, taking precedence over
+the loss decision; later impair settings never affect a send already
+started. Phase order at each distinct time is qdiscfail's: the tick's
+settings in EVENTS input order, then, repeated until stable, send
+completions, receptions and fresh injections merged in DATA order, and
+finally one DRR decision per idle link in FILE link order; zero-latency
+work repeats the instant. Any computed time above MAX_TIME is code 5
+with no partial output. Result top-level key order is
+packets,events,links. Packet rows append a last lost boolean to
+qdiscfail's row:
+[id,class,status,path,finish,delay,dropLink,hops,reroutes,dropObject,lost]
+in DATA order; a lost packet carries status lost, dropLink null,
+dropObject the offending [from,to] link, and a final hop that keeps
+arrive/start/depart with a null receive; otherwise lost is false.
+Topology event rows keep qdiscfail's format, and an impair event row is
+[t,2,[from,to],[n,j],0,0,0]. Link rows append lost,count,n,j to
+qdiscfail's statistics:
+[from,to,enqueued,overflow,peak,lastDepart,classes,faultRemoved,up,
+lost,count,n,j], the number of sends lost, the number of sends started,
+and the final settings. Worst case is qdiscfail's bound plus O(X+H) for
+X impair events and H started sends, with O(E) extra space.
 loopsafe takes FILE DESTINATION TABLE and is read-only: FILE uses
 forward's strict topology (duplicate keys and non-finite numbers code
 4), DESTINATION must name a node, and TABLE is a JSON object whose key
@@ -5425,6 +5465,457 @@ def compute_qdiscfail(nodes, links, class_specs, cap_of, packets, events):
                           admitted_c[li], overflows_c[li], peak[li],
                           last_depart[li], class_rows,
                           fault_removed[li], link_up[li]])
+    return {"packets": results, "events": event_rows,
+            "links": link_rows}
+
+
+def compute_qdiscimpair(nodes, links, class_specs, cap_of, packets, events):
+    # compute_qdiscfail verbatim (per-link DRR, dual total/class capacity
+    # admission, dynamic lowest-cost routing, fault flushes and
+    # re-routing, phase order, MAX_TIME) extended with compute_netimpair's
+    # per-link impairment: besides the topology settings, EVENTS carries
+    # [t,2,from,to,n,j] settings; n is the drop modulus (0 drops
+    # nothing) and j a signed latency offset, both starting at 0 with a
+    # per-link send counter. A setting only changes sends started after
+    # it, is idempotent on repetition, moves no packet, and changes no
+    # queue, deficit, cursor, or occupancy.
+    #
+    # When a send starts the counter is incremented first and the
+    # current n, j are snapshotted; with n > 0 and the fresh counter
+    # divisible by n the packet occupies the sender through depart and
+    # ends there as lost (no reception, null receive on the final hop,
+    # dropObject the link pair, dropLink null), otherwise reception is
+    # at depart + latency + j. A down event during the send faults it
+    # exactly as in qdiscfail and takes precedence; a later setting
+    # never touches a send already started.
+    E = len(links)
+    C = len(class_specs)
+    names = [c[0] for c in class_specs]
+    quanta = [c[1] for c in class_specs]
+    class_caps = [c[2] for c in class_specs]
+    bw = [l["bandwidth"] for l in links]
+    lat = [l["latency"] for l in links]
+    link_cap = [cap_of[i] for i in range(E)]
+
+    node_up = {u: True for u in nodes}
+    link_up = [bool(links[i]["up"]) for i in range(E)]
+    pair_index = {(links[i]["from"], links[i]["to"]): i
+                  for i in range(E)}
+
+    # Impairment state: imp_n/imp_j the current settings, send_count the
+    # sends started, lost_c the sends that ended as lost.
+    imp_n = [0] * E
+    imp_j = [0] * E
+    send_count = [0] * E
+    lost_c = [0] * E
+
+    n = len(packets)
+    queues = [[deque() for _ in range(C)] for _ in range(E)]
+    link_used = [0] * E
+    class_used = [[0] * C for _ in range(E)]
+    deficit = [[0] * C for _ in range(E)]
+    cursor = [0] * E
+    busy = [False] * E
+    sending_of = [None] * E
+    after_completion = [False] * E
+    admitted_c = [0] * E
+    overflows_c = [0] * E
+    peak = [0] * E
+    last_depart = [0] * E
+    fault_removed = [0] * E
+    cls_enq = [[0] * C for _ in range(E)]
+    cls_ovf = [[0] * C for _ in range(E)]
+    cls_peak = [[0] * C for _ in range(E)]
+    cls_sent = [[0] * C for _ in range(E)]
+    active = {u: set() for u in nodes}
+
+    loc = [packets[i][2] for i in range(n)]
+    prefix = [[] for _ in range(n)]
+    state = [0] * n
+    inflight = [None] * n
+    route = [None] * n
+    rpos = [0] * n
+    rgen = [-1] * n
+    gen = [0]
+    # results[i] = [id, class, status, path, finish, delay, dropLink,
+    # hops, reroutes, dropObject, lost]. The final flag marks a packet
+    # ended by an impairment loss; cur_n/cur_j snapshot the setting of
+    # the send a packet is currently making (0 while not sending).
+    results = [[pid, names[klass], None, [], None, None, None, [], 0,
+                None, False]
+               for pid, _, _, _, _, klass in packets]
+    cur_n = [0] * n
+    cur_j = [0] * n
+
+    adj_cache = [None]
+    adj_dirty = [True]
+
+    def build_adj():
+        adj = {u: [] for u in nodes}
+        for i, l in enumerate(links):
+            if (link_up[i] and node_up[l["from"]]
+                    and node_up[l["to"]]):
+                adj[l["from"]].append((l["to"], l["cost"]))
+        return adj
+
+    def hop_usable(frm, to):
+        li = pair_index[(frm, to)]
+        return (link_up[li] and node_up[frm] and node_up[to])
+
+    def check_time(value):
+        if value > MAX_TIME:
+            fail(5)
+        return value
+
+    def end_terminal(i, status, now, link_obj, obj):
+        state[i] = 2
+        results[i][2] = status
+        results[i][4] = now
+        results[i][5] = now - packets[i][1]
+        results[i][6] = link_obj
+        results[i][9] = obj
+
+    def select_path(i):
+        if adj_dirty[0]:
+            adj_cache[0] = build_adj()
+            adj_dirty[0] = False
+        dist = _netfail_dijkstra(nodes, adj_cache[0], loc[i])
+        entry = dist.get(packets[i][3])
+        del dist
+        return None if entry is None else entry[1]
+
+    def refresh_active(li):
+        l = links[li]
+        present = li in active[l["from"]]
+        has = busy[li] or any(queues[li][c] for c in range(C))
+        if has and not present:
+            active[l["from"]].add(li)
+            active[l["to"]].add(li)
+        elif not has and present:
+            active[l["from"]].discard(li)
+            active[l["to"]].discard(li)
+
+    def admit(i, now, first=False, diverted=False):
+        source = loc[i]
+        cidx = packets[i][5]
+        if source == packets[i][3]:
+            if not prefix[i]:
+                prefix[i] = [source]
+            end_terminal(i, "delivered", now, None, None)
+            return
+        old_suffix = (None if first or route[i] is None
+                      else tuple(route[i][rpos[i]:]))
+        reselect = (first or diverted or rgen[i] != gen[0])
+        if not reselect:
+            plan = route[i]
+            k = rpos[i]
+            if not (k + 1 < len(plan)
+                    and hop_usable(plan[k], plan[k + 1])):
+                reselect = True
+        if reselect:
+            new_path = select_path(i)
+            if new_path is None:
+                if not first:
+                    results[i][8] += 1
+                    end_terminal(i, "unreachable", now, None, None)
+                else:
+                    state[i] = 2
+                    results[i][2] = "unreachable"
+                return
+            new_t = tuple(new_path)
+            if not first and new_t != old_suffix:
+                results[i][8] += 1
+            route[i] = new_t
+            rpos[i] = 0
+            rgen[i] = gen[0]
+        if not prefix[i]:
+            prefix[i] = [source]
+        to = route[i][rpos[i] + 1]
+        li = pair_index[(source, to)]
+        hop = {"from": source, "to": to, "arrive": now, "start": None,
+               "depart": None, "receive": None, "wait": None}
+        results[i][7].append(hop)
+        size = packets[i][4]
+        if (link_used[li] + size > link_cap[li]
+                or class_used[li][cidx] + size > class_caps[cidx]):
+            end_terminal(i, "overflow", now, [source, to], [source, to])
+            overflows_c[li] += 1
+            cls_ovf[li][cidx] += 1
+            return
+        link_used[li] += size
+        if link_used[li] > peak[li]:
+            peak[li] = link_used[li]
+        class_used[li][cidx] += size
+        if class_used[li][cidx] > cls_peak[li][cidx]:
+            cls_peak[li][cidx] = class_used[li][cidx]
+        admitted_c[li] += 1
+        cls_enq[li][cidx] += 1
+        queues[li][cidx].append(i)
+        refresh_active(li)
+        if not busy[li]:
+            heapq.heappush(runnable_heap, li)
+
+    completion_heap = []
+    reception_heap = []
+    runnable_heap = []
+
+    def drr_pick(li, start):
+        c = start
+        nonempty_seen = False
+        visited = 0
+        while True:
+            q = queues[li][c]
+            if q:
+                nonempty_seen = True
+                deficit[li][c] += quanta[c]
+                head = q[0]
+                if deficit[li][c] >= packets[head][4]:
+                    return c, head
+            else:
+                deficit[li][c] = 0
+            c = (c + 1) % C
+            visited += 1
+            if visited == C:
+                if not nonempty_seen:
+                    return None
+                nonempty_seen = False
+                visited = 0
+
+    def send_head(li, cidx, i, now):
+        size = packets[i][4]
+        queues[li][cidx].popleft()
+        link_used[li] -= size
+        class_used[li][cidx] -= size
+        deficit[li][cidx] -= size
+        cursor[li] = cidx
+        busy[li] = True
+        sending_of[li] = i
+        inflight[i] = li
+        # Counter incremented and n, j snapshotted before the send runs,
+        # so settings changing during the send never affect it.
+        send_count[li] += 1
+        cur_n[i] = imp_n[li]
+        cur_j[i] = imp_j[li]
+        depart = check_time(now + (size + bw[li] - 1) // bw[li])
+        hop = results[i][7][-1]
+        hop["start"] = now
+        hop["depart"] = depart
+        hop["wait"] = now - hop["arrive"]
+        cls_sent[li][cidx] += 1
+        refresh_active(li)
+        heapq.heappush(completion_heap, (depart, li, i))
+
+    def schedule_link(li, now):
+        if after_completion[li]:
+            after_completion[li] = False
+            cidx = cursor[li]
+            q = queues[li][cidx]
+            if q and deficit[li][cidx] >= packets[q[0]][4]:
+                send_head(li, cidx, q[0], now)
+                return
+            if not q:
+                deficit[li][cidx] = 0
+            chosen = drr_pick(li, (cidx + 1) % C)
+        else:
+            chosen = drr_pick(li, cursor[li])
+        if chosen is not None:
+            send_head(li, chosen[0], chosen[1], now)
+
+    def run_due_links(now):
+        while runnable_heap:
+            li = heapq.heappop(runnable_heap)
+            if busy[li]:
+                continue
+            schedule_link(li, now)
+
+    def complete_send(now, li, i):
+        # At depart either the send ends as lost with no reception
+        # (snapshotted n > 0 and this send's fresh counter a multiple of
+        # n) or the reception is scheduled at depart + latency + the
+        # snapshotted jitter. The DRR residual retry applies either way.
+        busy[li] = False
+        sending_of[li] = None
+        inflight[i] = None
+        last_depart[li] = now
+        refresh_active(li)
+        after_completion[li] = True
+        heapq.heappush(runnable_heap, li)
+        nn = cur_n[i]
+        jj = cur_j[i]
+        if nn and send_count[li] % nn == 0:
+            lost_c[li] += 1
+            results[i][10] = True
+            end_terminal(i, "lost", now, None,
+                         [links[li]["from"], links[li]["to"]])
+            return
+        receive = check_time(now + lat[li] + jj)
+        results[i][7][-1]["receive"] = receive
+        heapq.heappush(reception_heap, (receive, i))
+
+    def receive_packet(i, now):
+        node = results[i][7][-1]["to"]
+        if not node_up[node]:
+            end_terminal(i, "fault", now, None, node)
+            return
+        loc[i] = node
+        prefix[i].append(node)
+        rpos[i] += 1
+        admit(i, now)
+
+    def apply_event(ev, now):
+        # qdiscfail's setting application with a kind-2 impair branch
+        # that only records the setting (all zeroes reported). Returns
+        # (changed, requeued, faults).
+        if ev[1] == 2:
+            frm, to, nn, jj = ev[2], ev[3], ev[4], ev[5]
+            li = pair_index[(frm, to)]
+            imp_n[li] = nn
+            imp_j[li] = jj
+            return 0, 0, 0
+        if ev[1] == 0:
+            node, up = ev[2], ev[3]
+            if node_up[node] == up:
+                return 0, 0, 0
+            node_up[node] = up
+            adj_dirty[0] = True
+            gen[0] += 1
+            if up:
+                return 1, 0, 0
+            affected = sorted(active[node])
+            fault_obj = node
+        else:
+            frm, to, up = ev[2], ev[3], ev[4]
+            li = pair_index[(frm, to)]
+            if link_up[li] == up:
+                return 0, 0, 0
+            link_up[li] = up
+            adj_dirty[0] = True
+            gen[0] += 1
+            if up:
+                return 1, 0, 0
+            affected = [li]
+            fault_obj = [frm, to]
+        faulted = set()
+        flushed = []
+        for a in affected:
+            if busy[a]:
+                faulted.add(sending_of[a])
+            for c in range(C):
+                q = queues[a][c]
+                while q:
+                    ci = q.popleft()
+                    size = packets[ci][4]
+                    link_used[a] -= size
+                    class_used[a][c] -= size
+                    results[ci][7].pop()
+                    fault_removed[a] += 1
+                    flushed.append(ci)
+        for ci in faulted:
+            # A down during the send faults it: fault takes precedence
+            # over the snapshotted loss decision.
+            a = inflight[ci]
+            busy[a] = False
+            sending_of[a] = None
+            inflight[ci] = None
+            end_terminal(ci, "fault", now, None, fault_obj)
+        for a in affected:
+            refresh_active(a)
+        for ci in sorted(flushed):
+            admit(ci, now, diverted=True)
+        return 1, len(flushed), len(faulted)
+
+    e_at = 0
+    en = len(events)
+    inject_at = 0
+
+    def next_inject_time():
+        return packets[inject_at][1] if inject_at < n else None
+
+    def next_time():
+        t = events[e_at][0] if e_at < en else None
+        nt = next_inject_time()
+        if nt is not None and (t is None or nt < t):
+            t = nt
+        if completion_heap:
+            ct = completion_heap[0][0]
+            if t is None or ct < t:
+                t = ct
+        if reception_heap:
+            rt = reception_heap[0][0]
+            if t is None or rt < t:
+                t = rt
+        return t
+
+    event_rows = []
+
+    while True:
+        now = next_time()
+        if now is None:
+            break
+        check_time(now)
+        while e_at < en and events[e_at][0] == now:
+            ev = events[e_at]
+            e_at += 1
+            if ev[1] == 2:
+                apply_event(ev, now)
+                event_rows.append([ev[0], 2, [ev[2], ev[3]],
+                                   [ev[4], ev[5]], 0, 0, 0])
+                continue
+            changed, requeued, faults = apply_event(ev, now)
+            target = ev[2] if ev[1] == 0 else [ev[2], ev[3]]
+            event_rows.append([ev[0], ev[1], target, ev[-1], changed,
+                               requeued, faults])
+        moved = True
+        while moved:
+            moved = False
+            while completion_heap and completion_heap[0][0] == now:
+                _, li, i = heapq.heappop(completion_heap)
+                if state[i] == 2:
+                    continue
+                complete_send(now, li, i)
+                moved = True
+            due = []
+            while reception_heap and reception_heap[0][0] == now:
+                _, i = heapq.heappop(reception_heap)
+                if state[i] != 2:
+                    due.append(i)
+            injected = []
+            while inject_at < n and packets[inject_at][1] <= now:
+                j = inject_at
+                inject_at += 1
+                if state[j] == 0:
+                    injected.append(j)
+            a = b = 0
+            while a < len(due) or b < len(injected):
+                if b >= len(injected) or (a < len(due)
+                                          and due[a] < injected[b]):
+                    i = due[a]
+                    a += 1
+                    receive_packet(i, now)
+                else:
+                    i = injected[b]
+                    b += 1
+                    state[i] = 1
+                    admit(i, now, first=True)
+            if due or injected:
+                moved = True
+            if runnable_heap:
+                run_due_links(now)
+                moved = True
+
+    for i in range(n):
+        results[i][3] = prefix[i]
+    link_rows = []
+    for li in range(E):
+        class_rows = [[names[c], cls_enq[li][c], cls_ovf[li][c],
+                       cls_peak[li][c], cls_sent[li][c]]
+                      for c in range(C)]
+        link_rows.append([links[li]["from"], links[li]["to"],
+                          admitted_c[li], overflows_c[li], peak[li],
+                          last_depart[li], class_rows,
+                          fault_removed[li], link_up[li],
+                          lost_c[li], send_count[li], imp_n[li],
+                          imp_j[li]])
     return {"packets": results, "events": event_rows,
             "links": link_rows}
 
@@ -14875,6 +15366,168 @@ def main():
                             class_index[klass]))
         result = compute_qdiscfail(nodes, links, classes, cap_of,
                                    packets, events)
+    elif argv[1] == "qdiscimpair":
+        if len(argv) != 6:
+            fail(2)
+        file_path, config_text, events_text, data_text = (
+            argv[2], argv[3], argv[4], argv[5])
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        link_pairs_set = {(l["from"], l["to"]) for l in links}
+        try:
+            config = json.loads(config_text,
+                                parse_constant=_reject_constant,
+                                parse_float=_finite_float,
+                                object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        try:
+            raw_events = json.loads(events_text,
+                                    parse_constant=_reject_constant,
+                                    parse_float=_finite_float,
+                                    object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        # CONFIG follows qdiscfail/netqdisc exactly: classes of
+        # [name,quantum,classCapacity] and a links table covering every
+        # directed FILE link once with its totalCapacity.
+        if not isinstance(config, dict) or set(config) != {"classes",
+                                                           "links"}:
+            fail(5)
+        raw_classes = config["classes"]
+        if not isinstance(raw_classes, list) or not raw_classes:
+            fail(5)
+        classes = []
+        seen_names = set()
+        for item in raw_classes:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            name, quantum, capacity = item
+            if type(name) is not str or name == "" or name in seen_names:
+                fail(5)
+            try:
+                name.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_names.add(name)
+            if type(quantum) is not int or not 1 <= quantum <= MAX_COST:
+                fail(5)
+            if type(capacity) is not int or not 1 <= capacity <= MAX_COST:
+                fail(5)
+            classes.append((name, quantum, capacity))
+        class_index = {name: i for i, (name, _, _) in enumerate(classes)}
+        raw_link_caps = config["links"]
+        if not isinstance(raw_link_caps, list):
+            fail(5)
+        cap_of_pair = {}
+        for item in raw_link_caps:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            frm, to, capacity = item
+            if type(frm) is not str or type(to) is not str:
+                fail(5)
+            pair = (frm, to)
+            if pair not in link_pairs_set or pair in cap_of_pair:
+                fail(5)
+            if type(capacity) is not int or not 1 <= capacity <= MAX_COST:
+                fail(5)
+            cap_of_pair[pair] = capacity
+        if set(cap_of_pair) != link_pairs_set:
+            fail(5)
+        cap_of = [cap_of_pair[(l["from"], l["to"])] for l in links]
+        latency_of = {(l["from"], l["to"]): l["latency"] for l in links}
+        # EVENTS is qdiscfail's non-empty, time-non-decreasing array of
+        # [t,0,node,up] / [t,1,from,to,up] settings plus
+        # [t,2,from,to,n,j] impair settings: n a non-boolean integer in
+        # 0..MAX_COST and j a signed integer with latency + j >= 0.
+        if not isinstance(raw_events, list) or not raw_events:
+            fail(5)
+        events = []
+        previous_event_time = None
+        for event in raw_events:
+            if not isinstance(event, list) or len(event) not in (4, 5, 6):
+                fail(5)
+            t, kind = event[0], event[1]
+            if type(t) is not int or not 0 <= t <= MAX_TIME:
+                fail(5)
+            if previous_event_time is not None and t < previous_event_time:
+                fail(5)
+            previous_event_time = t
+            if type(kind) is not int or kind not in (0, 1, 2):
+                fail(5)
+            if kind == 0:
+                if len(event) != 4:
+                    fail(5)
+                _, _, node, up = event
+                if type(node) is not str or node not in node_set:
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                events.append((t, 0, node, up))
+            elif kind == 1:
+                if len(event) != 5:
+                    fail(5)
+                _, _, frm, to, up = event
+                if (type(frm) is not str or type(to) is not str
+                        or (frm, to) not in link_pairs_set):
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                events.append((t, 1, frm, to, up))
+            else:
+                if len(event) != 6:
+                    fail(5)
+                _, _, frm, to, nn, jj = event
+                if (type(frm) is not str or type(to) is not str
+                        or (frm, to) not in link_pairs_set):
+                    fail(5)
+                if type(nn) is not int or not 0 <= nn <= MAX_COST:
+                    fail(5)
+                if type(jj) is not int:
+                    fail(5)
+                if latency_of[(frm, to)] + jj < 0:
+                    fail(5)
+                events.append((t, 2, frm, to, nn, jj))
+        # DATA follows qdiscfail's 6-tuple contract and may be empty.
+        if not isinstance(data, list):
+            fail(5)
+        packets = []
+        seen_ids = set()
+        previous_time = None
+        for item in data:
+            if not isinstance(item, list) or len(item) != 6:
+                fail(5)
+            pid, time, source, destination, size, klass = item
+            if (type(pid) is not str or pid == ""
+                    or not 1 <= len(pid) <= MAX_FLOW_LEN
+                    or pid in seen_ids):
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_ids.add(pid)
+            if type(time) is not int or not 0 <= time <= MAX_TIME:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if source not in node_set or destination not in node_set:
+                fail(5)
+            if type(size) is not int or not 1 <= size <= MAX_COST:
+                fail(5)
+            if type(klass) is not str or klass not in class_index:
+                fail(5)
+            packets.append((pid, time, source, destination, size,
+                            class_index[klass]))
+        result = compute_qdiscimpair(nodes, links, classes, cap_of,
+                                     packets, events)
     elif argv[1] == "converge":
         if len(argv) != 8:
             fail(2)
