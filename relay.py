@@ -179,6 +179,29 @@ sourceVersion,config with sourceVersion b and config the full archive
 object on generate or the compacted object on commit; any failure
 leaves PACK and A's bytes untouched and removes only this call's
 staging temp file, and one call rewrites at most one of the two files;
+config op 16 code 5 also covers a mode outside 0/1, an out-of-range
+b/e, a non-array or empty E, an [e,t,p] event whose e is not a
+non-boolean integer or whose clocks decrease, an invalid event t/p, a
+b that conflicts with the current v except an exact already-applied
+resend, a history suffix that conflicts with the simulated suffix, and
+a new version that would overflow MAX_COST; op 16 is a batched
+event-clock transaction [16,m,b,E] processing the clock-sorted
+configuration snapshots in E as one atomic operation: m=0 only
+previews (no file, temp file, or other side effect) and m=1 commits by
+replacing PACK once, atomically, only after every event validates and
+every version computes; starting at h[b], each event's t/p is compared
+with the previous state - an equal event is idempotent (events-row
+status 1, no new version) and every other event appends the next
+continuous version (events-row status 0) with the [n,l,p] delta of the
+previous state in op 7's row structure, code-point ordering, and
+six-integer policy delta; a first successful processing has batch
+status 0 and applied is true only when m=1 and at least one event
+changes, and a resend whose simulated change suffix already matches
+PACK's consecutive suffix from b is a duplicate (status 1, applied
+false, no write) while every other b/current-version mismatch rejects;
+the result key order is op,mode,status,old,new,applied,events,config
+with each events row [e,status,old,new,diff]; any failure leaves PACK
+and every temp file untouched;
 for
 compoundcp code 3 also covers a STATE read/write error and code 5
 also covers a STATE whose key order, content, or h digest is invalid,
@@ -12795,6 +12818,88 @@ def _config_archive_compact(pack_path, pack, v, topo, policy, history,
             "config": compact}
 
 
+def _config_event_batch(pack_path, pack, v, history, mode, base, events):
+    # Batched event-clock configuration transaction (config op 16):
+    # [16, m, b, E]. m is 0 (read-only preview) or 1 (atomic commit); b
+    # is the caller-observed base version; E is a non-empty array of
+    # [e, t, p] events with e a non-boolean integer in 0..MAX_COST,
+    # non-decreasing (equal e kept in input order), t a metric topology,
+    # and p a six-integer policy. Simulation starts at h[b] and walks
+    # the events in order: an event whose t/p equals the previous state
+    # is idempotent (row status 1, no version), every other event appends
+    # the next continuous version (row status 0) with the [n, l, p] delta
+    # of the previous state against the target, in op 7's row structure,
+    # code-point ordering, and six-integer policy delta.
+    #
+    # A first successful processing against the current version (b == v)
+    # has batch status 0 even when every event is idempotent. applied is
+    # true only for a mode-1 commit with at least one change; mode 0
+    # writes nothing and mode 1 replaces PACK once, atomically, only
+    # after every event validates and every version computes. A resend
+    # of an already applied batch (v == b+k and h[b+1..b+k] equals the
+    # simulated change suffix exactly) is a duplicate: status 1, applied
+    # false, nothing written. Every other b != v case (b absent from h,
+    # a partial/conflicting suffix) rejects with code 5, as does a new
+    # version past MAX_COST. O(S log S) time and O(S) extra space with S
+    # the total input/output size (the diff rows sort node/edge sets).
+    if base > v:
+        fail(5)
+    cur_version = base
+    cur_t = history[base][1]
+    cur_p = history[base][2]
+    rows = []
+    suffix = []
+    last_e = None
+    for event in events:
+        e, new_t, new_p = event
+        if last_e is not None and e < last_e:
+            fail(5)
+        last_e = e
+        n, l, p_delta = _config_state_diff(cur_t, new_t, cur_p, new_p)
+        diff = [n, l, p_delta]
+        if new_t == cur_t and new_p == cur_p:
+            rows.append([e, 1, cur_version, cur_version, diff])
+            continue
+        if cur_version >= MAX_COST:
+            fail(5)
+        next_version = cur_version + 1
+        rows.append([e, 0, cur_version, next_version, diff])
+        suffix.append([next_version, new_t, new_p])
+        cur_version = next_version
+        cur_t, cur_p = new_t, new_p
+    change_count = len(suffix)
+
+    if base != v:
+        # The only tolerated stale base is an exact resend: PACK must
+        # already end exactly at the simulated suffix with every entry
+        # equal; anything else is a version/suffix conflict.
+        if change_count == 0 or v != base + change_count:
+            fail(5)
+        for offset, entry in enumerate(suffix, start=1):
+            if history[base + offset] != entry:
+                fail(5)
+        return {"op": 16, "mode": mode, "status": 1, "old": base,
+                "new": v, "applied": False, "events": rows,
+                "config": pack}
+
+    if change_count == 0:
+        # All events idempotent at the current version: nothing to
+        # append, so a commit writes nothing either.
+        return {"op": 16, "mode": mode, "status": 0, "old": base,
+                "new": base, "applied": False, "events": rows,
+                "config": pack}
+    new_pack = {"v": v + change_count, "t": cur_t, "p": cur_p,
+                "h": history + suffix}
+    if mode == 1:
+        _write_state_atomic(pack_path, new_pack)
+        applied = True
+    else:
+        applied = False
+    return {"op": 16, "mode": mode, "status": 0, "old": base,
+            "new": v + change_count, "applied": applied, "events": rows,
+            "config": new_pack}
+
+
 def _config_rollback_log(pack_path, pack, v, history, mode, base, log,
                          out_path):
     # Rollback log export/replay (config op 10): [10, m, B, L, O]. L is
@@ -18505,6 +18610,30 @@ def main():
                     or type(op[3]) is not str or len(op[3]) == 0:
                 fail(5)
             mode, base, arch_path = op[1], op[2], op[3]
+        elif kind == 16:
+            # [16, m, b, E]: batched event-clock configuration
+            # transaction. m is 0 (read-only preview) or 1 (atomic
+            # commit); b is a bounded non-boolean integer base version;
+            # E a non-empty list of [e, t, p] events whose e is a
+            # bounded non-boolean integer (t/p validated after PACK
+            # validation). The non-decreasing e check, the b-vs-v
+            # conflict / duplicate-suffix check, and the MAX_COST
+            # overflow check run in _config_event_batch.
+            if len(op) != 4 or type(op[1]) is not int \
+                    or op[1] not in (0, 1) \
+                    or type(op[2]) is not int \
+                    or not 0 <= op[2] <= MAX_COST:
+                fail(5)
+            mode, base = op[1], op[2]
+            events = op[3]
+            if not isinstance(events, list) or not events:
+                fail(5)
+            for item in events:
+                if not isinstance(item, list) or len(item) != 3:
+                    fail(5)
+                if type(item[0]) is not int \
+                        or not 0 <= item[0] <= MAX_COST:
+                    fail(5)
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -18515,6 +18644,13 @@ def main():
             _validate_topology(new_t, metrics=True)
             if not _is_policy(new_p):
                 fail(5)
+        if kind == 16:
+            # Every event t follows the metric topology and every p the
+            # six-integer policy contract, exactly like op 8's target.
+            for item in events:
+                _validate_topology(item[1], metrics=True)
+                if not _is_policy(item[2]):
+                    fail(5)
         if kind == 0:
             try:
                 with open(out_path, "rb") as f:
@@ -18585,6 +18721,9 @@ def main():
             result = _config_archive_compact(pack_path, pack, v, topo,
                                              policy, history, mode, base,
                                              arch_path)
+        elif kind == 16:
+            result = _config_event_batch(pack_path, pack, v, history,
+                                         mode, base, events)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
