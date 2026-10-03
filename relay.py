@@ -428,6 +428,62 @@ op,mode,status,old,new,applied,events,config with each events row
 flows, V nodes, and A links the bound is
 O(B(K(V^2+A)+FV+A)) time and O(KV+FV+A) extra space besides the
 returned result;
+config op 23 code 5 also covers a mode outside 0/1, an out-of-range
+b/e/L/C, a non-array or empty E, an [e,t,p] event whose e is not a
+non-boolean integer or whose clocks decrease, an invalid event t/p, a
+non-array/empty F or [id,source,destination,demand,maxLatency] flow
+with a non-unique or empty id, equal endpoints, a demand outside
+1..MAX_COST, or a maxLatency outside 0..MAX_TIME, an L or C outside
+0..1000000, an F endpoint absent from h[b]'s topology, an unreachable
+or over-maxLatency flow or an overloaded link at h[b], a reachable
+path whose latency sum exceeds MAX_TIME, a b that conflicts with the
+current v except an exact already-applied resend, a history suffix
+that conflicts with the simulated suffix, and a new version that would
+overflow MAX_COST; op 23 is op 16's batched hotload plus a per-event
+latency-bounded reroute gate [23,m,b,E,F,L,C] with m/b/E carrying op
+22's input semantics, each F item
+[id,source,destination,demand,maxLatency] a flow with a unique
+non-empty string id, distinct endpoints that are nodes of h[b]'s
+topology, demand a non-boolean integer in 1..MAX_COST, and maxLatency
+a non-boolean integer in 0..MAX_TIME, L in 0..1000000 the largest
+allowed peak increase and C in 0..1000000 the largest rerouted demand
+as a fraction of one million of total demand: inputs validate before
+any simulation, which starts at h[b] and walks the clock-sorted
+events in E order; an event equal to the previous state is idempotent
+(events-row status 1, no version, an empty impact) and every other
+event routes each F flow on the up-link lowest-cost path with the
+full-node-sequence Unicode tie break before and after, with the path
+latency the sum of its link latencies, a flow whose full path changes
+a reroute whose demand joins movedDemand (an unreachable flow never
+reroutes), with a link's used the summed demand of every flow whose
+path traverses it and the peak the exact maximum used/bandwidth over
+all links; an event passes only when every flow is reachable on the
+new side and its new latency is at most its maxLatency, no link is
+overloaded, the exact peak increase is at most L/1000000, and
+movedDemand/totalDemand is at most C/1000000 (compared by integer
+cross multiplication, never floats), emitting an impact
+[oldPeak,newPeak,delta,movedDemand,totalDemand,movedRatio,flows,links]
+with flows in F order
+[id,oldCost,newCost,oldLatency,newLatency,oldPath,newPath,moved,pass]
+(null cost, null latency, and [] path on an unreachable side, moved a
+boolean for a path change between two reachable sides, and pass a
+boolean for the new latency being within maxLatency, false on an
+unreachable new side) and links in the candidate topology's order
+[from,to,bandwidth,used,utilization], peaks, movedRatio, and
+utilization rounded half up to six-decimal strings and delta a signed
+six-decimal string from the exact rationals; the first failing event
+is events-row status 2 with old/new both the pre-call version, after
+which simulation stops and the whole batch rejects with batch status
+2, applied false and the pre-call config, PACK untouched in both
+modes with no partial version or leftover temp file; with all events
+gated candidates, version/history append, duplicate-resend
+recognition, the preview/commit difference, and the single atomic
+replace follow op 16; the result key order is
+op,mode,status,old,new,applied,events,config with each events row
+[e,status,old,new,impact]; for B events, K distinct flow sources, F
+flows, V nodes, and A links the bound is
+O(B(K(V^2+A)+FV+A)) time and O(KV+FV+A) extra space besides the
+returned result;
 for
 compoundcp code 3 also covers a STATE read/write error and code 5
 also covers a STATE whose key order, content, or h digest is invalid,
@@ -14810,6 +14866,301 @@ def _config_stability_gate_batch(pack_path, pack, v, history, mode, base,
             "config": new_pack}
 
 
+def _config_latency_side(nodes, links, flows, flow_count):
+    # Route every flow on one topology for the latency gate (config op
+    # 23), exactly like _config_capacity_side - the route subcommand's
+    # lowest-cost path over up links with the full-node-sequence Unicode
+    # tie break, one Dijkstra per distinct source - and additionally sum
+    # each chosen path's link latencies. A flow item is
+    # [id, source, destination, demand, maxLatency]; the per-flow
+    # maxLatency is used by the caller, not here. Returns
+    # (paths, costs, latencies, used, peak(Num,Den), all_reachable,
+    # any_overload) with a None slot for paths/costs/latencies on an
+    # unreachable side. A reachable path whose latency sum exceeds
+    # MAX_TIME fails code 5. O(K(V^2 + A) + FV + A) for K distinct
+    # sources, F flows, V nodes, and A links.
+    node_set = set(nodes)
+    cost_of = {}
+    path_of = {}
+    lat_of = {}
+    for link in links:
+        lat_of[(link["from"], link["to"])] = link["latency"]
+    paths = [None] * flow_count
+    costs = [None] * flow_count
+    latencies = [None] * flow_count
+    reachable = True
+    for i, item in enumerate(flows):
+        s, d = item[1], item[2]
+        if s not in node_set or d not in node_set:
+            reachable = False
+            continue
+        if s not in cost_of:
+            cost_of[s], path_of[s] = shortest_paths(nodes, links, s)
+        path = path_of[s][d]
+        if path is None:
+            reachable = False
+            continue
+        latency = 0
+        for a, c in zip(path, path[1:]):
+            latency += lat_of[(a, c)]
+            if latency > MAX_TIME:
+                fail(5)
+        paths[i] = path
+        costs[i] = cost_of[s][d]
+        latencies[i] = latency
+    used = [0] * len(links)
+    index_of = {}
+    for index, link in enumerate(links):
+        index_of[(link["from"], link["to"])] = index
+    for i, item in enumerate(flows):
+        if paths[i] is None:
+            continue
+        path = paths[i]
+        demand = item[3]
+        for a, c in zip(path, path[1:]):
+            used[index_of[(a, c)]] += demand
+    peak_num, peak_den = 0, 1
+    over = False
+    for index, link in enumerate(links):
+        u, bw = used[index], link["bandwidth"]
+        if u > bw:
+            over = True
+        if u * peak_den > peak_num * bw:
+            peak_num, peak_den = u, bw
+    return (paths, costs, latencies, used, (peak_num, peak_den),
+            reachable, over)
+
+
+def _config_latency_impact(flows, old_costs, old_paths, old_latencies,
+                           old_peak, new_topo, new_costs, new_paths,
+                           new_latencies, new_used, new_peak, moved,
+                           moved_demand, total_demand, passed_latency):
+    # Build the [oldPeak, newPeak, delta, movedDemand, totalDemand,
+    # movedRatio, flows, links] impact row for a latency-gated event,
+    # carrying op 22's envelope with old/new latency and a per-flow pass
+    # flag added. Flow rows follow F order as
+    # [id, oldCost, newCost, oldLatency, newLatency, oldPath, newPath,
+    # moved, pass] with moved a plain boolean marking a path change
+    # between two reachable sides and pass a plain boolean marking the
+    # new-side latency at most the flow's maxLatency (false on an
+    # unreachable new side); an unreachable side is a null cost, a null
+    # latency, and []. Link rows follow the new (candidate) topology's
+    # link order, each [from, to, bandwidth, used, utilization].
+    old_num, old_den = old_peak
+    new_num, new_den = new_peak
+    flow_rows = []
+    for i, item in enumerate(flows):
+        fid = item[0]
+        oc = old_costs[i]
+        ol = old_latencies[i]
+        op_ = old_paths[i]
+        nc = new_costs[i]
+        nl = new_latencies[i]
+        np_ = new_paths[i]
+        flow_rows.append([fid, oc, nc, ol, nl,
+                          [] if op_ is None else op_,
+                          [] if np_ is None else np_,
+                          bool(moved[i]), bool(passed_latency[i])])
+    link_rows = []
+    for index, link in enumerate(new_topo["links"]):
+        u = new_used[index]
+        bw = link["bandwidth"]
+        link_rows.append([link["from"], link["to"], bw, u,
+                          _config_capacity_six(u, bw)])
+    return [_config_capacity_six(old_num, old_den),
+            _config_capacity_six(new_num, new_den),
+            _config_capacity_delta_six(new_num, new_den, old_num, old_den),
+            moved_demand, total_demand,
+            _config_capacity_six(moved_demand, total_demand),
+            flow_rows, link_rows]
+
+
+def _config_latency_gate_batch(pack_path, pack, v, history, mode, base,
+                               events, flows, limit_ppm, moved_ppm):
+    # Batched hotload with a per-event latency-bounded reroute gate
+    # (config op 23): [23, m, b, E, F, L, C]. m is 0 (read-only preview)
+    # or 1 (atomic commit); b the caller-observed base version; E a
+    # non-empty array of non-decreasing-clock [e, t, p] events exactly
+    # like op 16's; F a non-empty array of
+    # [id, source, destination, demand, maxLatency] flows with unique
+    # non-empty string ids, two distinct endpoints that are both nodes
+    # of the h[b] topology, a demand a non-boolean integer in
+    # 1..MAX_COST, and a maxLatency a non-boolean integer in
+    # 0..MAX_TIME; L a non-boolean integer in 0..1000000, the largest
+    # allowed peak-increase as a fraction of one million; C a
+    # non-boolean integer in 0..1000000, the largest rerouted demand as
+    # a fraction of total demand.
+    #
+    # Every input validates first (shapes in the command entry; the h[b]
+    # endpoint check, clocks, and event t/p here), then simulation walks
+    # from h[b] in E order. Every flow is routed on the up-link
+    # lowest-cost path with shortest_paths' full-node-sequence Unicode
+    # tie break, exactly like op 22, with the path latency the sum of
+    # its link latencies; a reachable path whose latency sum exceeds
+    # MAX_TIME is code 5. The batch is only defined from a feasible
+    # h[b]: every flow must be routable there within its maxLatency and
+    # every link already within its bandwidth, otherwise code 5. An
+    # event whose t/p equals the previous state is idempotent (row
+    # status 1, no version, an empty impact). Every other event routes
+    # each flow before and after: a flow whose full path changes is a
+    # reroute and movedDemand is the summed demand of rerouted flows; an
+    # unreachable flow never reroutes (its moved is false). An event
+    # passes only when every flow is reachable on the new side with its
+    # new latency at most its maxLatency, no link is overloaded, the
+    # exact peak increase is at most L/1000000, and
+    # movedDemand/totalDemand is at most C/1000000 (integer cross
+    # multiplication only, never floats). A passing event (row status 0,
+    # a candidate version) carries the impact
+    # [oldPeak, newPeak, delta, movedDemand, totalDemand, movedRatio,
+    # flows, links]: flows in F order
+    # [id, oldCost, newCost, oldLatency, newLatency, oldPath, newPath,
+    # moved, pass] with a null cost/latency and [] path on an
+    # unreachable side and pass reporting the new-side latency
+    # compliance; links in candidate topology order
+    # [from, to, bandwidth, used, utilization] for the new side,
+    # peaks/movedRatio/utilization rendered as six-decimal half-up
+    # strings and delta a signed six-decimal string from the exact
+    # rationals. At the first failing non-idempotent event simulation
+    # stops at once and the whole batch rejects: batch status 2, old/new
+    # both the pre-call v, applied false, config the pre-call pack, and
+    # PACK untouched in either mode.
+    #
+    # Once every event is a gated candidate, version/history append,
+    # duplicate-resend recognition, the preview/commit difference, and
+    # the single atomic replace follow op 16 exactly. For B events, K
+    # distinct flow sources, F flows, V nodes, and A links the bound is
+    # O(B(K(V^2+A) + FV + A)) time and O(KV + FV + A) extra space
+    # besides the returned result.
+    if base > v:
+        fail(5)
+    base_topo = history[base][1]
+    base_node_set = set(base_topo["nodes"])
+    for item in flows:
+        if item[1] not in base_node_set or item[2] not in base_node_set:
+            fail(5)
+    last_e = None
+    for item in events:
+        e = item[0]
+        if last_e is not None and e < last_e:
+            fail(5)
+        last_e = e
+        _validate_topology(item[1], metrics=True)
+        if not _is_policy(item[2]):
+            fail(5)
+
+    flow_count = len(flows)
+    total_demand = 0
+    for item in flows:
+        total_demand += item[3]
+    cur_version = base
+    cur_t = history[base][1]
+    cur_p = history[base][2]
+    (cur_paths, cur_costs, cur_latencies, _, cur_peak,
+     cur_reachable, cur_over) = _config_latency_side(
+         cur_t["nodes"], cur_t["links"], flows, flow_count)
+    # The batch is only defined from a feasible h[b]: every flow must be
+    # routable there within its maxLatency and every link already within
+    # its bandwidth.
+    if not cur_reachable or cur_over:
+        fail(5)
+    for i, item in enumerate(flows):
+        if cur_latencies[i] > item[4]:
+            fail(5)
+
+    rows = []
+    suffix = []
+    for event in events:
+        e, new_t, new_p = event
+        if new_t == cur_t and new_p == cur_p:
+            rows.append([e, 1, cur_version, cur_version, []])
+            continue
+        if cur_version >= MAX_COST:
+            fail(5)
+        (new_paths, new_costs, new_latencies, new_used, new_peak,
+         new_reachable, new_over) = _config_latency_side(
+             new_t["nodes"], new_t["links"], flows, flow_count)
+        moved = [False] * flow_count
+        passed_latency = [False] * flow_count
+        moved_demand = 0
+        for i, item in enumerate(flows):
+            np_ = new_paths[i]
+            nl = new_latencies[i]
+            passed_latency[i] = np_ is not None and nl <= item[4]
+            op_ = cur_paths[i]
+            if op_ is not None and np_ is not None and op_ != np_:
+                moved[i] = True
+                moved_demand += item[3]
+        passed = new_reachable and not new_over and all(passed_latency)
+        old_num, old_den = cur_peak
+        new_num, new_den = new_peak
+        if passed:
+            # Exact comparison of the peak increase against L/1000000:
+            # newNum/newDen - oldNum/oldDen <= L/1000000.
+            delta_num = new_num * old_den - old_num * new_den
+            increase_ok = (delta_num * 1000000
+                           <= limit_ppm * new_den * old_den)
+            if not increase_ok:
+                passed = False
+        if passed:
+            # Exact comparison of the rerouted share against C/1000000:
+            # movedDemand/totalDemand <= C/1000000.
+            if moved_demand * 1000000 > moved_ppm * total_demand:
+                passed = False
+        if not passed:
+            impact = _config_latency_impact(
+                flows, cur_costs, cur_paths, cur_latencies, cur_peak,
+                new_t, new_costs, new_paths, new_latencies, new_used,
+                new_peak, moved, moved_demand, total_demand,
+                passed_latency)
+            rows.append([e, 2, cur_version, cur_version, impact])
+            return {"op": 23, "mode": mode, "status": 2, "old": v,
+                    "new": v, "applied": False, "events": rows,
+                    "config": pack}
+        impact = _config_latency_impact(
+            flows, cur_costs, cur_paths, cur_latencies, cur_peak,
+            new_t, new_costs, new_paths, new_latencies, new_used,
+            new_peak, moved, moved_demand, total_demand, passed_latency)
+        next_version = cur_version + 1
+        rows.append([e, 0, cur_version, next_version, impact])
+        suffix.append([next_version, new_t, new_p])
+        cur_version = next_version
+        cur_t, cur_p = new_t, new_p
+        cur_paths, cur_costs = new_paths, new_costs
+        cur_latencies = new_latencies
+        cur_peak = new_peak
+    change_count = len(suffix)
+
+    if base != v:
+        # The only tolerated stale base is an exact resend: PACK must
+        # already end exactly at the simulated suffix with every entry
+        # equal; anything else is a version/suffix conflict.
+        if change_count == 0 or v != base + change_count:
+            fail(5)
+        for offset, entry in enumerate(suffix, start=1):
+            if history[base + offset] != entry:
+                fail(5)
+        return {"op": 23, "mode": mode, "status": 1, "old": base,
+                "new": v, "applied": False, "events": rows,
+                "config": pack}
+
+    if change_count == 0:
+        # All events idempotent at the current version: nothing to
+        # append, so a commit writes nothing either.
+        return {"op": 23, "mode": mode, "status": 0, "old": base,
+                "new": base, "applied": False, "events": rows,
+                "config": pack}
+    new_pack = {"v": v + change_count, "t": cur_t, "p": cur_p,
+                "h": history + suffix}
+    if mode == 1:
+        _write_state_atomic(pack_path, new_pack)
+        applied = True
+    else:
+        applied = False
+    return {"op": 23, "mode": mode, "status": 0, "old": base,
+            "new": v + change_count, "applied": applied, "events": rows,
+            "config": new_pack}
+
+
 def _config_rollback_log(pack_path, pack, v, history, mode, base, log,
                          out_path):
     # Rollback log export/replay (config op 10): [10, m, B, L, O]. L is
@@ -21010,6 +21361,62 @@ def main():
             if type(moved_ppm) is not int \
                     or not 0 <= moved_ppm <= 1000000:
                 fail(5)
+        elif kind == 23:
+            # [23, m, b, E, F, L, C]: batched hotload with a per-event
+            # latency-bounded reroute gate. m/b/E/L/C carry op 22's
+            # input semantics; F is a non-empty list of
+            # [id, source, destination, demand, maxLatency] flows with
+            # unique non-empty string ids, distinct string endpoints
+            # that are checked against h[b]'s topology after PACK
+            # validation, a demand a non-boolean integer in
+            # 1..MAX_COST, and a maxLatency a non-boolean integer in
+            # 0..MAX_TIME. The non-decreasing e check, the h[b]
+            # feasibility/endpoint/latency checks, the b-vs-v conflict
+            # / duplicate-suffix check, the MAX_COST overflow check,
+            # and the reachable-path MAX_TIME latency-sum check run in
+            # _config_latency_gate_batch.
+            if len(op) != 7 or type(op[1]) is not int \
+                    or op[1] not in (0, 1) \
+                    or type(op[2]) is not int \
+                    or not 0 <= op[2] <= MAX_COST:
+                fail(5)
+            mode, base = op[1], op[2]
+            events = op[3]
+            if not isinstance(events, list) or not events:
+                fail(5)
+            for item in events:
+                if not isinstance(item, list) or len(item) != 3:
+                    fail(5)
+                if type(item[0]) is not int \
+                        or not 0 <= item[0] <= MAX_COST:
+                    fail(5)
+            flows = op[4]
+            if not isinstance(flows, list) or not flows:
+                fail(5)
+            seen_ids = set()
+            for flow in flows:
+                if not isinstance(flow, list) or len(flow) != 5:
+                    fail(5)
+                fid, fs, fd, demand, max_latency = flow
+                if type(fid) is not str or fid == "" or fid in seen_ids:
+                    fail(5)
+                seen_ids.add(fid)
+                if type(fs) is not str or type(fd) is not str or fs == fd:
+                    fail(5)
+                if type(demand) is not int \
+                        or not 1 <= demand <= MAX_COST:
+                    fail(5)
+                if type(max_latency) is not int \
+                        or not 0 <= max_latency <= MAX_TIME:
+                    fail(5)
+            limit_ppm = op[5]
+            if type(limit_ppm) is not int \
+                    or not 0 <= limit_ppm <= 1000000:
+                fail(5)
+            moved_ppm = op[6]
+            if type(moved_ppm) is not int \
+                    or not 0 <= moved_ppm <= 1000000:
+                fail(5)
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -21128,6 +21535,11 @@ def main():
                                                   history, mode, base,
                                                   events, flows,
                                                   limit_ppm, moved_ppm)
+        elif kind == 23:
+            result = _config_latency_gate_batch(pack_path, pack, v,
+                                                history, mode, base,
+                                                events, flows,
+                                                limit_ppm, moved_ppm)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
