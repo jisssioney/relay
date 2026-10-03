@@ -753,6 +753,44 @@ covers a wrong arity and an R outside 0..MAX_COST while every op 28
 code-5 case still applies; the bound is
 O(B(S+1)(K(V^2+A)+FV+A)) time and
 O(KV+FV+A+(S+1)F) extra space;
+op 30 is op 29's batched compound-failure and cumulative-reroute gates
+plus an event-clock minimum reroute interval
+[30,m,b,E,F,S,L,C,R,D] with m/b/E/F/S/L/C/R carrying op 29's exact
+semantics and D a non-boolean integer in 0..MAX_COST; the no-failure
+scenario and each S scenario keep separate flat per-flow cumulative
+counts and per-flow last-reroute clocks that are never merged, and a
+non-idempotent event records one reroute at its event clock for a flow
+in a scenario only when that flow is reachable on both the previous
+and candidate sides there with different complete node paths (the same
+predicate as op 29's migration); the first reroute passes outright and
+every later one passes only when the current clock minus that flow's
+last reroute clock in that scenario is at least D, so D zero adds no
+restriction while, under non-decreasing clocks, a second reroute at
+the same clock fails whenever D is positive; a non-reroute and an
+equal-state event (row status 1, empty impact) update neither count
+nor clock; the event must satisfy every op 29 gate - the R cumulative
+cap, L, C, reachability, link overload, and each flow's own maxLatency
+- and every reroute's interval; the impact keeps op 29's fixed
+[oldWorst,newWorst,delta,scenarios] order with the scenario rows
+unchanged and each flow row gaining previousMoveClock, gap,
+intervalPass after moves - the first two null when there was no
+previous reroute, gap null when the current event does not reroute
+that flow, and intervalPass false only for a reroute whose gap is
+below D (true on a non-reroute and every first or passing reroute) -
+while each scenario pass aggregates op 29's predicate and every
+flow's intervalPass; six-decimal strings, the Unicode tie break, and
+input order are unchanged; the first failing event is the events row
+and batch status 2 with its impact retained, after which simulation
+stops, old/new are the pre-call version, applied false, the pre-call
+config is returned, and PACK is untouched in both modes; preview
+writes nothing, a commit atomically replaces PACK once only after the
+whole batch passes, and exact resend, all-equal events, and failed
+rollback are idempotent exactly like op 29; config op 30 code 5
+additionally covers a wrong arity and a D outside 0..MAX_COST while
+every op 29 code-5 case still applies, file read errors use code 3 and
+JSON syntax, duplicate-key, or non-finite-number errors code 4; the
+bound is O(B(S+1)(K(V^2+A)+FV+A)) time and
+O(KV+FV+A+(S+1)F) extra space;
 for
 compoundcp code 3 also covers a STATE read/write error and code 5
 also covers a STATE whose key order, content, or h digest is invalid,
@@ -17200,6 +17238,336 @@ def _config_flapmig_gate_batch(pack_path, pack, v, history, mode, base,
             "config": new_pack}
 
 
+def _config_flapgap_assess(old_topo, new_topo, flows, flow_count, prepared,
+                           total_demand, moved_ppm, move_cap, min_gap,
+                           cur_moves, cur_clocks, clock):
+    # Walk op 30's compound-failure scenarios exactly like op 29's
+    # _config_flapmig_assess (no-failure then S order, both sides
+    # routed, a flow a migration only when reachable on both sides with
+    # differing complete paths, the same C gate, latency/overload/
+    # reachable gates, worst tracking, the cumulative R counts, and
+    # rendered rows), additionally carrying the batch's
+    # per-(scenario, flow) last-reroute clocks. cur_clocks is the flat
+    # (S+1)*F array, one slot per (scenario, flow), holding the event
+    # clock of that slot's most recent recorded reroute or -1 when it
+    # has never rerouted; scenario index 0 is the no-failure scenario
+    # then prepared order. For a migrated flow the first reroute
+    # (previous clock -1) always passes; a later one passes only when
+    # clock - previousClock >= min_gap (D). D = 0 adds no restriction
+    # and, with non-decreasing clocks, only an equal-clock second
+    # reroute fails when D > 0. A flow that does not reroute - equal
+    # paths or an unreachable side - leaves its count and clock alone.
+    # The candidate post-event count and clock arrays are returned;
+    # candidate clocks record the would-be reroute clock even when its
+    # interval fails, so the rendered previousMoveClock/gap describe the
+    # failed move, while nothing the caller holds is mutated on a
+    # failure. Each rendered scenario row is op 29's row unchanged -
+    # [scenarioId, peak, movedDemand, totalDemand, movedRatio, maxMoves,
+    # pass, flows, links] - and each rendered flow row is op 29's row
+    # with previousMoveClock, gap, intervalPass appended after moves:
+    # [id, oldCost, newCost, oldLatency, newLatency, oldPath, newPath,
+    # moved, pass, moves, previousMoveClock, gap, intervalPass]. The
+    # first two appended values are null with no previous reroute, gap
+    # null when this event does not reroute the flow, and intervalPass
+    # false only for a reroute whose gap is below D (it is true on a
+    # non-reroute and on every first/passing reroute). pass aggregates
+    # op 29's exact per-scenario predicate AND every flow's
+    # intervalPass; the R cap still surfaces only through the event
+    # status and moves_ok. Extra space is the one live scenario pair
+    # plus the two candidate arrays: O(KV + FV + A + (S+1)F).
+    scenario_count = len(prepared) + 1
+    new_moves = [0] * (scenario_count * flow_count)
+    new_clocks = [0] * (scenario_count * flow_count)
+    old_worst_sid = None
+    old_worst_num, old_worst_den = 0, 1
+    new_worst_sid = None
+    new_worst_num, new_worst_den = 0, 1
+    all_reachable = True
+    no_over = True
+    latency_ok = True
+    migration_ok = True
+    moves_ok = True
+    interval_ok = True
+    rows = []
+    s_index = -1
+    for pair in _config_clatmig_iter(old_topo, new_topo, flows,
+                                     flow_count, prepared):
+        s_index += 1
+        sid, old_rec, new_rec = pair
+        (old_paths, old_costs, old_latencies, _, old_peak,
+         old_reachable, old_over) = old_rec
+        (new_paths, new_costs, new_latencies, new_used, new_peak,
+         new_reachable, new_over) = new_rec
+        old_num, old_den = old_peak
+        new_num, new_den = new_peak
+        if old_num * old_worst_den > old_worst_num * old_den:
+            old_worst_sid, old_worst_num, old_worst_den = \
+                sid, old_num, old_den
+        if new_num * new_worst_den > new_worst_num * new_den:
+            new_worst_sid, new_worst_num, new_worst_den = \
+                sid, new_num, new_den
+        moved = [False] * flow_count
+        moved_demand = 0
+        scenario_latency_ok = True
+        scenario_interval_ok = True
+        base_slot = s_index * flow_count
+        scenario_max_moves = 0
+        gaps = [None] * flow_count
+        flow_interval_pass = [True] * flow_count
+        for i, item in enumerate(flows):
+            slot = base_slot + i
+            op_ = old_paths[i]
+            np_ = new_paths[i]
+            if np_ is not None and new_latencies[i] > item[4]:
+                scenario_latency_ok = False
+            did_move = op_ is not None and np_ is not None and op_ != np_
+            previous = cur_clocks[slot]
+            updated_count = cur_moves[slot]
+            updated_clock = previous
+            if did_move:
+                moved[i] = True
+                moved_demand += item[3]
+                updated_count = cur_moves[slot] + 1
+                updated_clock = clock
+                if previous >= 0:
+                    gap = clock - previous
+                    gaps[i] = gap
+                    flow_pass = gap >= min_gap
+                    flow_interval_pass[i] = flow_pass
+                    if not flow_pass:
+                        scenario_interval_ok = False
+            new_moves[slot] = updated_count
+            new_clocks[slot] = updated_clock
+            if updated_count > move_cap:
+                moves_ok = False
+            if updated_count > scenario_max_moves:
+                scenario_max_moves = updated_count
+        # movedDemand/totalDemand <= moved_ppm/1000000 by cross multiply.
+        scenario_moved_ok = (moved_demand * 1000000
+                             <= moved_ppm * total_demand)
+        if not new_reachable:
+            all_reachable = False
+        if new_over:
+            no_over = False
+        if not scenario_latency_ok:
+            latency_ok = False
+        if not scenario_moved_ok:
+            migration_ok = False
+        if not scenario_interval_ok:
+            interval_ok = False
+        flow_rows = []
+        for i, item in enumerate(flows):
+            slot = base_slot + i
+            op_ = old_paths[i]
+            np_ = new_paths[i]
+            flow_rows.append(
+                [item[0],
+                 None if op_ is None else old_costs[i],
+                 None if np_ is None else new_costs[i],
+                 None if op_ is None else old_latencies[i],
+                 None if np_ is None else new_latencies[i],
+                 [] if op_ is None else op_,
+                 [] if np_ is None else np_,
+                 bool(moved[i]),
+                 np_ is not None and new_latencies[i] <= item[4],
+                 new_moves[slot],
+                 None if cur_clocks[slot] < 0 else cur_clocks[slot],
+                 gaps[i],
+                 bool(flow_interval_pass[i])])
+        link_rows = []
+        for index, link in enumerate(new_topo["links"]):
+            u = new_used[index]
+            link_rows.append([link["from"], link["to"],
+                              link["bandwidth"], u,
+                              _config_capacity_six(u,
+                                                   link["bandwidth"])])
+        scenario_pass = (new_reachable and not new_over
+                         and scenario_latency_ok
+                         and scenario_moved_ok
+                         and scenario_interval_ok)
+        rows.append([sid, _config_capacity_six(new_num, new_den),
+                     moved_demand, total_demand,
+                     _config_capacity_six(moved_demand, total_demand),
+                     scenario_max_moves, scenario_pass,
+                     flow_rows, link_rows])
+    return (old_worst_sid, old_worst_num, old_worst_den,
+            new_worst_sid, new_worst_num, new_worst_den,
+            all_reachable, no_over, latency_ok, migration_ok, moves_ok,
+            interval_ok, new_moves, new_clocks, rows)
+
+
+def _config_flapgap_gate_batch(pack_path, pack, v, history, mode, base,
+                               events, flows, limit_ppm, scenario_specs,
+                               moved_ppm, move_cap, min_gap):
+    # Batched hotload with op 29's full compound-failure and cumulative
+    # reroute gates plus an event-clock minimum reroute interval
+    # (config op 30): [30, m, b, E, F, S, L, C, R, D]. m, b, E, F, S,
+    # L, C, and R carry op 29's exact semantics (F the
+    # [id, source, destination, demand, maxLatency] shape, L the
+    # worst-utilization-increase cap, C the per-scenario migrated-demand
+    # cap, both in parts per million, R the per-flow per-scenario
+    # cumulative reroute cap); D is a non-boolean integer in
+    # 0..MAX_COST, the smallest permitted clock gap between two reroutes
+    # of one flow within one scenario.
+    #
+    # Every input validates first, exactly as op 29 (shapes in the
+    # command entry; the h[b] reference/endpoint/scenario checks,
+    # clocks, and event t/p here), then simulation walks from h[b] in E
+    # order under non-decreasing event clocks. The no-failure scenario
+    # and each S scenario keep separate flat per-flow cumulative counts
+    # and per-flow last-reroute clocks; they start at zero / "never",
+    # are never merged, and an event touches a flow's scenario slot
+    # only when that flow is reachable on BOTH the previous and
+    # candidate sides there with different complete node paths (the
+    # same migration predicate op 28/29 use). Such a reroute adds one
+    # to the count and stamps the slot with the event clock: the first
+    # reroute always passes while every later one passes only when
+    # clock - previousClock >= D. D = 0 adds no restriction; with
+    # non-decreasing clocks, reroutes at the same clock fail on their
+    # second occurrence whenever D > 0. A non-reroute - equal paths or
+    # an unreachable side - and an equal-state event update neither
+    # counts nor clocks. A non-idempotent event passes only when it
+    # satisfies every op 29 gate - per-scenario reachability,
+    # bandwidth, per-flow maxLatency, the C moved-demand cross
+    # multiplication, the cross-scenario worst-peak L increase, and
+    # every updated count at most R - AND every reroute meets D. An
+    # equal-state event is idempotent (row status 1, an empty impact)
+    # and changes no count or clock. The impact keeps op 29's
+    # [oldWorst, newWorst, delta, scenarios] and scenario rows; each
+    # flow row gains previousMoveClock, gap, intervalPass after its
+    # moves, and each scenario pass also requires every flow's
+    # intervalPass. On the failing event the rendered counts, clocks,
+    # and gap are the candidate values. At the first failing event
+    # simulation stops at once and the whole batch rejects: event row
+    # and batch status 2, old/new both the pre-call v, applied false,
+    # config the pre-call pack, and PACK untouched in either mode; the
+    # count and clock arrays then simply die with the call.
+    #
+    # Version/history append, duplicate-resend recognition, the
+    # preview/commit difference, and the single atomic replace follow
+    # op 16/27/28/29 exactly. For B events, S scenarios, K distinct
+    # flow sources, F flows, V nodes, and A links the bound is
+    # O(B(S+1)(K(V^2+A) + FV + A)) time and
+    # O(KV + FV + A + (S+1)F) extra space besides the returned result.
+    if base > v:
+        fail(5)
+    base_topo = history[base][1]
+    base_node_set = set(base_topo["nodes"])
+    for item in flows:
+        if item[1] not in base_node_set or item[2] not in base_node_set:
+            fail(5)
+    prepared = _config_compound_prepare(base_topo["nodes"],
+                                        base_topo["links"], flows,
+                                        scenario_specs)
+    last_e = None
+    for item in events:
+        e = item[0]
+        if last_e is not None and e < last_e:
+            fail(5)
+        last_e = e
+        _validate_topology(item[1], metrics=True)
+        if not _is_policy(item[2]):
+            fail(5)
+
+    flow_count = len(flows)
+    total_demand = 0
+    for item in flows:
+        total_demand += item[3]
+    cur_version = base
+    cur_t = history[base][1]
+    cur_p = history[base][2]
+    # As in op 29 the batch is only defined from a failure-feasible
+    # h[b]: every flow routable in every scenario within its
+    # maxLatency and every link within its bandwidth there.
+    (_, _, _, cur_reachable, cur_no_over, cur_latency_ok, _) = \
+        _config_clatency_assess(cur_t["nodes"], cur_t["links"], flows,
+                                flow_count, prepared, False)
+    if not cur_reachable or not cur_no_over or not cur_latency_ok:
+        fail(5)
+
+    # Per-(scenario, flow) cumulative migration counts and last-reroute
+    # clocks, scenario index 0 the no-failure scenario then the
+    # prepared scenarios in S order; each block is F entries in F
+    # order. Counts start at zero and -1 marks a clock that has never
+    # recorded a reroute.
+    slots = (len(prepared) + 1) * flow_count
+    cur_moves = [0] * slots
+    cur_clocks = [-1] * slots
+    rows = []
+    suffix = []
+    for event in events:
+        e, new_t, new_p = event
+        if new_t == cur_t and new_p == cur_p:
+            rows.append([e, 1, cur_version, cur_version, []])
+            continue
+        if cur_version >= MAX_COST:
+            fail(5)
+        (old_worst_sid, old_worst_num, old_worst_den,
+         new_worst_sid, new_worst_num, new_worst_den,
+         new_reachable, new_no_over, new_latency_ok, migration_ok,
+         moves_ok, interval_ok, new_moves, new_clocks,
+         scenario_rows) = _config_flapgap_assess(
+             cur_t, new_t, flows, flow_count, prepared, total_demand,
+             moved_ppm, move_cap, min_gap, cur_moves, cur_clocks, e)
+        passed = (new_reachable and new_no_over and new_latency_ok
+                  and migration_ok and moves_ok and interval_ok)
+        if passed:
+            # Exact comparison of the worst-peak increase against
+            # L/1000000: newWorst - oldWorst <= L/1000000.
+            delta_num = new_worst_num * old_worst_den \
+                - old_worst_num * new_worst_den
+            increase_ok = (delta_num * 1000000
+                           <= limit_ppm * new_worst_den * old_worst_den)
+            if not increase_ok:
+                passed = False
+        impact = _config_compound_impact(
+            old_worst_sid, old_worst_num, old_worst_den,
+            new_worst_sid, new_worst_num, new_worst_den, scenario_rows)
+        if not passed:
+            rows.append([e, 2, cur_version, cur_version, impact])
+            return {"op": 30, "mode": mode, "status": 2, "old": v,
+                    "new": v, "applied": False, "events": rows,
+                    "config": pack}
+        next_version = cur_version + 1
+        rows.append([e, 0, cur_version, next_version, impact])
+        suffix.append([next_version, new_t, new_p])
+        cur_version = next_version
+        cur_t, cur_p = new_t, new_p
+        cur_moves = new_moves
+        cur_clocks = new_clocks
+    change_count = len(suffix)
+
+    if base != v:
+        # The only tolerated stale base is an exact resend: PACK must
+        # already end exactly at the simulated suffix with every entry
+        # equal; anything else is a version/suffix conflict.
+        if change_count == 0 or v != base + change_count:
+            fail(5)
+        for offset, entry in enumerate(suffix, start=1):
+            if history[base + offset] != entry:
+                fail(5)
+        return {"op": 30, "mode": mode, "status": 1, "old": base,
+                "new": v, "applied": False, "events": rows,
+                "config": pack}
+
+    if change_count == 0:
+        # All events idempotent at the current version: nothing to
+        # append, so a commit writes nothing either.
+        return {"op": 30, "mode": mode, "status": 0, "old": base,
+                "new": base, "applied": False, "events": rows,
+                "config": pack}
+    new_pack = {"v": v + change_count, "t": cur_t, "p": cur_p,
+                "h": history + suffix}
+    if mode == 1:
+        _write_state_atomic(pack_path, new_pack)
+        applied = True
+    else:
+        applied = False
+    return {"op": 30, "mode": mode, "status": 0, "old": base,
+            "new": v + change_count, "applied": applied, "events": rows,
+            "config": new_pack}
+
+
 def _config_rollback_log(pack_path, pack, v, history, mode, base, log,
                          out_path):
     # Rollback log export/replay (config op 10): [10, m, B, L, O]. L is
@@ -23892,6 +24260,105 @@ def main():
             if type(move_cap) is not int \
                     or not 0 <= move_cap <= MAX_COST:
                 fail(5)
+        elif kind == 30:
+            # [30, m, b, E, F, S, L, C, R, D]: op 29's batched
+            # compound-failure and cumulative-reroute gates plus an
+            # event-clock minimum reroute interval. m/b/E/F/S/L/C/R
+            # carry op 29's exact input semantics (F the same
+            # [id, source, destination, demand, maxLatency] shape, L the
+            # worst-utilization-increase cap, C the per-scenario
+            # migrated-demand cap, R the per-flow per-scenario
+            # cumulative reroute cap); D is a non-boolean integer in
+            # 0..MAX_COST, the smallest clock gap permitted between two
+            # reroutes of one flow within one scenario, counted
+            # separately for the no-failure scenario and each S
+            # scenario. Every op 29 structural and simulation check
+            # also applies; the non-decreasing e check, clock handling,
+            # the h[b] feasibility/endpoint checks, the per-scenario C
+            # cross multiplication, the R cumulative comparison, the D
+            # gap comparison, the b-vs-v conflict / duplicate-suffix
+            # check, and the MAX_COST overflow check run in
+            # _config_flapgap_gate_batch.
+            if len(op) != 10 or type(op[1]) is not int \
+                    or op[1] not in (0, 1) \
+                    or type(op[2]) is not int \
+                    or not 0 <= op[2] <= MAX_COST:
+                fail(5)
+            mode, base = op[1], op[2]
+            events = op[3]
+            if not isinstance(events, list) or not events:
+                fail(5)
+            for item in events:
+                if not isinstance(item, list) or len(item) != 3:
+                    fail(5)
+                if type(item[0]) is not int \
+                        or not 0 <= item[0] <= MAX_COST:
+                    fail(5)
+            flows = op[4]
+            if not isinstance(flows, list) or not flows:
+                fail(5)
+            seen_ids = set()
+            for flow in flows:
+                if not isinstance(flow, list) or len(flow) != 5:
+                    fail(5)
+                fid, fs, fd, demand, max_latency = flow
+                if type(fid) is not str or fid == "" or fid in seen_ids:
+                    fail(5)
+                seen_ids.add(fid)
+                if type(fs) is not str or type(fd) is not str or fs == fd:
+                    fail(5)
+                if type(demand) is not int \
+                        or not 1 <= demand <= MAX_COST:
+                    fail(5)
+                if type(max_latency) is not int \
+                        or not 0 <= max_latency <= MAX_COST:
+                    fail(5)
+            scenario_specs = op[5]
+            if not isinstance(scenario_specs, list) or not scenario_specs:
+                fail(5)
+            seen_scenario_ids = set()
+            for spec in scenario_specs:
+                if not isinstance(spec, list) or len(spec) != 3:
+                    fail(5)
+                sid, fail_nodes, fail_links = spec
+                if type(sid) is not str or sid == "" \
+                        or sid in seen_scenario_ids:
+                    fail(5)
+                seen_scenario_ids.add(sid)
+                if not isinstance(fail_nodes, list):
+                    fail(5)
+                seen_nodes = set()
+                for node in fail_nodes:
+                    if type(node) is not str or node in seen_nodes:
+                        fail(5)
+                    seen_nodes.add(node)
+                if not isinstance(fail_links, list):
+                    fail(5)
+                seen_pairs = set()
+                for pair in fail_links:
+                    if not isinstance(pair, list) or len(pair) != 2:
+                        fail(5)
+                    a, c = pair
+                    if type(a) is not str or type(c) is not str \
+                            or (a, c) in seen_pairs:
+                        fail(5)
+                    seen_pairs.add((a, c))
+            limit_ppm = op[6]
+            if type(limit_ppm) is not int \
+                    or not 0 <= limit_ppm <= 1000000:
+                fail(5)
+            moved_ppm = op[7]
+            if type(moved_ppm) is not int \
+                    or not 0 <= moved_ppm <= 1000000:
+                fail(5)
+            move_cap = op[8]
+            if type(move_cap) is not int \
+                    or not 0 <= move_cap <= MAX_COST:
+                fail(5)
+            min_gap = op[9]
+            if type(min_gap) is not int \
+                    or not 0 <= min_gap <= MAX_COST:
+                fail(5)
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -24044,6 +24511,12 @@ def main():
                                                 events, flows, limit_ppm,
                                                 scenario_specs, moved_ppm,
                                                 move_cap)
+        elif kind == 30:
+            result = _config_flapgap_gate_batch(pack_path, pack, v,
+                                                history, mode, base,
+                                                events, flows, limit_ppm,
+                                                scenario_specs, moved_ppm,
+                                                move_cap, min_gap)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
