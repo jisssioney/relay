@@ -234,6 +234,41 @@ the result key order is op,mode,status,old,new,applied,events,config
 with each events row [e,status,old,new,impact]; the bound is
 O(BK(V^2+A)+S) time and O(S+BRV+KV) space for B events, K distinct
 sources, R queries, V nodes, A links, S total I/O;
+config op 18 code 5 also covers a mode outside 0/1, an out-of-range
+b/e/L/D, a non-array or empty E, an [e,t,p] event whose e is not a
+non-boolean integer or whose clocks decrease, an invalid event t/p, a
+non-array/empty Q or [s,d] pair with non-string or duplicate pairs, a Q
+endpoint absent from h[b]'s topology, a b that conflicts with the
+current v except an exact already-applied resend, a history suffix that
+conflicts with the simulated suffix, and a new version that would
+overflow MAX_COST; op 18 is op 16's batched hotload plus a per-event
+ECMP stability gate [18,m,b,E,Q,L,D] with L in 0..MAX_COST the allowed
+lowest-cost increase and D in 0..MAX_COST the allowed number of old
+equal-cost next hops removed per query: inputs validate before any
+simulation, which starts at h[b] and walks the clock-sorted events in E
+order; an event equal to the previous state is idempotent (events-row
+status 1, no version, an empty impact) and every other event compares,
+for each Q pair in input order, before and after, the lowest cost and
+the complete dispatch candidate set - only the first hop of each
+lowest-cost path, sorted by Unicode code point order, each entry
+[nextHop,path] with path that next hop's lexicographically smallest
+representative path - emitting, in Q order, impact rows
+[s,d,oldCost,newCost,oldCandidates,newCandidates,removed,added,pass]
+where removed and added are ordered next-hop arrays (null cost and []
+candidates when unreachable; cost 0 and [] candidates when s == d); a
+pair passes when the old route was unreachable, or the new route is
+reachable, newCost-oldCost <= L, and at most D old next hops were
+removed, and an event passes only when all pairs pass (events-row
+status 0, a candidate version); the first failing event is events-row
+status 2 with old/new both the pre-call version, after which simulation
+stops and the whole batch rejects with batch status 2, applied false and
+the pre-call config, PACK untouched in both modes with no partial result
+or leftover temp file; with all events gated candidates, version/history
+append, duplicate-resend recognition, the preview/commit difference, and
+the single atomic replace follow op 16; the result key order is
+op,mode,status,old,new,applied,events,config with each events row
+[e,status,old,new,impact]; the bound is O(BR(V^2+A)) time and
+O(BRV+V+A) extra space for B events, R queries, V nodes, and A links;
 for
 compoundcp code 3 also covers a STATE read/write error and code 5
 also covers a STATE whose key order, content, or h digest is invalid,
@@ -13657,6 +13692,159 @@ def _config_route_gate_batch(pack_path, pack, v, history, mode, base,
             "config": new_pack}
 
 
+def _config_ecmp_gate_batch(pack_path, pack, v, history, mode, base,
+                            events, queries, cost_limit, remove_limit):
+    # Batched hotload with a per-event ECMP stability gate (config op
+    # 18): [18, m, b, E, Q, L, D]. m is 0 (read-only preview) or 1
+    # (atomic commit); b the caller-observed base version; E a non-empty
+    # array of non-decreasing-clock [e, t, p] events exactly like op
+    # 16's; Q a non-empty list of distinct [s, d] pairs whose endpoints
+    # must both be nodes of the h[b] topology; L and D non-boolean
+    # integers in 0..MAX_COST, respectively the largest allowed
+    # lowest-cost increase and the largest allowed number of old
+    # equal-cost next hops that may disappear per query.
+    #
+    # Every input validates first (shapes in the command entry; the h[b]
+    # endpoint check, clocks, and event t/p here), then simulation walks
+    # from h[b] in E order. An event whose t/p equals the previous state
+    # is idempotent (row status 1, no version, an empty impact). Every
+    # other event is a candidate: for each Q pair in input order the
+    # dispatch candidate set is computed before and after, an ordered
+    # list of [nextHop, path] pairs holding only the first hop of each
+    # lowest-cost path, sorted by next hop in Unicode code point order,
+    # with path the lexicographically smallest representative path for
+    # that next hop (the dispatch subcommand's exact grouping). An
+    # unreachable pair has null cost and an empty candidate set; s == d
+    # has cost 0 and an empty candidate set. Each pair yields, in Q
+    # order, an impact row
+    # [s, d, oldCost, newCost, oldCandidates, newCandidates,
+    #  removed, added, pass]
+    # with removed/added the ordered next-hop arrays lost/gained. A pair
+    # passes when its old route was unreachable, or the new route is
+    # reachable, the cost increase is at most L, and at most D old next
+    # hops were removed; an event passes only when every pair passes
+    # (row status 0, a candidate version). At the first failing
+    # non-idempotent event simulation stops at once and the whole batch
+    # rejects: batch status 2, old/new both the pre-call v, applied
+    # false, config the pre-call pack, and PACK untouched in either mode.
+    #
+    # Once every event is a gated candidate, version/history append,
+    # duplicate-resend recognition, the preview/commit difference, and
+    # the single atomic replace follow op 16 exactly. O(BR(V^2+A)) time
+    # and O(BRV + V + A) extra space: B events, R queries, V nodes, and
+    # A links (each representative path is at most V nodes).
+    if base > v:
+        fail(5)
+    base_node_set = set(history[base][1]["nodes"])
+    for s, d in queries:
+        if s not in base_node_set or d not in base_node_set:
+            fail(5)
+    last_e = None
+    for item in events:
+        e = item[0]
+        if last_e is not None and e < last_e:
+            fail(5)
+        last_e = e
+        _validate_topology(item[1], metrics=True)
+        if not _is_policy(item[2]):
+            fail(5)
+
+    # Dispatch candidates on the running topology for each Q pair, one
+    # reversed-graph Dijkstra per distinct (source, destination), handed
+    # from each passing event's after-side to the next event's
+    # before-side. The h[b] routes seed the first event.
+    def side_routes(topo):
+        node_set = set(topo["nodes"])
+        routes = {}
+        for s, d in queries:
+            if s not in node_set or d not in node_set:
+                total, hops, rep_paths = None, [], []
+            else:
+                total, hops, rep_paths = dispatch_candidates(
+                    topo["nodes"], topo["links"], s, d)
+            candidates = [[hop, path]
+                          for hop, path in zip(hops, rep_paths)]
+            routes[(s, d)] = (total, candidates, hops)
+        return routes
+
+    cur_version = base
+    cur_t = history[base][1]
+    cur_p = history[base][2]
+    cur_routes = side_routes(cur_t)
+
+    rows = []
+    suffix = []
+    for event in events:
+        e, new_t, new_p = event
+        if new_t == cur_t and new_p == cur_p:
+            rows.append([e, 1, cur_version, cur_version, []])
+            continue
+        if cur_version >= MAX_COST:
+            fail(5)
+        new_routes = side_routes(new_t)
+        impact = []
+        passed = True
+        for s, d in queries:
+            old_cost, old_cands, old_hops = cur_routes[(s, d)]
+            n_cost, new_cands, new_hops = new_routes[(s, d)]
+            new_hop_set = set(new_hops)
+            old_hop_set = set(old_hops)
+            removed = [h for h in old_hops if h not in new_hop_set]
+            added = [h for h in new_hops if h not in old_hop_set]
+            if old_cost is None:
+                pair_pass = True
+            else:
+                pair_pass = (n_cost is not None
+                             and n_cost - old_cost <= cost_limit
+                             and len(removed) <= remove_limit)
+            if not pair_pass:
+                passed = False
+            impact.append([s, d, old_cost, n_cost, old_cands, new_cands,
+                           removed, added, pair_pass])
+        next_version = cur_version + 1
+        if not passed:
+            rows.append([e, 2, cur_version, cur_version, impact])
+            return {"op": 18, "mode": mode, "status": 2, "old": v,
+                    "new": v, "applied": False, "events": rows,
+                    "config": pack}
+        rows.append([e, 0, cur_version, next_version, impact])
+        suffix.append([next_version, new_t, new_p])
+        cur_version = next_version
+        cur_t, cur_p = new_t, new_p
+        cur_routes = new_routes
+    change_count = len(suffix)
+
+    if base != v:
+        # The only tolerated stale base is an exact resend: PACK must
+        # already end exactly at the simulated suffix with every entry
+        # equal; anything else is a version/suffix conflict.
+        if change_count == 0 or v != base + change_count:
+            fail(5)
+        for offset, entry in enumerate(suffix, start=1):
+            if history[base + offset] != entry:
+                fail(5)
+        return {"op": 18, "mode": mode, "status": 1, "old": base,
+                "new": v, "applied": False, "events": rows,
+                "config": pack}
+
+    if change_count == 0:
+        # All events idempotent at the current version: nothing to
+        # append, so a commit writes nothing either.
+        return {"op": 18, "mode": mode, "status": 0, "old": base,
+                "new": base, "applied": False, "events": rows,
+                "config": pack}
+    new_pack = {"v": v + change_count, "t": cur_t, "p": cur_p,
+                "h": history + suffix}
+    if mode == 1:
+        _write_state_atomic(pack_path, new_pack)
+        applied = True
+    else:
+        applied = False
+    return {"op": 18, "mode": mode, "status": 0, "old": base,
+            "new": v + change_count, "applied": applied, "events": rows,
+            "config": new_pack}
+
+
 def _config_rollback_log(pack_path, pack, v, history, mode, base, log,
                          out_path):
     # Rollback log export/replay (config op 10): [10, m, B, L, O]. L is
@@ -19612,6 +19800,54 @@ def main():
             limit = op[5]
             if type(limit) is not int or not 0 <= limit <= MAX_COST:
                 fail(5)
+        elif kind == 18:
+            # [18, m, b, E, Q, L, D]: batched hotload with a per-event
+            # ECMP stability gate. m is 0 (read-only preview) or 1
+            # (atomic commit); b a bounded non-boolean integer base
+            # version; E a non-empty list of [e, t, p] events shaped
+            # exactly like op 16's (e a bounded non-boolean integer,
+            # t/p validated after PACK validation); Q a non-empty list
+            # of distinct [s, d] string endpoint pairs; L and D bounded
+            # non-boolean integers (the allowed lowest-cost increase and
+            # the allowed number of removed old equal-cost next hops).
+            # The non-decreasing e check, the Q endpoints against h[b]'s
+            # topology, the b-vs-v conflict / duplicate-suffix check,
+            # and the MAX_COST overflow check run in
+            # _config_ecmp_gate_batch.
+            if len(op) != 7 or type(op[1]) is not int \
+                    or op[1] not in (0, 1) \
+                    or type(op[2]) is not int \
+                    or not 0 <= op[2] <= MAX_COST:
+                fail(5)
+            mode, base = op[1], op[2]
+            events = op[3]
+            if not isinstance(events, list) or not events:
+                fail(5)
+            for item in events:
+                if not isinstance(item, list) or len(item) != 3:
+                    fail(5)
+                if type(item[0]) is not int \
+                        or not 0 <= item[0] <= MAX_COST:
+                    fail(5)
+            queries = op[4]
+            if not isinstance(queries, list) or not queries:
+                fail(5)
+            seen_queries = set()
+            for pair in queries:
+                if not isinstance(pair, list) or len(pair) != 2:
+                    fail(5)
+                s, d = pair
+                if type(s) is not str or type(d) is not str \
+                        or (s, d) in seen_queries:
+                    fail(5)
+                seen_queries.add((s, d))
+            cost_limit = op[5]
+            remove_limit = op[6]
+            if type(cost_limit) is not int \
+                    or not 0 <= cost_limit <= MAX_COST \
+                    or type(remove_limit) is not int \
+                    or not 0 <= remove_limit <= MAX_COST:
+                fail(5)
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -19706,6 +19942,10 @@ def main():
             result = _config_route_gate_batch(pack_path, pack, v, history,
                                               mode, base, events, queries,
                                               limit)
+        elif kind == 18:
+            result = _config_ecmp_gate_batch(pack_path, pack, v, history,
+                                             mode, base, events, queries,
+                                             cost_limit, remove_limit)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
