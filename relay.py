@@ -308,6 +308,41 @@ the per-source bound on directed simple-path prefixes visited by wm's
 DFS enumeration, and S the total input/output size, the bound is
 O(BK(PV + V^2 + A) + S) time and O(S + BRV + V^2 + A + P) extra space
 (each impact route path is at most V nodes);
+config op 20 code 5 also covers a mode outside 0/1, an out-of-range
+b/e/L/K, a non-array or empty E, an [e,t,p] event whose e is not a
+non-boolean integer or whose clocks decrease, an invalid event t/p, a
+non-array/empty Q or [s,d] pair with non-string, s == d, or duplicate
+pairs, a Q endpoint absent from h[b]'s topology, a b that conflicts with
+the current v except an exact already-applied resend, a history suffix
+that conflicts with the simulated suffix, and a new version that would
+overflow MAX_COST; op 20 is op 16's batched hotload plus a per-event
+primary/backup path gate [20,m,b,E,Q,L,K] with L in 0..MAX_COST the
+allowed primary-cost increase and K in 0..MAX_COST the allowed
+backup-cost increase per query: inputs validate before any simulation,
+which starts at h[b] and walks the clock-sorted events in E order; an
+event equal to the previous state is idempotent (events-row status 1, no
+version, an empty impact) and every other event compares, for each Q
+pair in input order, before and after, the primary and backup paths
+exactly like the protect subcommand - the primary the lowest-cost path
+over up links with the full-node-sequence Unicode tie break, the backup
+the lowest-cost path after removing every directed edge the primary
+traverses - emitting, in Q order, impact rows
+[s,d,oldPrimary,oldBackup,newPrimary,newBackup,pass] where an
+unreachable side is [null,[]] and a reachable side is [cost,path]; a
+pair passes only when both the new primary and the new backup exist and,
+on each side, either the old side had no path or the new cost minus the
+old cost is at most L (primary) / K (backup), and an event passes only
+when all pairs pass (events-row status 0, a candidate version); the
+first failing event is events-row status 2 with old/new both the
+pre-call version, after which simulation stops and the whole batch
+rejects with batch status 2, applied false and the pre-call config, PACK
+untouched in both modes with no partial result or leftover temp file;
+with all events gated candidates, version/history append,
+duplicate-resend recognition, the preview/commit difference, and the
+single atomic replace follow op 16; the result key order is
+op,mode,status,old,new,applied,events,config with each events row
+[e,status,old,new,impact]; the bound is O(BR(V^2+A)) time and
+O(BRV+V+A) extra space for B events, R queries, V nodes, and A links;
 for
 compoundcp code 3 also covers a STATE read/write error and code 5
 also covers a STATE whose key order, content, or h digest is invalid,
@@ -14063,6 +14098,181 @@ def _config_quality_gate_batch(pack_path, pack, v, history, mode, base,
             "config": new_pack}
 
 
+def _config_protect_gate_batch(pack_path, pack, v, history, mode, base,
+                                events, queries, primary_limit,
+                                backup_limit):
+    # Batched hotload with a per-event primary/backup path gate (config
+    # op 20): [20, m, b, E, Q, L, K]. m is 0 (read-only preview) or 1
+    # (atomic commit); b the caller-observed base version; E a non-empty
+    # array of non-decreasing-clock [e, t, p] events exactly like op
+    # 16's; Q a non-empty list of distinct [s, d] pairs, s != d, whose
+    # endpoints must both be nodes of the h[b] topology; L and K
+    # non-boolean integers in 0..MAX_COST, respectively the largest
+    # allowed primary-cost increase and the largest allowed
+    # backup-cost increase per query.
+    #
+    # Every input validates first (shapes in the command entry; the h[b]
+    # endpoint check, clocks, and event t/p here), then simulation walks
+    # from h[b] in E order. An event whose t/p equals the previous state
+    # is idempotent (row status 1, no version, an empty impact). Every
+    # other event is a candidate: for each Q pair in input order the
+    # primary and backup paths are computed before and after exactly like
+    # the protect subcommand - the primary is the lowest-cost path over
+    # up links with shortest_paths' full-node-sequence Unicode tie
+    # break, and the backup the lowest-cost path after removing every
+    # directed edge the primary traverses; an unreachable side is
+    # [None, []] and a reachable one [cost, path]. Each pair yields, in
+    # Q order, an impact row
+    # [s, d, oldPrimary, oldBackup, newPrimary, newBackup, pass]. A pair
+    # passes only when both the new primary and the new backup exist and,
+    # on each side, either the old side had no path or the new cost minus
+    # the old cost is at most L (primary) / K (backup); an event passes
+    # only when every pair passes (row status 0, a candidate version). At
+    # the first failing non-idempotent event simulation stops at once and
+    # the whole batch rejects: batch status 2, old/new both the pre-call
+    # v, applied false, config the pre-call pack, and PACK untouched in
+    # either mode.
+    #
+    # Once every event is a gated candidate, version/history append,
+    # duplicate-resend recognition, the preview/commit difference, and
+    # the single atomic replace follow op 16 exactly. O(BR(V^2+A)) time
+    # and O(BRV + V + A) extra space: B events, R queries, V nodes, and
+    # A links (each primary or backup path is at most V nodes).
+    if base > v:
+        fail(5)
+    base_node_set = set(history[base][1]["nodes"])
+    for s, d in queries:
+        if s not in base_node_set or d not in base_node_set:
+            fail(5)
+    last_e = None
+    for item in events:
+        e = item[0]
+        if last_e is not None and e < last_e:
+            fail(5)
+        last_e = e
+        _validate_topology(item[1], metrics=True)
+        if not _is_policy(item[2]):
+            fail(5)
+
+    # Primary/backup pairs on the running topology for each Q pair: two
+    # shortest_paths runs per pair (the backup graph drops the primary's
+    # directed edges), handed from each passing event's after-side to
+    # the next event's before-side. The h[b] routes seed the first
+    # event.
+
+    def side_routes(topo):
+        nodes, links = topo["nodes"], topo["links"]
+        node_set = set(nodes)
+        routes = {}
+        for s, d in queries:
+            if s not in node_set or d not in node_set:
+                primary = None
+                backup = None
+            else:
+                cost_of, path_of = shortest_paths(nodes, links, s)
+                primary_path = path_of[d]
+                if primary_path is None:
+                    primary = None
+                    backup = None
+                else:
+                    primary = [cost_of[d], primary_path]
+                    removed = set(zip(primary_path,
+                                      primary_path[1:]))
+                    backup_links = [link for link in links
+                                    if (link["from"], link["to"])
+                                    not in removed]
+                    bcost_of, bpath_of = shortest_paths(
+                        nodes, backup_links, s)
+                    backup_path = bpath_of[d]
+                    if backup_path is None:
+                        backup = None
+                    else:
+                        backup = [bcost_of[d], backup_path]
+            routes[(s, d)] = (primary, backup)
+        return routes
+
+    def as_route(route):
+        return [None, []] if route is None else route
+
+    cur_version = base
+    cur_t = history[base][1]
+    cur_p = history[base][2]
+    cur_routes = side_routes(cur_t)
+
+    rows = []
+    suffix = []
+    for event in events:
+        e, new_t, new_p = event
+        if new_t == cur_t and new_p == cur_p:
+            rows.append([e, 1, cur_version, cur_version, []])
+            continue
+        if cur_version >= MAX_COST:
+            fail(5)
+        new_routes = side_routes(new_t)
+        impact = []
+        passed = True
+        for s, d in queries:
+            old_primary, old_backup = cur_routes[(s, d)]
+            new_primary, new_backup = new_routes[(s, d)]
+            if new_primary is None or new_backup is None:
+                pair_pass = False
+            else:
+                primary_ok = (old_primary is None
+                              or new_primary[0] - old_primary[0]
+                              <= primary_limit)
+                backup_ok = (old_backup is None
+                             or new_backup[0] - old_backup[0]
+                             <= backup_limit)
+                pair_pass = primary_ok and backup_ok
+            if not pair_pass:
+                passed = False
+            impact.append([s, d, as_route(old_primary),
+                           as_route(old_backup), as_route(new_primary),
+                           as_route(new_backup), pair_pass])
+        next_version = cur_version + 1
+        if not passed:
+            rows.append([e, 2, cur_version, cur_version, impact])
+            return {"op": 20, "mode": mode, "status": 2, "old": v,
+                    "new": v, "applied": False, "events": rows,
+                    "config": pack}
+        rows.append([e, 0, cur_version, next_version, impact])
+        suffix.append([next_version, new_t, new_p])
+        cur_version = next_version
+        cur_t, cur_p = new_t, new_p
+        cur_routes = new_routes
+    change_count = len(suffix)
+
+    if base != v:
+        # The only tolerated stale base is an exact resend: PACK must
+        # already end exactly at the simulated suffix with every entry
+        # equal; anything else is a version/suffix conflict.
+        if change_count == 0 or v != base + change_count:
+            fail(5)
+        for offset, entry in enumerate(suffix, start=1):
+            if history[base + offset] != entry:
+                fail(5)
+        return {"op": 20, "mode": mode, "status": 1, "old": base,
+                "new": v, "applied": False, "events": rows,
+                "config": pack}
+
+    if change_count == 0:
+        # All events idempotent at the current version: nothing to
+        # append, so a commit writes nothing either.
+        return {"op": 20, "mode": mode, "status": 0, "old": base,
+                "new": base, "applied": False, "events": rows,
+                "config": pack}
+    new_pack = {"v": v + change_count, "t": cur_t, "p": cur_p,
+                "h": history + suffix}
+    if mode == 1:
+        _write_state_atomic(pack_path, new_pack)
+        applied = True
+    else:
+        applied = False
+    return {"op": 20, "mode": mode, "status": 0, "old": base,
+            "new": v + change_count, "applied": applied, "events": rows,
+            "config": new_pack}
+
+
 def _config_rollback_log(pack_path, pack, v, history, mode, base, log,
                          out_path):
     # Rollback log export/replay (config op 10): [10, m, B, L, O]. L is
@@ -20117,6 +20327,53 @@ def main():
             limit = op[6]
             if type(limit) is not int or not 0 <= limit <= MAX_COST:
                 fail(5)
+        elif kind == 20:
+            # [20, m, b, E, Q, L, K]: batched hotload with a per-event
+            # primary/backup path gate. m is 0 (read-only preview) or 1
+            # (atomic commit); b a bounded non-boolean integer base
+            # version; E a non-empty list of [e, t, p] events shaped
+            # exactly like op 16's (e a bounded non-boolean integer,
+            # t/p validated after PACK validation); Q a non-empty list
+            # of distinct [s, d] string endpoint pairs with s != d; L
+            # and K bounded non-boolean integers, the allowed primary-
+            # and backup-cost increases. The non-decreasing e check,
+            # the Q endpoints against h[b]'s topology, the b-vs-v
+            # conflict / duplicate-suffix check, and the MAX_COST
+            # overflow check run in _config_protect_gate_batch.
+            if len(op) != 7 or type(op[1]) is not int \
+                    or op[1] not in (0, 1) \
+                    or type(op[2]) is not int \
+                    or not 0 <= op[2] <= MAX_COST:
+                fail(5)
+            mode, base = op[1], op[2]
+            events = op[3]
+            if not isinstance(events, list) or not events:
+                fail(5)
+            for item in events:
+                if not isinstance(item, list) or len(item) != 3:
+                    fail(5)
+                if type(item[0]) is not int \
+                        or not 0 <= item[0] <= MAX_COST:
+                    fail(5)
+            queries = op[4]
+            if not isinstance(queries, list) or not queries:
+                fail(5)
+            seen_queries = set()
+            for pair in queries:
+                if not isinstance(pair, list) or len(pair) != 2:
+                    fail(5)
+                s, d = pair
+                if type(s) is not str or type(d) is not str \
+                        or s == d or (s, d) in seen_queries:
+                    fail(5)
+                seen_queries.add((s, d))
+            primary_limit = op[5]
+            backup_limit = op[6]
+            if type(primary_limit) is not int \
+                    or not 0 <= primary_limit <= MAX_COST \
+                    or type(backup_limit) is not int \
+                    or not 0 <= backup_limit <= MAX_COST:
+                fail(5)
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -20220,6 +20477,12 @@ def main():
                                                 history, mode, base,
                                                 events, queries,
                                                 weights, limit)
+        elif kind == 20:
+            result = _config_protect_gate_batch(pack_path, pack, v,
+                                                history, mode, base,
+                                                events, queries,
+                                                primary_limit,
+                                                backup_limit)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
