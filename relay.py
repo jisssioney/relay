@@ -828,6 +828,40 @@ covers a wrong arity and a W or Q outside 0..MAX_COST while every op
 30 code-5 case still applies; the bound is
 O(B(S+1)(K(V^2+A)+FV+A)) time and
 O(KV+FV+A+B(S+1)F) extra space;
+op 32 is op 31's batched compound-failure gates plus a per-scenario
+cumulative windowed moved-demand gate
+[32,m,b,E,F,S,L,C,R,D,W,Q,H] with the first twelve entries carrying op
+31's exact validation and semantics and H a non-boolean integer in
+0..1000000; the no-failure scenario and each S scenario keep separate
+and never merged op 31 per-flow cumulative counts, last-reroute clocks,
+and burst-count windows, alongside a parallel flat per-flow
+(clock, demand) record sequence whose retained demands are summed; a
+non-idempotent event still routes every flow independently per scenario
+in no-failure then S order, and a flow records one migration at the
+event clock only on op 31's migration predicate, with repeated
+migrations of the same flow counted repeatedly; for the candidate the
+closed window [e-W, e] first drops records with clocks below e-W and
+their demand, then adds the candidate, the scenario's windowMovedDemand
+being the retained demand sum across its flows and windowMovedRatio its
+exact windowMovedDemand/totalDemand rendered with six decimals; the
+scenario passes the window demand gate only when windowMovedDemand *
+1000000 <= H * totalDemand by integer cross multiplication (H=0 rejects
+every reroute); the event must satisfy every op 31 gate including the Q
+burst-count window and the new H window-demand gate; the impact keeps
+op 31's exact fixed order with each scenario row gaining
+windowMovedDemand, windowMovedRatio after maxWindowMoves and then pass,
+flows, links, the flow structure unchanged; the candidate counts,
+clocks, records, retained-demand sums, and rendered fields are retained
+on the first failing event, which is events-row and batch status 2
+after which simulation stops, old/new the pre-call version, applied
+false, the pre-call config returned, and PACK untouched in both modes
+with no leftover temp file; preview writes nothing, a commit atomically
+replaces PACK once only after the whole batch passes, and exact resend,
+all-equal events, and failed rollback are idempotent exactly like op
+31; config op 32 code 5 additionally covers a wrong arity and an H
+outside 0..1000000 while every op 31 code-5 case still applies; the
+bound is O(B(S+1)(K(V^2+A)+FV+A)) time and
+O(KV+FV+A+B(S+1)F) extra space;
 for
 compoundcp code 3 also covers a STATE read/write error and code 5
 also covers a STATE whose key order, content, or h digest is invalid,
@@ -17626,6 +17660,227 @@ def _config_winmig_assess(old_topo, new_topo, flows, flow_count, prepared,
             cur_windows, rows)
 
 
+def _config_demandwin_assess(old_topo, new_topo, flows, flow_count,
+                             prepared, total_demand, moved_ppm, move_cap,
+                             cur_moves, event_clock, min_gap, cur_clocks,
+                             window_width, window_cap, cur_windows,
+                             cur_window_demands, window_demand_ppm):
+    # Walk op 32's compound-failure scenarios exactly like op 31's
+    # _config_winmig_assess (no-failure then S order, both sides routed,
+    # a flow a reroute only when reachable on both sides with differing
+    # complete paths, the same C/L/latency/overload/reachability gates,
+    # the same cumulative R counts and last-reroute clocks, the same D
+    # minimum interval, the same Q per-flow burst-count window and
+    # windowPass flow field, the same worst tracking, and op 31's exact
+    # rendered flow rows), additionally carrying the per-flow retained
+    # moved-demand sums behind the batch's per-(scenario, flow)
+    # reroute records and enforcing op 32's per-scenario cumulative
+    # windowed demand gate H. cur_windows is the flat (S+1)*F array of
+    # non-decreasing prior (clock, demand) record deques before this
+    # event and cur_window_demands the flat array of their retained
+    # demand sums, in the same flat layout as cur_moves; scenario index
+    # 0 is the no-failure scenario then prepared order. For each flow
+    # the window first drops prior records with clocks strictly below
+    # event_clock - W (popleft, subtracting each record's demand from
+    # the slot sum, O(1) amortized because the threshold is
+    # non-decreasing with the non-decreasing event clocks), then a
+    # reroute appends (event_clock, this flow's demand) and adds it;
+    # repeated reroutes of the same flow each append and count again.
+    # The retained deque length is op 31's count and must stay at most
+    # window_cap exactly as there; the scenario's windowMovedDemand is
+    # the sum of the retained demands across its flows after the trim
+    # and the candidate adds; windowMovedRatio is
+    # windowMovedDemand/totalDemand rendered with six decimals, and the
+    # window demand gate passes exactly when
+    # windowMovedDemand * 1000000 <= H * totalDemand by integer cross
+    # multiplication (no float). W=0 accumulates same-clock records,
+    # Q=0 rejects every reroute through op 31's count gate, and H=0
+    # rejects every reroute through the demand gate; a non-reroute only
+    # slides the window and adds no record, and equal-state events never
+    # reach here. The deques and sums are mutated in place: the caller
+    # either keeps them on a pass or abandons the whole batch on the
+    # first failure, exactly like op 31's candidate count/clock/window
+    # arrays. Each rendered scenario row is op 31's row with
+    # windowMovedDemand and windowMovedRatio inserted after
+    # maxWindowMoves:
+    # [scenarioId, peak, movedDemand, totalDemand, movedRatio, maxMoves,
+    # maxWindowMoves, windowMovedDemand, windowMovedRatio, pass, flows,
+    # links]; the rendered flow rows stay op 31's exact
+    # [id, oldCost, newCost, oldLatency, newLatency, oldPath, newPath,
+    # moved, pass, moves, previousMoveClock, gap, intervalPass,
+    # windowStart, windowMoves, windowPass] where windowStart is fixed at
+    # event_clock - W, windowMoves the retained record count, and
+    # windowPass false only when that count exceeds window_cap. pass
+    # folds the scenario's Q and window-demand results into op 31's
+    # predicate; a Q breach surfaces through window_ok and an H breach
+    # through window_demand_ok. Extra space is the one live scenario
+    # pair plus the candidate count/clock arrays and the retained record
+    # deques and demand sums: O(KV + FV + A + B(S+1)F).
+    scenario_count = len(prepared) + 1
+    new_moves = [0] * (scenario_count * flow_count)
+    new_clocks = [None] * (scenario_count * flow_count)
+    window_start = event_clock - window_width
+    old_worst_sid = None
+    old_worst_num, old_worst_den = 0, 1
+    new_worst_sid = None
+    new_worst_num, new_worst_den = 0, 1
+    all_reachable = True
+    no_over = True
+    latency_ok = True
+    migration_ok = True
+    moves_ok = True
+    interval_ok = True
+    window_ok = True
+    window_demand_ok = True
+    rows = []
+    s_index = -1
+    for pair in _config_clatmig_iter(old_topo, new_topo, flows,
+                                     flow_count, prepared):
+        s_index += 1
+        sid, old_rec, new_rec = pair
+        (old_paths, old_costs, old_latencies, _, old_peak,
+         old_reachable, old_over) = old_rec
+        (new_paths, new_costs, new_latencies, new_used, new_peak,
+         new_reachable, new_over) = new_rec
+        old_num, old_den = old_peak
+        new_num, new_den = new_peak
+        if old_num * old_worst_den > old_worst_num * old_den:
+            old_worst_sid, old_worst_num, old_worst_den = \
+                sid, old_num, old_den
+        if new_num * new_worst_den > new_worst_num * new_den:
+            new_worst_sid, new_worst_num, new_worst_den = \
+                sid, new_num, new_den
+        moved = [False] * flow_count
+        moved_demand = 0
+        scenario_latency_ok = True
+        base_slot = s_index * flow_count
+        scenario_max_moves = 0
+        scenario_max_window_moves = 0
+        # Per-flow interval detail for this scenario, rendered into the
+        # flow rows once used demand and counts are settled: each entry
+        # (previousMoveClock, gap, intervalPass).
+        flow_gaps = [None] * flow_count
+        flow_interval_pass = [True] * flow_count
+        # Per-flow post-trim window lengths and window pass flags, and
+        # the scenario's total retained windowed moved demand across
+        # its flows.
+        flow_window_moves = [0] * flow_count
+        flow_window_pass = [True] * flow_count
+        scenario_window_demand = 0
+        for i, item in enumerate(flows):
+            op_ = old_paths[i]
+            np_ = new_paths[i]
+            if np_ is not None and new_latencies[i] > item[4]:
+                scenario_latency_ok = False
+            did_move = op_ is not None and np_ is not None and op_ != np_
+            slot = base_slot + i
+            prev_clock = cur_clocks[slot]
+            window = cur_windows[slot]
+            while window and window[0][0] < window_start:
+                _, dropped_demand = window.popleft()
+                cur_window_demands[slot] -= dropped_demand
+            if did_move:
+                moved[i] = True
+                moved_demand += item[3]
+                if prev_clock is not None:
+                    gap = event_clock - prev_clock
+                    flow_gaps[i] = gap
+                    if gap < min_gap:
+                        flow_interval_pass[i] = False
+                window.append((event_clock, item[3]))
+                cur_window_demands[slot] += item[3]
+            window_moves = len(window)
+            flow_window_moves[i] = window_moves
+            scenario_window_demand += cur_window_demands[slot]
+            if window_moves > window_cap:
+                flow_window_pass[i] = False
+                window_ok = False
+            updated = cur_moves[slot] + (1 if did_move else 0)
+            new_moves[slot] = updated
+            new_clocks[slot] = event_clock if did_move else prev_clock
+            if updated > move_cap:
+                moves_ok = False
+            if not flow_interval_pass[i]:
+                interval_ok = False
+            if updated > scenario_max_moves:
+                scenario_max_moves = updated
+            if window_moves > scenario_max_window_moves:
+                scenario_max_window_moves = window_moves
+        # movedDemand/totalDemand <= moved_ppm/1000000 by cross multiply.
+        scenario_moved_ok = (moved_demand * 1000000
+                             <= moved_ppm * total_demand)
+        # windowMovedDemand/totalDemand <= H/1000000 by cross multiply.
+        scenario_window_demand_ok = (scenario_window_demand * 1000000
+                                     <= window_demand_ppm * total_demand)
+        if not new_reachable:
+            all_reachable = False
+        if new_over:
+            no_over = False
+        if not scenario_latency_ok:
+            latency_ok = False
+        if not scenario_moved_ok:
+            migration_ok = False
+        if not scenario_window_demand_ok:
+            window_demand_ok = False
+        scenario_interval_ok = True
+        scenario_window_count_ok = True
+        flow_rows = []
+        for i, item in enumerate(flows):
+            op_ = old_paths[i]
+            np_ = new_paths[i]
+            slot = base_slot + i
+            prev_clock = cur_clocks[slot]
+            row_interval = flow_interval_pass[i]
+            if not row_interval:
+                scenario_interval_ok = False
+            if not flow_window_pass[i]:
+                scenario_window_count_ok = False
+            flow_rows.append(
+                [item[0],
+                 None if op_ is None else old_costs[i],
+                 None if np_ is None else new_costs[i],
+                 None if op_ is None else old_latencies[i],
+                 None if np_ is None else new_latencies[i],
+                 [] if op_ is None else op_,
+                 [] if np_ is None else np_,
+                 bool(moved[i]),
+                 np_ is not None and new_latencies[i] <= item[4],
+                 new_moves[slot],
+                 prev_clock,
+                 flow_gaps[i],
+                 row_interval,
+                 window_start,
+                 flow_window_moves[i],
+                 flow_window_pass[i]])
+        link_rows = []
+        for index, link in enumerate(new_topo["links"]):
+            u = new_used[index]
+            link_rows.append([link["from"], link["to"],
+                              link["bandwidth"], u,
+                              _config_capacity_six(u,
+                                                   link["bandwidth"])])
+        scenario_pass = (new_reachable and not new_over
+                         and scenario_latency_ok
+                         and scenario_moved_ok
+                         and scenario_interval_ok
+                         and scenario_window_count_ok
+                         and scenario_window_demand_ok)
+        rows.append([sid, _config_capacity_six(new_num, new_den),
+                     moved_demand, total_demand,
+                     _config_capacity_six(moved_demand, total_demand),
+                     scenario_max_moves, scenario_max_window_moves,
+                     scenario_window_demand,
+                     _config_capacity_six(scenario_window_demand,
+                                          total_demand),
+                     scenario_pass,
+                     flow_rows, link_rows])
+    return (old_worst_sid, old_worst_num, old_worst_den,
+            new_worst_sid, new_worst_num, new_worst_den,
+            all_reachable, no_over, latency_ok, migration_ok, moves_ok,
+            interval_ok, window_ok, window_demand_ok, new_moves,
+            new_clocks, cur_windows, cur_window_demands, rows)
+
+
 def _config_winmig_gate_batch(pack_path, pack, v, history, mode, base,
                               events, flows, limit_ppm, scenario_specs,
                               moved_ppm, move_cap, min_gap,
@@ -17798,6 +18053,193 @@ def _config_winmig_gate_batch(pack_path, pack, v, history, mode, base,
     else:
         applied = False
     return {"op": 31, "mode": mode, "status": 0, "old": base,
+            "new": v + change_count, "applied": applied, "events": rows,
+            "config": new_pack}
+
+
+def _config_demandwin_gate_batch(pack_path, pack, v, history, mode, base,
+                                 events, flows, limit_ppm, scenario_specs,
+                                 moved_ppm, move_cap, min_gap,
+                                 window_width, window_cap,
+                                 window_demand_ppm):
+    # Batched hotload with op 31's full compound-failure, cumulative,
+    # and minimum-interval reroute gates plus a per-scenario cumulative
+    # windowed moved-demand gate (config op 32):
+    # [32, m, b, E, F, S, L, C, R, D, W, Q, H]. m, b, E, F, S, L, C, R,
+    # D, W, and Q carry op 31's exact validation and semantics (F the
+    # [id, source, destination, demand, maxLatency] shape, L the
+    # worst-utilization-increase cap, C the per-scenario migrated-demand
+    # cap, R the per-flow per-scenario cumulative reroute cap, D the
+    # minimum clock gap, W the inclusive window width behind the event
+    # clock, and Q the per-flow per-scenario cap on reroutes whose
+    # clocks lie in [e-W, e]); H is a non-boolean integer in
+    # 0..1000000, the largest cumulative moved demand whose reroute
+    # clocks lie in one scenario's closed [e-W, e], as a fraction in
+    # parts per million of total flow demand.
+    #
+    # Every input validates first, exactly as op 31 (shapes in the
+    # command entry; the h[b] reference/endpoint/scenario checks,
+    # clocks, and event t/p here), then simulation walks from h[b] in E
+    # order under non-decreasing event clocks. Beside op 31's flat
+    # per-(scenario, flow) cumulative counts and last-reroute clocks,
+    # each scenario - the no-failure scenario and each S scenario,
+    # never merged - keeps its own flat per-flow non-decreasing
+    # (clock, demand) record sequence and the retained demand sum;
+    # repeated reroutes of one flow each add that flow's demand again.
+    # A non-idempotent event routes both sides per scenario and a flow
+    # reroutes at the event clock exactly on op 31's predicate
+    # (reachable on both sides, different complete node paths). For the
+    # candidate window the sequence first drops records with clocks
+    # strictly below e-W and their demand from the sum, then appends
+    # (e, demand) for a reroute; the scenario passes only when the sum
+    # of every flow's retained demand is at most H/1000000 of
+    # totalDemand by integer cross multiplication. W=0 accumulates
+    # records at one clock and H=0 rejects every reroute. A non-reroute
+    # and an equal-state event add no record (the equal-state row is
+    # status 1 with an empty impact and changes nothing). The event
+    # passes only when it satisfies every op 31 gate (reachability,
+    # bandwidth, per-flow maxLatency, C, L, R, and D) and every
+    # scenario's window demand passes. The impact is op 31's
+    # [oldWorst, newWorst, delta, scenarios] with each scenario row
+    # gaining windowMovedDemand, windowMovedRatio after maxWindowMoves
+    # and the flow rows unchanged; the failing event's rendered counts,
+    # clocks, retained records, and window demand sums are the candidate
+    # post-event values. At the first failing event simulation stops at
+    # once and the whole batch rejects: event row and batch status 2,
+    # old/new both the pre-call v, applied false, config the pre-call
+    # pack, and PACK untouched in either mode; the per-batch count,
+    # clock, record, and demand arrays then die with the call.
+    #
+    # Version/history append, duplicate-resend recognition, the
+    # preview/commit difference, and the single atomic replace follow
+    # op 16/27/28/29/30/31 exactly. For B events, S scenarios, K
+    # distinct flow sources, F flows, V nodes, and A links the bound is
+    # O(B(S+1)(K(V^2+A) + FV + A)) time and
+    # O(KV + FV + A + B(S+1)F) extra space besides the returned result.
+    if base > v:
+        fail(5)
+    base_topo = history[base][1]
+    base_node_set = set(base_topo["nodes"])
+    for item in flows:
+        if item[1] not in base_node_set or item[2] not in base_node_set:
+            fail(5)
+    prepared = _config_compound_prepare(base_topo["nodes"],
+                                        base_topo["links"], flows,
+                                        scenario_specs)
+    last_e = None
+    for item in events:
+        e = item[0]
+        if last_e is not None and e < last_e:
+            fail(5)
+        last_e = e
+        _validate_topology(item[1], metrics=True)
+        if not _is_policy(item[2]):
+            fail(5)
+
+    flow_count = len(flows)
+    total_demand = 0
+    for item in flows:
+        total_demand += item[3]
+    cur_version = base
+    cur_t = history[base][1]
+    cur_p = history[base][2]
+    # As in op 31 the batch is only defined from a failure-feasible
+    # h[b]: every flow routable in every scenario within its
+    # maxLatency and every link within its bandwidth there.
+    (_, _, _, cur_reachable, cur_no_over, cur_latency_ok, _) = \
+        _config_clatency_assess(cur_t["nodes"], cur_t["links"], flows,
+                                flow_count, prepared, False)
+    if not cur_reachable or not cur_no_over or not cur_latency_ok:
+        fail(5)
+
+    # Per-(scenario, flow) cumulative migration counts, last-reroute
+    # clocks, (clock, demand) reroute records, and retained record
+    # demand sums, scenario index 0 the no-failure scenario then the
+    # prepared scenarios in S order; each block is F entries in F
+    # order. Counts start at zero, clocks unset (None), record
+    # sequences empty, and sums at zero.
+    slot_count = (len(prepared) + 1) * flow_count
+    cur_moves = [0] * slot_count
+    cur_clocks = [None] * slot_count
+    cur_windows = [deque() for _ in range(slot_count)]
+    cur_window_demands = [0] * slot_count
+    rows = []
+    suffix = []
+    for event in events:
+        e, new_t, new_p = event
+        if new_t == cur_t and new_p == cur_p:
+            rows.append([e, 1, cur_version, cur_version, []])
+            continue
+        if cur_version >= MAX_COST:
+            fail(5)
+        (old_worst_sid, old_worst_num, old_worst_den,
+         new_worst_sid, new_worst_num, new_worst_den,
+         new_reachable, new_no_over, new_latency_ok, migration_ok,
+         moves_ok, interval_ok, window_ok, window_demand_ok, new_moves,
+         new_clocks, new_windows, new_window_demands, scenario_rows) = \
+            _config_demandwin_assess(
+                cur_t, new_t, flows, flow_count, prepared, total_demand,
+                moved_ppm, move_cap, cur_moves, e, min_gap, cur_clocks,
+                window_width, window_cap, cur_windows,
+                cur_window_demands, window_demand_ppm)
+        passed = (new_reachable and new_no_over and new_latency_ok
+                  and migration_ok and moves_ok and interval_ok
+                  and window_ok and window_demand_ok)
+        if passed:
+            # Exact comparison of the worst-peak increase against
+            # L/1000000: newWorst - oldWorst <= L/1000000.
+            delta_num = new_worst_num * old_worst_den \
+                - old_worst_num * new_worst_den
+            increase_ok = (delta_num * 1000000
+                           <= limit_ppm * new_worst_den * old_worst_den)
+            if not increase_ok:
+                passed = False
+        impact = _config_compound_impact(
+            old_worst_sid, old_worst_num, old_worst_den,
+            new_worst_sid, new_worst_num, new_worst_den, scenario_rows)
+        if not passed:
+            rows.append([e, 2, cur_version, cur_version, impact])
+            return {"op": 32, "mode": mode, "status": 2, "old": v,
+                    "new": v, "applied": False, "events": rows,
+                    "config": pack}
+        next_version = cur_version + 1
+        rows.append([e, 0, cur_version, next_version, impact])
+        suffix.append([next_version, new_t, new_p])
+        cur_version = next_version
+        cur_t, cur_p = new_t, new_p
+        cur_moves = new_moves
+        cur_clocks = new_clocks
+        cur_windows = new_windows
+        cur_window_demands = new_window_demands
+    change_count = len(suffix)
+
+    if base != v:
+        # The only tolerated stale base is an exact resend: PACK must
+        # already end exactly at the simulated suffix with every entry
+        # equal; anything else is a version/suffix conflict.
+        if change_count == 0 or v != base + change_count:
+            fail(5)
+        for offset, entry in enumerate(suffix, start=1):
+            if history[base + offset] != entry:
+                fail(5)
+        return {"op": 32, "mode": mode, "status": 1, "old": base,
+                "new": v, "applied": False, "events": rows,
+                "config": pack}
+
+    if change_count == 0:
+        # All events idempotent at the current version: nothing to
+        # append, so a commit writes nothing either.
+        return {"op": 32, "mode": mode, "status": 0, "old": base,
+                "new": base, "applied": False, "events": rows,
+                "config": pack}
+    new_pack = {"v": v + change_count, "t": cur_t, "p": cur_p,
+                "h": history + suffix}
+    if mode == 1:
+        _write_state_atomic(pack_path, new_pack)
+        applied = True
+    else:
+        applied = False
+    return {"op": 32, "mode": mode, "status": 0, "old": base,
             "new": v + change_count, "applied": applied, "events": rows,
             "config": new_pack}
 
@@ -24869,6 +25311,124 @@ def main():
             if type(window_cap) is not int \
                     or not 0 <= window_cap <= MAX_COST:
                 fail(5)
+        elif kind == 32:
+            # [32, m, b, E, F, S, L, C, R, D, W, Q, H]: op 31's
+            # compound-failure, cumulative-reroute, minimum-interval,
+            # and burst-window gates plus a per-scenario cumulative
+            # windowed moved-demand gate. The first twelve entries carry
+            # op 31's exact validation and semantics (F the same
+            # [id, source, destination, demand, maxLatency] shape, L the
+            # worst-utilization-increase cap, C the per-scenario
+            # migrated-demand cap, R the per-flow per-scenario
+            # cumulative reroute cap, counted separately for the
+            # no-failure scenario and each S scenario, D the minimum
+            # clock gap between two reroutes of one flow within one
+            # scenario, W the inclusive window width behind each event
+            # clock, and Q the per-flow per-scenario cap on reroutes
+            # whose clocks lie in [e-W, e]); H is a non-boolean integer
+            # in 0..1000000 bounding one scenario's cumulative demand
+            # of reroutes whose clocks lie in the closed [e-W, e] as a
+            # fraction of total demand. Every op 31 structural and
+            # simulation check also applies; the non-decreasing e
+            # check, clock handling, the h[b] feasibility/endpoint
+            # checks, the per-scenario C cross multiplication, the R
+            # cumulative comparison, the D interval comparison, the
+            # [e-W, e] window drop/count, the cumulative retained-demand
+            # H comparison, the b-vs-v conflict / duplicate-suffix
+            # check, and the MAX_COST overflow check run in
+            # _config_demandwin_gate_batch.
+            if len(op) != 13 or type(op[1]) is not int \
+                    or op[1] not in (0, 1) \
+                    or type(op[2]) is not int \
+                    or not 0 <= op[2] <= MAX_COST:
+                fail(5)
+            mode, base = op[1], op[2]
+            events = op[3]
+            if not isinstance(events, list) or not events:
+                fail(5)
+            for item in events:
+                if not isinstance(item, list) or len(item) != 3:
+                    fail(5)
+                if type(item[0]) is not int \
+                        or not 0 <= item[0] <= MAX_COST:
+                    fail(5)
+            flows = op[4]
+            if not isinstance(flows, list) or not flows:
+                fail(5)
+            seen_ids = set()
+            for flow in flows:
+                if not isinstance(flow, list) or len(flow) != 5:
+                    fail(5)
+                fid, fs, fd, demand, max_latency = flow
+                if type(fid) is not str or fid == "" or fid in seen_ids:
+                    fail(5)
+                seen_ids.add(fid)
+                if type(fs) is not str or type(fd) is not str or fs == fd:
+                    fail(5)
+                if type(demand) is not int \
+                        or not 1 <= demand <= MAX_COST:
+                    fail(5)
+                if type(max_latency) is not int \
+                        or not 0 <= max_latency <= MAX_COST:
+                    fail(5)
+            scenario_specs = op[5]
+            if not isinstance(scenario_specs, list) or not scenario_specs:
+                fail(5)
+            seen_scenario_ids = set()
+            for spec in scenario_specs:
+                if not isinstance(spec, list) or len(spec) != 3:
+                    fail(5)
+                sid, fail_nodes, fail_links = spec
+                if type(sid) is not str or sid == "" \
+                        or sid in seen_scenario_ids:
+                    fail(5)
+                seen_scenario_ids.add(sid)
+                if not isinstance(fail_nodes, list):
+                    fail(5)
+                seen_nodes = set()
+                for node in fail_nodes:
+                    if type(node) is not str or node in seen_nodes:
+                        fail(5)
+                    seen_nodes.add(node)
+                if not isinstance(fail_links, list):
+                    fail(5)
+                seen_pairs = set()
+                for pair in fail_links:
+                    if not isinstance(pair, list) or len(pair) != 2:
+                        fail(5)
+                    a, c = pair
+                    if type(a) is not str or type(c) is not str \
+                            or (a, c) in seen_pairs:
+                        fail(5)
+                    seen_pairs.add((a, c))
+            limit_ppm = op[6]
+            if type(limit_ppm) is not int \
+                    or not 0 <= limit_ppm <= 1000000:
+                fail(5)
+            moved_ppm = op[7]
+            if type(moved_ppm) is not int \
+                    or not 0 <= moved_ppm <= 1000000:
+                fail(5)
+            move_cap = op[8]
+            if type(move_cap) is not int \
+                    or not 0 <= move_cap <= MAX_COST:
+                fail(5)
+            min_gap = op[9]
+            if type(min_gap) is not int \
+                    or not 0 <= min_gap <= MAX_COST:
+                fail(5)
+            window_width = op[10]
+            if type(window_width) is not int \
+                    or not 0 <= window_width <= MAX_COST:
+                fail(5)
+            window_cap = op[11]
+            if type(window_cap) is not int \
+                    or not 0 <= window_cap <= MAX_COST:
+                fail(5)
+            window_demand_ppm = op[12]
+            if type(window_demand_ppm) is not int \
+                    or not 0 <= window_demand_ppm <= 1000000:
+                fail(5)
         else:
             fail(5)
         v, topo, policy, history = _validate_config_pack(raw_pack)
@@ -25034,6 +25594,11 @@ def main():
                                                scenario_specs, moved_ppm,
                                                move_cap, min_gap,
                                                window_width, window_cap)
+        elif kind == 32:
+            result = _config_demandwin_gate_batch(
+                pack_path, pack, v, history, mode, base, events, flows,
+                limit_ppm, scenario_specs, moved_ppm, move_cap, min_gap,
+                window_width, window_cap, window_demand_ppm)
     else:
         fail(2)
     # Write raw UTF-8 bytes to the binary stdout buffer: the text layer
