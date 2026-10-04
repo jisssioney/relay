@@ -31,6 +31,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py qdiscfail FILE CONFIG EVENTS DATA
        python relay.py qdiscimpair FILE CONFIG EVENTS DATA
        python relay.py policyqdiscimpair FILE CONFIG RULES EVENTS DATA
+       python relay.py policyqdiscreorder FILE CONFIG RULES EVENTS WINDOW WAIT DATA
        python relay.py converge FILE SRC DST D R EVENTS
        python relay.py ecmpconverge FILE SOURCE DESTINATION DELAY RUN FLOWS EVENTS
        python relay.py policy FILE S D P C RULES
@@ -75,7 +76,7 @@ for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
 policytx op 4 also OUT),
 4 JSON syntax
 (for forward/loopsafe also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/qdisc/reorder/tbucket/netqueue/netfragment/policyqueue/ecmpqueue/netshape/netfail/policyfail/netimpair/netreorder/netqdisc/qdiscfail/qdiscimpair/policyqdiscimpair/converge/ecmpconverge/policy/reserve/rebalance/retune also those in
+for queue/qdisc/reorder/tbucket/netqueue/netfragment/policyqueue/ecmpqueue/netshape/netfail/policyfail/netimpair/netreorder/netqdisc/qdiscfail/qdiscimpair/policyqdiscimpair/policyqdiscreorder/converge/ecmpconverge/policy/reserve/rebalance/retune also those in
 FILE/DATA/QUEUES/MTUS/SHAPERS/CLASSES/CONFIG/EVENTS/FLOWS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
@@ -2298,6 +2299,50 @@ O(D(KV+(V+E) log V)+H(C+log(P+E))+Q+X) for K rules, V nodes, E links,
 P packets, C classes, X events, D decisions, H actual hops, and Q total
 DRR class visits, with O(KV+V+E+P+H+D+EC) extra space besides the
 output.
+policyqdiscreorder is read-only and takes
+FILE CONFIG RULES EVENTS WINDOW WAIT DATA, reusing
+policyqdiscimpair's FILE/CONFIG/RULES/EVENTS and full forwarding
+semantics exactly; WINDOW and WAIT are non-boolean decimal integers in
+0..MAX_COST. DATA may be empty and each row is
+[id,flow,seq,time,source,destination,size,port,class]: id, time,
+source, destination, size, port, and class keep policyqdiscimpair's
+packet contract (the class must occur in CONFIG.classes), flow is a
+1..256 code point UTF-8 string, and within every
+(source,destination,flow) group the seq values must be 0,1,2,... in
+DATA order. Packets first run policyqdiscimpair's full clock, and only
+packets it delivers to their destination enter that triple's
+reorderer; each flow's expected starts at 0. A delivered packet whose
+seq equals expected releases immediately at its delivery tick together
+with every buffered contiguous successor; a larger seq with
+seq-expected <= WINDOW buffers; a larger seq past WINDOW is
+over_window and never buffers; a smaller seq is late. While a gap
+exists the buffered minimum seq owns a timer set to its network
+finish tick plus WAIT; buffering a still-lower seq re-times it. When
+the timer fires, expected jumps to that minimum seq and the
+contiguous run releases at the firing tick, re-timing any remaining
+gap. At one tick the whole network phase completes first, the tick's
+deliveries are admitted in DATA order, and timers are handled last;
+the timers drain after the final delivery and a timer tick above
+MAX_TIME is code 5. lost, fault, overflow, and unreachable all count
+as network_drop, never buffer, and never advance expected. Result
+top-level key order is packets,events,links,flows. Each packet row
+keeps policyqdiscimpair's twelve fields verbatim and appends
+flow,seq,orderStatus,release,wait: a non-delivered packet carries
+network_drop,null,null; a released packet carries "released", its
+release tick, and the wait over its network finish tick; late and
+over_window carry null times. events and links keep
+policyqdiscimpair's exact semantics. flows is in first-appearance
+order as
+[source,destination,flow,released,late,overWindow,networkDrop,
+peakBuffered,lastRelease], lastRelease null for a flow that never
+released. Wrong argument count exits 2, FILE unreadable 3, strict
+JSON errors (UTF-8, syntax, duplicate keys, non-finite numbers) in any
+of the JSON inputs exit 4, and every other shape, seq, range,
+reference, topology, or clock overflow error exits 5; failure leaves
+stdout empty. Success writes compact UTF-8 JSON plus one LF,
+byte-identical for identical input, and writes no files. Worst case is
+policyqdiscimpair's bound plus O(P log F) time and O(P+F) space for P
+packets and F flows.
 loopsafe takes FILE DESTINATION TABLE and is read-only: FILE uses
 forward's strict topology (duplicate keys and non-finite numbers code
 4), DESTINATION must name a node, and TABLE is a JSON object whose key
@@ -6952,7 +6997,7 @@ def compute_qdiscimpair(nodes, links, class_specs, cap_of, packets,
 
 
 def compute_policyqdiscimpair(nodes, links, class_specs, cap_of,
-                              packets, events, rules):
+                              packets, events, rules, deliver_cb=None):
     # Policy routing on qdiscimpair's per-link DRR impairment clock.
     # The DRR queues, total/class dual-capacity admission (overflows
     # occupy and enqueue nothing and leave every deficit and the cursor
@@ -7086,6 +7131,8 @@ def compute_policyqdiscimpair(nodes, links, class_specs, cap_of,
         results[i][5] = now - packets[i][1]
         results[i][6] = link_obj
         results[i][9] = obj
+        if status == "delivered" and deliver_cb is not None:
+            deliver_cb(i, now)
 
     def choose_suffix(i):
         # First usable policy rule suffix from loc[i] to the original
@@ -7479,6 +7526,293 @@ def compute_policyqdiscimpair(nodes, links, class_specs, cap_of,
                           send_count[li], imp_n[li], imp_j[li]])
     return {"packets": results, "events": event_rows,
             "links": link_rows}
+
+
+def compute_policyqdiscreorder(nodes, links, class_specs, cap_of,
+                               packets, events, rules, window, wait):
+    # policyqdiscimpair forwarding followed by a per-flow reorder buffer,
+    # the reorder-layer twin of compute_netreorder. Every packet first
+    # runs compute_policyqdiscimpair verbatim on its own complete clock;
+    # only packets whose network status is "delivered" (their finish the
+    # delivery tick at the destination) enter a reorderer keyed by
+    # (source, destination, flow). lost, fault, overflow, and
+    # unreachable are all network_drop: they never buffer and never
+    # advance the flow's expected. Reordering never feeds back into the
+    # network, so policyqdiscimpair's events and links rows are
+    # reproduced unchanged.
+    #
+    # Per flow expected starts at 0. A delivered packet with seq ==
+    # expected releases at its delivery tick together with every buffered
+    # contiguous successor; a larger seq whose distance is at most WINDOW
+    # buffers; a larger seq past WINDOW is over_window and never buffers;
+    # a smaller seq is late. While a gap exists the buffered packet with
+    # the smallest seq owns a timer at its delivery tick plus WAIT: a
+    # still-lower seq buffered later supersedes it and re-times the
+    # timer. When the timer fires, expected jumps to that minimum
+    # buffered seq and the contiguous run releases at the firing tick; a
+    # remaining gap re-times off the new minimum, which can be due at
+    # once. At one tick the whole network phase completes first, the
+    # tick's deliveries are admitted in DATA order, and timers run last,
+    # so a zero WAIT timer armed this tick still fires in the timer
+    # phase; after the last delivery the timers drain. A timer tick above
+    # MAX_TIME is code 5.
+    #
+    # seqs are validated dense 0..k-1 per flow, so each flow buffers in a
+    # dense k-slot array with a monotone scan cursor (each slot scanned
+    # once), and the single timer heap holds at most one entry per flow.
+    # That gives O(P log F) time and O(P+F) space beyond the network.
+    n = len(packets)
+    deliveries = []  # (delivery tick, packet index), clock order
+
+    def deliver_cb(i, now):
+        deliveries.append((now, i))
+
+    # packet tuple is
+    # (id, flow, seq, time, source, destination, size, port, class idx);
+    # policyqdiscimpair consumes
+    # (id, time, source, destination, size, port, class idx).
+    net_packets = [(pid, t, source, destination, size, port, klass)
+                   for pid, _, _, t, source, destination, size, port,
+                   klass in packets]
+    net = compute_policyqdiscimpair(nodes, links, class_specs, cap_of,
+                                    net_packets, events, rules,
+                                    deliver_cb)
+    net_rows = net["packets"]
+
+    def check_time(value):
+        if value > MAX_TIME:
+            fail(5)
+        return value
+
+    # Flow states in first-appearance (DATA) order, dense index f. slots
+    # is the dense seq -> packet index buffer (-1 empty), expect the next
+    # seq to release, cursor the lowest seq not scanned while finding the
+    # buffered minimum, min_buf that cached minimum (None without a gap),
+    # cur the current buffered count. Counts cover the four outcomes.
+    findex_of = {}
+    flow_keys = []
+    flow_k = []
+    for i in range(n):
+        pid, flow, seq, t, source, destination, size, port, klass = (
+            packets[i])
+        key = (source, destination, flow)
+        f = findex_of.get(key)
+        if f is None:
+            f = len(flow_keys)
+            findex_of[key] = f
+            flow_keys.append(key)
+            flow_k.append(0)
+        flow_k[f] += 1
+    F = len(flow_keys)
+    slots = [[-1] * flow_k[f] for f in range(F)]
+    expect = [0] * F
+    cursor = [0] * F
+    min_buf = [None] * F
+    cur = [0] * F
+    peak = [0] * F
+    c_released = [0] * F
+    c_late = [0] * F
+    c_over = [0] * F
+    c_drop = [0] * F
+    last_release = [None] * F
+
+    # results[i] keeps the full policyqdiscimpair packet row and appends
+    # flow, seq, orderStatus, release, wait (indices 12..16).
+    # Non-delivered packets never reach the reorderer: network_drop with
+    # both times null.
+    results = [None] * n
+    deliver_tick = [-1] * n
+    deliver_rank = [-1] * n
+    for i in range(n):
+        pid, flow, seq, t, source, destination, size, port, klass = (
+            packets[i])
+        row = list(net_rows[i]) + [flow, seq, None, None, None]
+        results[i] = row
+        if net_rows[i][2] != "delivered":
+            c_drop[findex_of[(source, destination, flow)]] += 1
+            row[14] = "network_drop"
+    tick_times = []
+    for now, i in deliveries:
+        deliver_tick[i] = now
+        if not tick_times or tick_times[-1] != now:
+            tick_times.append(now)
+        deliver_rank[i] = len(tick_times) - 1
+    # Buckets keyed by tick rank, appended in DATA order so each tick's
+    # reorderer admissions follow DATA order regardless of the network
+    # phase's internal same-tick reception sequence.
+    buckets = [[] for _ in tick_times]
+    for i in range(n):
+        if deliver_rank[i] >= 0:
+            buckets[deliver_rank[i]].append(i)
+
+    # Indexed min-heap of (deadline, flow), one live entry per flow with a
+    # buffered gap; pos[f] is its 0-based slot or -1.
+    heap = []
+    pos = [-1] * F
+
+    def h_swap(a, b):
+        pos[heap[a][1]] = b
+        pos[heap[b][1]] = a
+        heap[a], heap[b] = heap[b], heap[a]
+
+    def h_up(child):
+        while child:
+            parent = (child - 1) // 2
+            if heap[parent] <= heap[child]:
+                break
+            h_swap(parent, child)
+            child = parent
+
+    def h_down(parent):
+        size = len(heap)
+        while True:
+            child = parent * 2 + 1
+            if child >= size:
+                break
+            if child + 1 < size and heap[child + 1] < heap[child]:
+                child += 1
+            if heap[parent] <= heap[child]:
+                break
+            h_swap(parent, child)
+            parent = child
+
+    def h_insert(f, deadline):
+        pos[f] = len(heap)
+        heap.append((deadline, f))
+        h_up(pos[f])
+
+    def h_remove(f):
+        p = pos[f]
+        if p < 0:
+            return
+        last = heap.pop()
+        pos[f] = -1
+        if p < len(heap):
+            heap[p] = last
+            pos[last[1]] = p
+            h_up(p)
+            h_down(p)
+
+    def h_set(f, deadline):
+        p = pos[f]
+        if p < 0:
+            h_insert(f, deadline)
+            return
+        old = heap[p][0]
+        heap[p] = (deadline, f)
+        if deadline < old:
+            h_up(p)
+        elif deadline > old:
+            h_down(p)
+
+    def find_min(f):
+        # Lowest buffered seq at or past expect, scanning each slot once.
+        k = cursor[f]
+        arr = slots[f]
+        while k < len(arr) and arr[k] < 0:
+            k += 1
+        cursor[f] = k
+        return None if k == len(arr) else k
+
+    def arm(f):
+        m = min_buf[f]
+        if m is None:
+            h_remove(f)
+            return
+        idx = slots[f][m]
+        # The deadline is stored unchecked: it only matters if the gap is
+        # still open when it would fire, and the main loop applies the
+        # MAX_TIME rule at that point (an expected packet arriving first
+        # removes the timer without ever consuming it).
+        h_set(f, deliver_tick[idx] + wait)
+
+    def mark_released(i, now):
+        results[i][14] = "released"
+        results[i][15] = now
+        # The network finish tick is field 4 of the twelve-field
+        # policyqdiscimpair row.
+        results[i][16] = now - results[i][4]
+
+    def release_contiguous(f, now):
+        # Release from expect through every buffered consecutive slot.
+        arr = slots[f]
+        e = expect[f]
+        while e < len(arr) and arr[e] >= 0:
+            i = arr[e]
+            arr[e] = -1
+            cur[f] -= 1
+            c_released[f] += 1
+            last_release[f] = now
+            mark_released(i, now)
+            e += 1
+        expect[f] = e
+        cursor[f] = e
+        min_buf[f] = None if cur[f] == 0 else find_min(f)
+
+    def admit(i, now):
+        pid, flow, seq, t, source, destination, size, port, klass = (
+            packets[i])
+        f = findex_of[(source, destination, flow)]
+        e = expect[f]
+        if seq == e:
+            c_released[f] += 1
+            last_release[f] = now
+            mark_released(i, now)
+            expect[f] = e + 1
+            cursor[f] = e + 1
+            release_contiguous(f, now)
+            arm(f)
+        elif seq < e:
+            c_late[f] += 1
+            results[i][14] = "late"
+        elif seq - e <= window:
+            slots[f][seq] = i
+            cur[f] += 1
+            if cur[f] > peak[f]:
+                peak[f] = cur[f]
+            if min_buf[f] is None or seq < min_buf[f]:
+                min_buf[f] = seq
+                arm(f)
+        else:
+            c_over[f] += 1
+            results[i][14] = "over_window"
+
+    def fire_due(now):
+        # Timers phase: every flow whose deadline has reached now fires,
+        # in (deadline, first-appearance) order; re-timed deadlines that
+        # are already due (including zero WAIT) fire again this phase.
+        while heap and heap[0][0] <= now:
+            deadline, f = heap[0]
+            h_remove(f)
+            m = min_buf[f]
+            # No stale entries exist (the heap is indexed), but a timer
+            # whose gap vanished (all contiguous at admission) is removed
+            # explicitly, so m is always present here.
+            expect[f] = m
+            cursor[f] = m
+            release_contiguous(f, now)
+            arm(f)
+
+    r = 0
+    R = len(tick_times)
+    while r < R or heap:
+        if r < R and (not heap or tick_times[r] <= heap[0][0]):
+            now = check_time(tick_times[r])
+            for i in buckets[r]:
+                admit(i, now)
+            r += 1
+        else:
+            now = check_time(heap[0][0])
+        fire_due(now)
+
+    flow_rows = []
+    for f in range(F):
+        source, destination, flow = flow_keys[f]
+        flow_rows.append([source, destination, flow, c_released[f],
+                          c_late[f], c_over[f], c_drop[f], peak[f],
+                          last_release[f]])
+    return {"packets": results, "events": net["events"],
+            "links": net["links"], "flows": flow_rows}
 
 
 def compute_policyfail(nodes, links, cap_of, packets, events, rules):
@@ -24168,6 +24502,205 @@ def main():
                             class_index[klass]))
         result = compute_policyqdiscimpair(nodes, links, classes, cap_of,
                                            packets, events, rules)
+    elif argv[1] == "policyqdiscreorder":
+        if len(argv) != 9:
+            fail(2)
+        (file_path, config_text, rules_text, events_text, window_text,
+         wait_text, data_text) = argv[2:]
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        link_pairs_set = {(l["from"], l["to"]) for l in links}
+        latency_of = {(l["from"], l["to"]): l["latency"] for l in links}
+        # Inputs are handled in argument order like netreorder: each
+        # JSON input's strict parse (code 4) and shape checks (code 5)
+        # finish before the next argument, so the WINDOW/WAIT range
+        # checks land between EVENTS and DATA exactly as there.
+        try:
+            config = json.loads(config_text,
+                                parse_constant=_reject_constant,
+                                parse_float=_finite_float,
+                                object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        # CONFIG follows qdiscimpair/netqdisc exactly: classes of
+        # [name,quantum,classCapacity] and a links table covering every
+        # directed FILE link once with its totalCapacity.
+        if not isinstance(config, dict) or set(config) != {"classes",
+                                                           "links"}:
+            fail(5)
+        raw_classes = config["classes"]
+        if not isinstance(raw_classes, list) or not raw_classes:
+            fail(5)
+        classes = []
+        seen_names = set()
+        for item in raw_classes:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            name, quantum, capacity = item
+            if type(name) is not str or name == "" or name in seen_names:
+                fail(5)
+            try:
+                name.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_names.add(name)
+            if type(quantum) is not int or not 1 <= quantum <= MAX_COST:
+                fail(5)
+            if type(capacity) is not int or not 1 <= capacity <= MAX_COST:
+                fail(5)
+            classes.append((name, quantum, capacity))
+        class_index = {name: i for i, (name, _, _) in enumerate(classes)}
+        raw_link_caps = config["links"]
+        if not isinstance(raw_link_caps, list):
+            fail(5)
+        cap_of_pair = {}
+        for item in raw_link_caps:
+            if not isinstance(item, list) or len(item) != 3:
+                fail(5)
+            frm, to, capacity = item
+            if type(frm) is not str or type(to) is not str:
+                fail(5)
+            pair = (frm, to)
+            if pair not in link_pairs_set or pair in cap_of_pair:
+                fail(5)
+            if type(capacity) is not int or not 1 <= capacity <= MAX_COST:
+                fail(5)
+            cap_of_pair[pair] = capacity
+        if set(cap_of_pair) != link_pairs_set:
+            fail(5)
+        cap_of = [cap_of_pair[(l["from"], l["to"])] for l in links]
+        try:
+            raw_rules = json.loads(rules_text,
+                                   parse_constant=_reject_constant,
+                                   parse_float=_finite_float,
+                                   object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        # RULES is policyfail's policytx [n,s,d,a,b,c,path] set; a rule
+        # class absent from CONFIG.classes simply never matches.
+        rules = _validate_policytx_rules(raw_rules, node_set,
+                                         link_pairs_set)
+        try:
+            raw_events = json.loads(events_text,
+                                    parse_constant=_reject_constant,
+                                    parse_float=_finite_float,
+                                    object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        # EVENTS follows qdiscimpair: topology settings plus
+        # [t,2,from,to,n,j] loss-modulus/latency-offset settings.
+        if not isinstance(raw_events, list) or not raw_events:
+            fail(5)
+        events = []
+        previous_event_time = None
+        for event in raw_events:
+            if not isinstance(event, list) or len(event) not in (4, 5, 6):
+                fail(5)
+            t, kind = event[0], event[1]
+            if type(t) is not int or not 0 <= t <= MAX_TIME:
+                fail(5)
+            if previous_event_time is not None and t < previous_event_time:
+                fail(5)
+            previous_event_time = t
+            if type(kind) is not int or kind not in (0, 1, 2):
+                fail(5)
+            if kind == 0:
+                if len(event) != 4:
+                    fail(5)
+                _, _, node, up = event
+                if type(node) is not str or node not in node_set:
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                events.append((t, 0, node, up))
+            elif kind == 1:
+                if len(event) != 5:
+                    fail(5)
+                _, _, frm, to, up = event
+                if (type(frm) is not str or type(to) is not str
+                        or (frm, to) not in link_pairs_set):
+                    fail(5)
+                if type(up) is not bool:
+                    fail(5)
+                events.append((t, 1, frm, to, up))
+            else:
+                if len(event) != 6:
+                    fail(5)
+                _, _, frm, to, nn, jj = event
+                if (type(frm) is not str or type(to) is not str
+                        or (frm, to) not in link_pairs_set):
+                    fail(5)
+                if type(nn) is not int or not 0 <= nn <= MAX_COST:
+                    fail(5)
+                if type(jj) is not int:
+                    fail(5)
+                if latency_of[(frm, to)] + jj < 0:
+                    fail(5)
+                events.append((t, 2, frm, to, nn, jj))
+        window = _bounded_int_arg(window_text)
+        wait = _bounded_int_arg(wait_text)
+        try:
+            data = json.loads(data_text, parse_constant=_reject_constant,
+                              parse_float=_finite_float,
+                              object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        # DATA may be empty; each row is
+        # [id,flow,seq,time,source,destination,size,port,class].
+        # id/time/source/destination/size/port/class follow
+        # policyqdiscimpair, flow is a 1..256 code point UTF-8 string,
+        # and within each (source,destination,flow) group seq runs
+        # 0,1,2,... in DATA order.
+        if not isinstance(data, list):
+            fail(5)
+        packets = []
+        seen_ids = set()
+        previous_time = None
+        next_seq_of = {}
+        for item in data:
+            if not isinstance(item, list) or len(item) != 9:
+                fail(5)
+            (pid, flow, seq, time, source, destination, size, port,
+             klass) = item
+            if (type(pid) is not str or pid == ""
+                    or not 1 <= len(pid) <= MAX_FLOW_LEN
+                    or pid in seen_ids):
+                fail(5)
+            try:
+                pid.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            seen_ids.add(pid)
+            if type(flow) is not str or not 1 <= len(flow) <= MAX_FLOW_LEN:
+                fail(5)
+            try:
+                flow.encode("utf-8")
+            except UnicodeEncodeError:
+                fail(5)
+            if type(seq) is not int or not 0 <= seq <= MAX_COST:
+                fail(5)
+            if type(time) is not int or not 0 <= time <= MAX_TIME:
+                fail(5)
+            if previous_time is not None and time < previous_time:
+                fail(5)
+            previous_time = time
+            if source not in node_set or destination not in node_set:
+                fail(5)
+            if type(size) is not int or not 1 <= size <= MAX_COST:
+                fail(5)
+            if type(port) is not int or not 0 <= port <= 65535:
+                fail(5)
+            if type(klass) is not str or klass not in class_index:
+                fail(5)
+            group = (source, destination, flow)
+            if seq != next_seq_of.get(group, 0):
+                fail(5)
+            next_seq_of[group] = seq + 1
+            packets.append((pid, flow, seq, time, source, destination,
+                            size, port, class_index[klass]))
+        result = compute_policyqdiscreorder(nodes, links, classes, cap_of,
+                                            packets, events, rules,
+                                            window, wait)
     elif argv[1] == "converge":
         if len(argv) != 8:
             fail(2)
