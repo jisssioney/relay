@@ -38,6 +38,7 @@ Usage: python relay.py route FILE SOURCE
        python relay.py policytx FILE STATE OP
        python relay.py policyreplay PACK STATE TV PV DATA
        python relay.py reserve FILE DATA
+       python relay.py reservetime FILE EVENTS
        python relay.py rebalance FILE DATA LIMIT
        python relay.py loadshift FILE LIMIT FLOWS EVENTS
        python relay.py flowshift FILE LIMIT FLOWS EVENTS
@@ -76,7 +77,7 @@ for failcmp OLD or NEW, for policyreplay PACK or STATE, and for
 policytx op 4 also OUT),
 4 JSON syntax
 (for forward/loopsafe also duplicate keys or non-finite numbers in FILE/TABLE,
-for queue/qdisc/reorder/tbucket/netqueue/netfragment/policyqueue/ecmpqueue/netshape/netfail/policyfail/netimpair/netreorder/netqdisc/qdiscfail/qdiscimpair/policyqdiscimpair/policyqdiscreorder/converge/ecmpconverge/policy/reserve/rebalance/retune also those in
+for queue/qdisc/reorder/tbucket/netqueue/netfragment/policyqueue/ecmpqueue/netshape/netfail/policyfail/netimpair/netreorder/netqdisc/qdiscfail/qdiscimpair/policyqdiscimpair/policyqdiscreorder/converge/ecmpconverge/policy/reserve/reservetime/rebalance/retune also those in
 FILE/DATA/QUEUES/MTUS/SHAPERS/CLASSES/CONFIG/EVENTS/FLOWS/RULES, and for loadshift/flowshift also those in FILE/FLOWS/EVENTS, and for
 pshift also those in FILE/FLOWS/RULES/EVENTS, and for pshiftcp also
 those in FILE/FLOWS/RULES/EVENTS/STATE, for fragment/reassemble that in DATA, for rewrite that in R/D, for quality/replay/nfail/lfail/lrepair/nrepair/impair/
@@ -1332,6 +1333,35 @@ edge) with the route lowest-cost path as fallback. The result has key
 order topologyVersion, policyVersion, results; each result item is
 [s, d, p, c, rule, cost, path] with rule the matched rule's array index
 (null on fallback) and null, null, [] when no route exists.
+reservetime takes FILE EVENTS and is read-only: FILE follows reserve's
+strict metric topology and is never written, and EVENTS is a JSON array,
+possibly empty, of [t,"add",id,source,destination,bandwidth,hold] and
+[t,"del",id] items on one non-decreasing explicit clock. t is a
+non-boolean integer in 0..MAX_COST (a regression is code 5), id a
+1..64 codepoint UTF-8 string, source/destination two different FILE
+nodes, and bandwidth/hold non-boolean integers in 1..MAX_COST; an
+unknown kind or wrong item shape is code 5. At each clock every
+reservation expiring at or before t releases before the explicit events
+of t, earliest expiry first with equal expiry ordered by id, and equal-t
+explicit events keep input order; an add accepted at t routes with the
+remaining bandwidth at that instant using reserve's feasible paths and
+ranking (post-reservation peak utilization by integer cross
+multiplication, then total cost, then the path's Unicode code point
+order), occupies its bandwidth immediately, and expires at t+hold, an
+overflow past MAX_TIME being code 5. Status rows are [t,kind,id,status,
+path]: add status 0 accepted, 1 an active id re-added with the identical
+source/destination/bandwidth/hold (its path and expiry are kept), and 2
+unreachable or insufficient capacity (empty path, links unchanged, the
+batch continues); an active id re-added with any different spec is code
+5. del status 0 releases that reservation's own occupancy and status 1
+names an id not active; an expired id may be added again. Auto-generated
+rows use kind "expire" with status 0. Result key order is events,active,
+links: events lists rows in actual processing order including expiries,
+active lists [id,source,destination,bandwidth,expires,path] for the
+reservations still active after the last explicit clock, sorted by id,
+and links follows FILE order as [from,to,capacity,residual]. No
+floating-point arithmetic is used. The replay costs O(BA(V+A)) time and
+O(V+A+B) extra space.
 retune takes FILE and LIMIT exactly like rebalance and DATA=[C,G]. C is
 a JSON array, possibly empty, using rebalance's [id,s,d,b,path] shape
 and all of its per-item validation; its ids are unique. G is non-empty
@@ -9556,6 +9586,164 @@ def compute_reserve(nodes, links, requests):
     return {"allocations": allocations,
             "links": [[link["from"], link["to"], capacity[i],
                        capacity[i] - residual[i], residual[i]]
+                      for i, link in enumerate(links)]}
+
+
+def _reserve_route(adj, capacity, residual, source, destination, b):
+    # The single-request feasible-path search compute_reserve runs,
+    # exposed for reservetime's event replay. Returns None when the
+    # destination is unreachable over up links (reachability ignores
+    # residual), ("no_capacity", None) when it is reachable but no up
+    # simple path has every edge residual >= b, or ("ok", (path, cost))
+    # for the winning path. Ranking is post-reservation peak
+    # utilization (integer cross-multiplied fractions), then cost, then
+    # Unicode code point path order.
+    seen = {source}
+    stack = [source]
+    while stack:
+        for to, _, _ in adj[stack.pop()]:
+            if to not in seen:
+                seen.add(to)
+                stack.append(to)
+    if destination not in seen:
+        return None
+    best_num = best_den = best_cost = None
+    best_path = None
+    path = [source]
+    visited = {source}
+    states = [(0, 1, 0)]
+    iters = [iter(adj[source])]
+    while iters:
+        try:
+            to, w, index = next(iters[-1])
+        except StopIteration:
+            iters.pop()
+            if iters:
+                states.pop()
+                visited.remove(path.pop())
+            continue
+        if to in visited or residual[index] < b:
+            continue
+        num, den, cost = states[-1]
+        e_num = capacity[index] - residual[index] + b
+        e_den = capacity[index]
+        if e_num * den > num * e_den:
+            num, den = e_num, e_den
+        cost += w
+        visited.add(to)
+        path.append(to)
+        if to == destination:
+            if (best_path is None
+                    or num * best_den < best_num * den
+                    or (num * best_den == best_num * den
+                        and (cost < best_cost
+                             or (cost == best_cost
+                                 and path < best_path)))):
+                best_num, best_den, best_cost = num, den, cost
+                best_path = list(path)
+            # A simple path cannot pass through the destination and
+            # return to it, so nothing extends past it.
+            visited.remove(path.pop())
+        else:
+            states.append((num, den, cost))
+            iters.append(iter(adj[to]))
+    if best_path is None:
+        return ("no_capacity", None)
+    return ("ok", (best_path, best_cost))
+
+
+def compute_reservetime(nodes, links, events):
+    # Event-clock driven reservation lifecycle over reserve's strict
+    # metric topology, which never changes here. events are pre-validated
+    # tuples (t,"add",id,s,d,b,hold) or (t,"del",id) with non-decreasing
+    # t. An add accepted at t occupies b along its chosen path until an
+    # explicit del or its expiry at t+hold. Before the explicit events of
+    # each clock t run, every reservation expiring at or before t is
+    # released, earliest expiry first and ties by id; explicit events at
+    # the same t then keep input order. Routing, ranking, and rejection
+    # (status 2, empty path, links untouched) are exactly reserve's. An
+    # add of a live id whose s/d/b/hold are all identical is idempotent
+    # (status 1, path and expiry kept); any other live-id spec is code 5.
+    # A del of an absent id is status 1; expired ids may be added again.
+    # All arithmetic is integer-only.
+    adj = {n: [] for n in nodes}
+    index_of = {}
+    for index, link in enumerate(links):
+        pair = (link["from"], link["to"])
+        index_of[pair] = index
+        if link["up"]:
+            adj[link["from"]].append((link["to"], link["cost"], index))
+    capacity = [link["bandwidth"] for link in links]
+    residual = list(capacity)
+
+    # id -> (s, d, b, hold, expires, path)
+    active = {}
+    # Heap of (expires, id); entries for deleted or re-fired ids are
+    # left in place and skipped when popped via the active record.
+    expiry_heap = []
+    out_events = []
+
+    def release(rid):
+        s, d, b, hold, expires, path = active.pop(rid)
+        for a, c in zip(path, path[1:]):
+            # The release is exactly this reservation's own occupancy,
+            # so residual can never rise above capacity.
+            residual[index_of[(a, c)]] += b
+        return expires, path
+
+    def fire_expiries(until):
+        while expiry_heap and expiry_heap[0][0] <= until:
+            when, rid = heapq.heappop(expiry_heap)
+            rec = active.get(rid)
+            if rec is None or rec[4] != when:
+                # Stale entry: explicitly deleted, or superseded.
+                continue
+            _, path = release(rid)
+            out_events.append([when, "expire", rid, 0, path])
+
+    for event in events:
+        t = event[0]
+        fire_expiries(t)
+        if event[1] == "add":
+            _, _, rid, s, d, b, hold = event
+            if rid in active:
+                old = active[rid]
+                if (s, d, b, hold) != (old[0], old[1], old[2], old[3]):
+                    fail(5)
+                out_events.append([t, "add", rid, 1, old[5]])
+                continue
+            found = _reserve_route(adj, capacity, residual, s, d, b)
+            if found is None or found[0] == "no_capacity":
+                # Unreachable and capacity exhaustion are both status 2
+                # with an empty path, and neither changes a link.
+                out_events.append([t, "add", rid, 2, []])
+                continue
+            _, (path, cost) = found
+            if cost > MAX_TIME or t > MAX_TIME - hold:
+                fail(5)
+            expires = t + hold
+            for a, c in zip(path, path[1:]):
+                residual[index_of[(a, c)]] -= b
+            active[rid] = (s, d, b, hold, expires, path)
+            heapq.heappush(expiry_heap, (expires, rid))
+            out_events.append([t, "add", rid, 0, path])
+        else:
+            _, _, rid = event
+            if rid not in active:
+                out_events.append([t, "del", rid, 1, []])
+                continue
+            _, path = release(rid)
+            out_events.append([t, "del", rid, 0, path])
+
+    active_rows = []
+    for rid in sorted(active):
+        s, d, b, hold, expires, path = active[rid]
+        active_rows.append([rid, s, d, b, expires, path])
+
+    return {"events": out_events,
+            "active": active_rows,
+            "links": [[link["from"], link["to"], capacity[i],
+                       residual[i]]
                       for i, link in enumerate(links)]}
 
 
@@ -26714,6 +26902,73 @@ def main():
                 fail(5)
             requests.append((rid, s, d, b))
         result = compute_reserve(nodes, links, requests)
+    elif argv[1] == "reservetime":
+        if len(argv) != 4:
+            fail(2)
+        file_path, events_text = argv[2], argv[3]
+        nodes, links, node_set = load_network(file_path, metrics=True,
+                                              strict=True)
+        try:
+            raw_events = json.loads(
+                events_text, parse_constant=_reject_constant,
+                parse_float=_finite_float, object_pairs_hook=_object_no_dup)
+        except (ValueError, RecursionError):
+            fail(4)
+        # EVENTS is a JSON array, possibly empty, of add events
+        # [t,"add",id,s,d,b,hold] and del events [t,"del",id]. t is a
+        # non-boolean integer in 0..MAX_COST and non-decreasing; id is a
+        # 1..64 codepoint UTF-8 string, s/d existing distinct FILE
+        # nodes, and b/hold non-boolean integers in 1..MAX_COST. Every
+        # shape and range failure is code 5 and rejects the whole batch
+        # before the clock starts; cross-event conflicts (a live id
+        # re-added with a different spec) and the t+hold overflow are
+        # code 5 raised during the replay, still before any JSON output.
+        if not isinstance(raw_events, list):
+            fail(5)
+        events = []
+        previous_time = None
+        for item in raw_events:
+            if not isinstance(item, list) or len(item) < 2:
+                fail(5)
+            t, kind = item[0], item[1]
+            if type(t) is not int or not 0 <= t <= MAX_COST:
+                fail(5)
+            if previous_time is not None and t < previous_time:
+                fail(5)
+            previous_time = t
+            if kind == "add":
+                if len(item) != 7:
+                    fail(5)
+                _, _, rid, s, d, b, hold = item
+                if type(rid) is not str or not 1 <= len(rid) <= 64:
+                    fail(5)
+                try:
+                    rid.encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(5)
+                if (type(s) is not str or type(d) is not str
+                        or s not in node_set or d not in node_set
+                        or s == d):
+                    fail(5)
+                if type(b) is not int or not 1 <= b <= MAX_COST:
+                    fail(5)
+                if type(hold) is not int or not 1 <= hold <= MAX_COST:
+                    fail(5)
+                events.append((t, "add", rid, s, d, b, hold))
+            elif kind == "del":
+                if len(item) != 3:
+                    fail(5)
+                rid = item[2]
+                if type(rid) is not str or not 1 <= len(rid) <= 64:
+                    fail(5)
+                try:
+                    rid.encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(5)
+                events.append((t, "del", rid))
+            else:
+                fail(5)
+        result = compute_reservetime(nodes, links, events)
     elif argv[1] == "rebalance":
         if len(argv) != 5:
             fail(2)
